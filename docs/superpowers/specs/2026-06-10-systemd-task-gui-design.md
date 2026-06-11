@@ -37,7 +37,7 @@ system instance strictly read-only.
 
 ## Architecture
 
-Single process, four bounded modules under `src/taskdeck/`. Each module answers: what
+Single process, four bounded modules under `taskdeck/` (flat package — RPM-only deps mean no pip install step, so `python3 -m taskdeck` runs from the repo root). Each module answers: what
 it does, how you use it, what it depends on. No module reaches around another.
 
 ### `systemd_client.py` — data layer (no Qt widgets; QProcess + QObject signals only)

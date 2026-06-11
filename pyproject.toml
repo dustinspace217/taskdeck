@@ -1,0 +1,30 @@
+# Tool configuration only. Deliberately NO [build-system]/[project] packaging:
+# every dependency is an RPM in system site-packages, the app runs as
+# `python3 -m taskdeck` from the repo root, and adding pip packaging would
+# create a second install path to keep in sync for zero benefit (YAGNI).
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+# Default rules + import sorting (I) + pyupgrade (UP) + bugbear (B).
+# Power of Ten rule 10: strictest practical from the first commit.
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+# PySide6's RPM ships type stubs, but Qt's generated stubs have gaps
+# (Signal/Slot descriptors confuse strict mode). Per-module relaxation below
+# keeps OUR code strict while not fighting stub gaps we don't control.
+[[tool.mypy.overrides]]
+module = "PySide6.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# realsystemd = opt-in tests that hit the REAL user systemd instance
+# (read-only). Excluded by default so the suite is hermetic.
+addopts = "-m 'not realsystemd'"
+markers = ["realsystemd: read-only tests against the real systemd user instance"]
