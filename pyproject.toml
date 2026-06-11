@@ -16,12 +16,18 @@ select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.mypy]
 python_version = "3.14"
-# PySide6's RPM ships real type stubs (verified: /usr/lib/python3.14/site-packages/
-# PySide6/*.pyi, 57 files), so mypy checks Qt calls against actual signatures —
-# no blanket override. If a specific stub gap surfaces, use a targeted
-# `# type: ignore[code]` with a reason comment at the call site, never a
-# module-wide suppression (Power of Ten rule 10).
 strict = true
+# Fedora's python3-pyside6 RPM ships .pyi stubs (57 files) but OMITS the PEP 561
+# py.typed marker, so mypy refuses to use them and errors [import-untyped] on
+# every PySide6 import under strict mode (probed 2026-06-10:
+# `mypy --strict -c "from PySide6.QtCore import QObject"` fails without this).
+# The override makes PySide6 Any-typed — not ideal, but the alternatives are
+# worse: creating the marker under /usr/lib needs root, and pip-installing
+# stubs adds the second install path the header above forbids. Revisit if the
+# RPM ever adds py.typed.
+[[tool.mypy.overrides]]
+module = "PySide6.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
