@@ -89,8 +89,9 @@ it does, how you use it, what it depends on. No module reaches around another.
   e.g. astrowidget-fetch mid-download). Run/enable/disable are unconfirmed (cheap,
   reversible). Failures surface systemctl's stderr verbatim in the status bar.
 
-### Entry point: `src/taskdeck/app.py`, launched by `taskdeck` console script or
-`python3 -m taskdeck`. Desktop file + icon: v1 nice-to-have, not a gate.
+### Entry point: `taskdeck/app.py` (main()), launched as `python3 -m taskdeck`
+via `taskdeck/__main__.py`. No console script — there is no pip packaging by
+design. Desktop file + icon: v1 nice-to-have, not a gate.
 
 ## Data flow
 

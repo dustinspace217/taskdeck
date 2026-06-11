@@ -8,23 +8,24 @@ target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]
-# Default rules + import sorting (I) + pyupgrade (UP) + bugbear (B).
-# Power of Ten rule 10: strictest practical from the first commit.
+# select REPLACES ruff's default rule set (it does not extend it). This set is
+# a strict superset of the defaults: pycodestyle E/W, pyflakes F, import
+# sorting I, pyupgrade UP, bugbear B. Power of Ten rule 10: strictest
+# practical from the first commit.
 select = ["E", "F", "W", "I", "UP", "B"]
 
 [tool.mypy]
 python_version = "3.14"
+# PySide6's RPM ships real type stubs (verified: /usr/lib/python3.14/site-packages/
+# PySide6/*.pyi, 57 files), so mypy checks Qt calls against actual signatures —
+# no blanket override. If a specific stub gap surfaces, use a targeted
+# `# type: ignore[code]` with a reason comment at the call site, never a
+# module-wide suppression (Power of Ten rule 10).
 strict = true
-# PySide6's RPM ships type stubs, but Qt's generated stubs have gaps
-# (Signal/Slot descriptors confuse strict mode). Per-module relaxation below
-# keeps OUR code strict while not fighting stub gaps we don't control.
-[[tool.mypy.overrides]]
-module = "PySide6.*"
-ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # realsystemd = opt-in tests that hit the REAL user systemd instance
 # (read-only). Excluded by default so the suite is hermetic.
-addopts = "-m 'not realsystemd'"
+addopts = "--strict-markers -m 'not realsystemd'"
 markers = ["realsystemd: read-only tests against the real systemd user instance"]

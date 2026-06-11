@@ -12,6 +12,6 @@ whether it worked, and its logs. Built with PySide6/Qt Widgets on Fedora KDE.
     python3 -m taskdeck
 
 ## Develop
-    sudo dnf install python3-pytest-qt ruff  # mypy optional
+    sudo dnf install python3-pytest-qt ruff python3-mypy
     python3 -m pytest          # hermetic suite (offscreen Qt)
     ruff check . && mypy taskdeck
