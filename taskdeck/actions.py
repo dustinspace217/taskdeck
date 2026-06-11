@@ -30,7 +30,10 @@ def action_argv(verb: str, scope: str, unit: str) -> list[str]:
         raise ActionNotAllowed(
             f"verb {verb!r} not allowed in v1 (allowed: {sorted(ALLOWED_VERBS)})"
         )
-    return ["systemctl", "--user", verb, unit]
+    # "--" stops flag parsing, same defense as fetch_calendar: unit names come
+    # from parsed systemd output, and leading-dash names are legal in systemd
+    # (the root slice is "-.slice"). Probed 2026-06-11: systemctl accepts it.
+    return ["systemctl", "--user", verb, "--", unit]
 
 
 def run_now_unit(row: TimerRow) -> str:
