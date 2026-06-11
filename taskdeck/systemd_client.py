@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+
 
 @dataclass(frozen=True)
 class TimerRow:
@@ -201,3 +203,163 @@ def parse_journal(text: str) -> list[LogEntry]:
     if bad and not entries:
         raise ValueError(f"journal output entirely unparseable ({bad} bad lines)")
     return entries
+
+
+# Scope constants used across modules; "user" gets --user injected, "system"
+# doesn't. Strings (not an Enum) because they appear verbatim in request ids
+# and error messages — YAGNI until a third scope exists.
+SCOPE_USER = "user"
+SCOPE_SYSTEM = "system"
+
+# Curated Details-tab properties (spec): enough to answer "what is this unit
+# and what is it doing" without the full ~200-key `show` dump.
+DETAIL_PROPS = (
+    "Description,FragmentPath,ActiveState,SubState,MainPID,"
+    "MemoryCurrent,MemoryPeak,CPUUsageNSec,TriggeredBy,Triggers"
+)
+RESULT_PROPS = "Result,ExecMainStatus,ExecMainExitTimestamp"
+
+
+class SystemdClient(QObject):  # type: ignore[misc]
+    """Runs systemctl/journalctl asynchronously and emits results as signals.
+
+    Why QProcess and not subprocess: QProcess integrates with the Qt event
+    loop, so the UI thread never blocks — subprocess.run() would freeze the
+    window for the duration of every call.
+
+    finished(request_id, stdout) — command exited 0.
+    failed(request_id, message)  — non-zero exit, spawn failure, or timeout.
+                                   message carries stderr verbatim: the user
+                                   sees systemd's own words, not a paraphrase.
+
+    Single-flight: a request whose id is already in flight is rejected
+    (returns False). Refresh timers + manual refresh + action-triggered
+    refresh can otherwise stack arbitrarily many identical subprocesses.
+    """
+
+    finished = Signal(str, str)
+    failed = Signal(str, str)
+
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        systemctl: str = "systemctl",
+        journalctl: str = "journalctl",
+        analyze: str = "systemd-analyze",
+        timeout_ms: int = 5000,
+    ) -> None:
+        super().__init__(parent)
+        self._systemctl = systemctl
+        self._journalctl = journalctl
+        self._analyze = analyze
+        self._timeout_ms = timeout_ms
+        # request_id -> QProcess; doubles as the single-flight registry.
+        # Bounded by the number of distinct request kinds (~8), not by call
+        # rate — that's the memory-bounding argument for keying by id.
+        self._inflight: dict[str, QProcess] = {}
+
+    # -- generic runner ----------------------------------------------------
+
+    def request(self, request_id: str, argv: list[str]) -> bool:
+        """Start argv asynchronously; results arrive via finished/failed.
+
+        Returns False (and runs nothing) if request_id is already in flight.
+        """
+        if request_id in self._inflight:
+            return False
+        proc = QProcess(self)
+        self._inflight[request_id] = proc
+
+        # QTimer (not QProcess.waitForFinished) keeps everything event-driven.
+        watchdog = QTimer(proc)
+        watchdog.setSingleShot(True)
+        watchdog.setInterval(self._timeout_ms)
+
+        def on_timeout() -> None:
+            proc.kill()  # triggers on_finished with CrashExit
+            self._inflight.pop(request_id, None)
+            self.failed.emit(request_id, f"{argv[0]} timed out after {self._timeout_ms} ms")
+
+        def on_finished(exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+            if request_id not in self._inflight:
+                return  # timeout already reported; ignore the kill's echo
+            self._inflight.pop(request_id, None)
+            watchdog.stop()
+            if exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0:
+                stderr = proc.readAllStandardError().data().decode(errors="replace").strip()
+                self.failed.emit(request_id, f"{argv[0]} exit {exit_code}: {stderr}")
+                return
+            stdout = proc.readAllStandardOutput().data().decode(errors="replace")
+            self.finished.emit(request_id, stdout)
+
+        def on_error(_err: QProcess.ProcessError) -> None:
+            # Covers spawn failure (binary missing) — finished() never fires.
+            if request_id in self._inflight:
+                self._inflight.pop(request_id, None)
+                watchdog.stop()
+                self.failed.emit(request_id, f"failed to start {argv[0]}: {proc.errorString()}")
+
+        watchdog.timeout.connect(on_timeout)
+        proc.finished.connect(on_finished)
+        proc.errorOccurred.connect(on_error)
+        proc.start(argv[0], argv[1:])
+        watchdog.start()
+        return True
+
+    # -- typed conveniences (argv assembly in ONE place) --------------------
+
+    def _scope_args(self, scope: str) -> list[str]:
+        return ["--user"] if scope == SCOPE_USER else []
+
+    def list_timers(self, scope: str) -> bool:
+        return self.request(
+            f"timers:{scope}",
+            [self._systemctl, *self._scope_args(scope), "list-timers", "--all", "-o", "json"],
+        )
+
+    def list_services(self, scope: str) -> bool:
+        return self.request(
+            f"services:{scope}",
+            [
+                self._systemctl, *self._scope_args(scope),
+                "list-units", "--type=service", "-o", "json",
+            ],
+        )
+
+    def fetch_results(self, scope: str, units: list[str]) -> bool:
+        return self.request(
+            f"results:{scope}",
+            [self._systemctl, *self._scope_args(scope), "show", *units, "-p", RESULT_PROPS],
+        )
+
+    def fetch_log(self, scope: str, unit: str) -> bool:
+        return self.request(
+            f"log:{scope}:{unit}",
+            [
+                self._journalctl, *self._scope_args(scope),
+                "-u", unit, "-o", "json", "-n", "200", "--no-pager",
+            ],
+        )
+
+    def fetch_cat(self, scope: str, unit: str) -> bool:
+        return self.request(
+            f"cat:{scope}:{unit}",
+            [self._systemctl, *self._scope_args(scope), "cat", unit, "--no-pager"],
+        )
+
+    def fetch_details(self, scope: str, unit: str) -> bool:
+        return self.request(
+            f"details:{scope}:{unit}",
+            [self._systemctl, *self._scope_args(scope), "show", unit, "-p", DETAIL_PROPS],
+        )
+
+    def fetch_calendar(self, expr: str) -> bool:
+        # systemd-analyze calendar needs no scope; expression comes from the
+        # unit file's OnCalendar= line. --iterations verified on systemd 258.
+        return self.request(
+            f"calendar:{expr}",
+            [self._analyze, "calendar", "--iterations=5", expr],
+        )
+
+    def run_action(self, argv: list[str], unit: str) -> bool:
+        return self.request(f"action:{unit}", argv)

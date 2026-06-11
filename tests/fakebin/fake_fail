@@ -1,0 +1,4 @@
+#!/bin/bash
+# Simulates systemctl failing (unknown unit, dead bus, …).
+echo "Failed to connect to bus: No medium found" >&2
+exit 1

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Never returns within any sane timeout — exercises the watchdog kill.
+sleep 30
