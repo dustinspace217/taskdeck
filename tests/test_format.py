@@ -5,7 +5,9 @@ function — so these tests are deterministic forever.
 """
 from datetime import datetime
 
-from taskdeck.models import format_delta, format_when
+import pytest
+
+from taskdeck.models import format_delta, format_when, strip_ansi
 
 NOW = datetime(2026, 6, 10, 19, 0, 0)  # fixed reference: Wed Jun 10 2026 19:00 local
 
@@ -62,6 +64,25 @@ def test_format_delta_units():
     assert format_delta(3600 * 4 + 60 * 10) == "4h 10m"
     assert format_delta(86400 * 4 + 3600 * 11) == "4d 11h"
     assert format_delta(86400 * 39 + 3600 * 5) == "39d"
+
+
+def test_zero_epoch_means_never_not_1969():
+    # systemd emits last:0 for never-ran timers (fixture-proven, QA TA-F1) —
+    # render as missing, never as Dec 31 1969.
+    assert format_when(0, NOW) == "—"
+
+
+def test_format_delta_rejects_negative():
+    # ValueError (not assert): survives -O, and lands inside the window's
+    # surfaced exception classes if it ever fires in a refresh cycle.
+    with pytest.raises(ValueError):
+        format_delta(-1)
+
+
+def test_strip_ansi_removes_csi_and_osc():
+    assert strip_ansi("\x1b[0;32mok\x1b[0m") == "ok"
+    assert strip_ansi("\x1b]0;title\x07rest") == "rest"
+    assert strip_ansi("plain") == "plain"
 
 
 def test_format_delta_threshold_boundaries():

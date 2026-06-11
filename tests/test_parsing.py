@@ -51,8 +51,14 @@ def test_parse_list_units_fields():
 
 
 def test_parse_show_results_blank_line_separated_blocks_in_arg_order():
+    # Fixture has THREE blocks: two units that have run, one never-ran
+    # (drkonqi-coredump-cleanup — re-capture prerequisite, see plan note).
     text = (FIXTURES / "show_results.txt").read_text()
-    units = ["astrowidget-fetch.service", "boothang-update-check.service"]
+    units = [
+        "astrowidget-fetch.service",
+        "boothang-update-check.service",
+        "drkonqi-coredump-cleanup.service",
+    ]
     results = parse_show_results(text, units)
     assert set(results) <= set(units)
     first = results[units[0]]
@@ -61,10 +67,29 @@ def test_parse_show_results_blank_line_separated_blocks_in_arg_order():
     assert first.exec_status == 0
 
 
+def test_parse_show_results_never_ran_unit_gets_no_entry():
+    # THE false-success gate (QA AT-F1, probed 2026-06-11): a never-ran
+    # service reports Result=success / ExecMainStatus=0 as DEFAULTS with an
+    # empty ExecMainExitTimestamp. No entry → the UI renders "—", never a
+    # green ✔ for a job that never fired. The same empty timestamp occurs
+    # while a service is STILL RUNNING — also correctly "no result yet".
+    text = "Result=success\nExecMainExitTimestamp=\nExecMainStatus=0\n"
+    assert parse_show_results(text, ["never.service"]) == {}
+    # And the real fixture's never-ran block behaves identically:
+    fixture = (FIXTURES / "show_results.txt").read_text()
+    units = [
+        "astrowidget-fetch.service",
+        "boothang-update-check.service",
+        "drkonqi-coredump-cleanup.service",
+    ]
+    assert "drkonqi-coredump-cleanup.service" not in parse_show_results(fixture, units)
+
+
 def test_parse_show_results_tolerates_missing_keys_and_short_output():
     # A block can lack ExecMainStatus entirely (non-service units); a unit
     # list longer than the output must not raise — absent units get no entry.
-    results = parse_show_results("Result=success\n", ["a.service", "b.service"])
+    text = "Result=success\nExecMainExitTimestamp=Wed\n"
+    results = parse_show_results(text, ["a.service", "b.service"])
     assert results["a.service"].result == "success"
     assert results["a.service"].exec_status is None
     assert "b.service" not in results
@@ -100,7 +125,10 @@ def test_parse_show_results_leading_empty_block_keeps_alignment():
 
 
 def test_parse_show_results_middle_empty_block_keeps_alignment():
-    text = "Result=success\nExecMainStatus=0\n\n\nResult=exit-code\nExecMainStatus=1\n"
+    text = (
+        "Result=success\nExecMainExitTimestamp=Wed\nExecMainStatus=0\n\n\n"
+        "Result=exit-code\nExecMainExitTimestamp=Thu\nExecMainStatus=1\n"
+    )
     results = parse_show_results(text, ["a.service", "b.target", "c.service"])
     assert results["a.service"] == LastResult("success", 0)
     assert "b.target" not in results
@@ -109,8 +137,11 @@ def test_parse_show_results_middle_empty_block_keeps_alignment():
 
 def test_parse_show_results_distinct_values_land_on_their_units():
     # Guards the argument-order contract with DISTINGUISHABLE per-unit values
-    # (the real fixture's two blocks are identical, so it can't catch swaps).
-    text = "Result=success\nExecMainStatus=0\n\nResult=exit-code\nExecMainStatus=1\n"
+    # (the real fixture's ran-blocks are identical, so it can't catch swaps).
+    text = (
+        "Result=success\nExecMainExitTimestamp=Wed\nExecMainStatus=0\n\n"
+        "Result=exit-code\nExecMainExitTimestamp=Thu\nExecMainStatus=1\n"
+    )
     results = parse_show_results(text, ["ok.service", "bad.service"])
     assert results["ok.service"] == LastResult("success", 0)
     assert results["bad.service"] == LastResult("exit-code", 1)
@@ -120,6 +151,34 @@ def test_parse_show_results_more_blocks_than_units_raises():
     text = "Result=success\n\nResult=exit-code\n"
     with pytest.raises(ValueError):
         parse_show_results(text, ["only.service"])
+
+
+def test_parse_list_timers_passes_last_zero_through():
+    # systemd emits last:0 (not null) for never-ran timers — the parser stays
+    # a faithful transcription and passes it through; RENDERING treats 0 as
+    # missing (models.ts_missing). Re-capture prerequisite: the fixture must
+    # contain at least one never-ran timer.
+    rows = parse_list_timers((FIXTURES / "list_timers.json").read_text())
+    assert any(r.last_usec == 0 for r in rows), "fixture needs a never-ran timer (last:0)"
+
+
+def test_parse_list_timers_rejects_null_required_fields():
+    # systemd's table-to-JSON layer emits null for empty cells; a None unit
+    # name would explode far downstream (sorted({None, str})) OUTSIDE the
+    # surfaced exception classes — the parser must refuse it loudly instead.
+    with pytest.raises(ValueError, match="activates"):
+        parse_list_timers('[{"unit":"x.timer","activates":null,"next":null,"last":null}]')
+
+
+def test_parse_list_timers_rejects_non_array_payload():
+    # Valid JSON of the wrong SHAPE (an object) is still malformed input.
+    with pytest.raises(ValueError, match="array"):
+        parse_list_timers('{"unit":"x.timer"}')
+
+
+def test_parse_list_units_rejects_null_unit_name():
+    with pytest.raises(ValueError, match="unit"):
+        parse_list_units('[{"unit":null,"load":"loaded","active":"active","sub":"r"}]')
 
 
 def test_parse_journal_empty_output_is_empty_not_error():

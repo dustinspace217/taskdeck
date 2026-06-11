@@ -1,3 +1,5 @@
 #!/bin/bash
 # Never returns within any sane timeout — exercises the watchdog kill.
-sleep 30
+# exec replaces bash, so QProcess.kill() SIGKILLs the sleep ITSELF — without
+# it, bash dies and the sleep survives as a ~30s orphan (QA TA-F7).
+exec sleep 30

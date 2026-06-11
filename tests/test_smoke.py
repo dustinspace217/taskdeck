@@ -12,10 +12,18 @@ from taskdeck.main_window import MainWindow
 from taskdeck.systemd_client import LastResult, ServiceRow, SystemdClient, TimerRow
 
 ARTIFACTS = Path(__file__).parent / "artifacts"
+FAKEBIN = Path(__file__).parent / "fakebin"
 
 
 def test_window_builds_and_renders(qtbot):
-    client = SystemdClient()  # never asked to run anything in this test
+    # All three binary paths point at fakebin so hermeticity is STRUCTURAL —
+    # a future edit that fires a fetch or an action cannot silently spawn
+    # the real systemctl (QA TA-F6 + the action-path extension).
+    client = SystemdClient(
+        systemctl=str(FAKEBIN / "fake_ok"),
+        journalctl=str(FAKEBIN / "fake_ok"),
+        analyze=str(FAKEBIN / "fake_ok"),
+    )
     window = MainWindow(client, auto_refresh=False)
     qtbot.addWidget(window)
 
@@ -25,6 +33,9 @@ def test_window_builds_and_renders(qtbot):
         {"a.service": LastResult("success", 0)},
         now=datetime(2026, 6, 10, 19, 0, 0),
     )
+    # Enablement requires the rendered data's scope to match the active scope
+    # (the model was populated directly here, bypassing _apply_results).
+    window._data_scope = "user"
     window.resize(1100, 700)
     window.show()
     qtbot.waitExposed(window)

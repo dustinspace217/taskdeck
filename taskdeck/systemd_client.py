@@ -67,21 +67,48 @@ class LogEntry:
     priority: int  # syslog level 0-7; 7 (debug) when the field is absent
 
 
+def _require_str(item: dict[str, object], key: str, context: str) -> str:
+    """Field-type gate for required string fields.
+
+    systemd's table-to-JSON layer emits null for empty cells, and a None
+    smuggled into a dataclass explodes far from its source (e.g. inside
+    sorted() in the refresh path) with a TypeError — OUTSIDE the window's
+    surfaced exception classes, producing the silent-frozen-table failure
+    mode. Raising ValueError here keeps the failure loud and attributed.
+    """
+    value = item.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"{context}: field {key!r} is {type(value).__name__}, expected str")
+    return value
+
+
+def _int_or_none(item: dict[str, object], key: str, context: str) -> int | None:
+    """Field-type gate for optional µs-epoch fields (int or null)."""
+    value = item.get(key)
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    raise ValueError(f"{context}: field {key!r} is {type(value).__name__}, expected int or null")
+
+
 def parse_list_timers(text: str) -> list[TimerRow]:
     """Parse `systemctl list-timers --all -o json` output.
 
-    Raises ValueError (from json) on malformed input — callers surface that as
-    an error state, never an empty table (no-silent-failure rule).
-    Records missing required fields (unit/activates) raise KeyError — same policy:
-    surface, never swallow.
+    Raises ValueError on malformed input OR wrong-shape/wrong-type payloads
+    (a JSON object instead of an array, null required fields) — callers
+    surface that as an error state, never an empty table (no-silent-failure
+    rule). NOTE: `last` is passed through faithfully, INCLUDING the literal 0
+    systemd emits for never-ran timers — rendering treats 0 as missing
+    (models.ts_missing); the client does not editorialize.
     """
     raw = json.loads(text)
+    if not isinstance(raw, list):
+        raise ValueError(f"list-timers: expected JSON array, got {type(raw).__name__}")
     return [
         TimerRow(
-            unit=item["unit"],
-            activates=item["activates"],
-            next_usec=item.get("next"),
-            last_usec=item.get("last"),
+            unit=_require_str(item, "unit", "list-timers"),
+            activates=_require_str(item, "activates", "list-timers"),
+            next_usec=_int_or_none(item, "next", "list-timers"),
+            last_usec=_int_or_none(item, "last", "list-timers"),
         )
         for item in raw
     ]
@@ -90,16 +117,20 @@ def parse_list_timers(text: str) -> list[TimerRow]:
 def parse_list_units(text: str) -> list[ServiceRow]:
     """Parse `systemctl list-units --type=service -o json` output.
 
-    Records missing the unit field raise KeyError — surfaced, never swallowed.
+    Same validation policy as parse_list_timers: wrong shape or a null unit
+    name raises ValueError. The descriptive fields tolerate null (rendered
+    as empty) — only fields that flow into request argv must be strings.
     """
     raw = json.loads(text)
+    if not isinstance(raw, list):
+        raise ValueError(f"list-units: expected JSON array, got {type(raw).__name__}")
     return [
         ServiceRow(
-            unit=item["unit"],
-            load=item.get("load", ""),
-            active=item.get("active", ""),
-            sub=item.get("sub", ""),
-            description=item.get("description", ""),
+            unit=_require_str(item, "unit", "list-units"),
+            load=item.get("load") or "",
+            active=item.get("active") or "",
+            sub=item.get("sub") or "",
+            description=item.get("description") or "",
         )
         for item in raw
     ]
@@ -136,6 +167,22 @@ def parse_show_results(text: str, units: list[str]) -> dict[str, LastResult]:
                 f"systemctl show returned more blocks than the {len(units)} requested units"
             )
         status_text = props.get("ExecMainStatus", "")
+        # NEVER-RAN GATE (probed 2026-06-11): a loaded-but-never-run service
+        # reports Result=success and ExecMainStatus=0 — those are DEFAULTS,
+        # not evidence; rendering them green told the user "it ran and it
+        # succeeded" about a job that never fired (and after a re-login, a
+        # FAILED job's evidence resets to those same defaults). The
+        # disambiguator is ExecMainExitTimestamp: present-but-EMPTY for
+        # never-ran (probe: `show drkonqi-coredump-cleanup.service`), and
+        # equally empty while a main process is STILL RUNNING (the status
+        # column shows ▶ running for that case) or when the key is absent
+        # entirely (non-service unit) — all three correctly mean "no result
+        # to claim". No entry → renders "—". LIMITATION, by design: this
+        # converts false-success to unknown, not to truth — post-relogin the
+        # only surviving failure evidence is the journal.
+        if not props.get("ExecMainExitTimestamp", ""):
+            props = {}
+            return
         # EAFP int parsing: .isdigit() guards accept strings int() rejects
         # ("--1", unicode digits); try/except is both shorter and correct.
         try:
@@ -259,15 +306,29 @@ class SystemdClient(QObject):  # type: ignore[misc]
         # DEF-T4-01 comment in request() for why they are not freed.
         self._inflight: dict[str, QProcess] = {}
 
+    @property
+    def systemctl_path(self) -> str:
+        """The injected systemctl binary path.
+
+        Exposed so action argv (built in actions.py) honors the same
+        injection the fetches do — otherwise a fakebin-injected test client
+        would still spawn the REAL systemctl for actions.
+        """
+        return self._systemctl
+
     # -- generic runner ----------------------------------------------------
 
-    def request(self, request_id: str, argv: list[str]) -> bool:
+    def request(self, request_id: str, argv: list[str], timeout_ms: int | None = None) -> bool:
         """Start argv asynchronously; results arrive via finished/failed.
 
         Returns False (and runs nothing) if request_id is already in flight.
+        timeout_ms overrides the client default per request kind — journal
+        reads legitimately take longer than list queries (reverse-seeking a
+        multi-GB rotated journal is a known multi-second operation).
         """
         if request_id in self._inflight:
             return False
+        effective_timeout = timeout_ms if timeout_ms is not None else self._timeout_ms
         proc = QProcess(self)
         # KNOWN BOUNDED LEAK (DEF-T4-01): dead QProcess objects stay parented
         # to this client until it is destroyed. Freeing them is deliberately
@@ -282,7 +343,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
         # QTimer (not QProcess.waitForFinished) keeps everything event-driven.
         watchdog = QTimer(proc)
         watchdog.setSingleShot(True)
-        watchdog.setInterval(self._timeout_ms)
+        watchdog.setInterval(effective_timeout)
 
         # All three handlers guard on IDENTITY (`is proc`), not key presence:
         # a killed process's death echoes arrive on a LATER event-loop turn,
@@ -295,7 +356,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
                 return  # already terminal (finished / spawn-failed / successor owns id)
             proc.kill()  # the CrashExit echo is swallowed by on_finished's identity guard
             self._inflight.pop(request_id, None)
-            self.failed.emit(request_id, f"{argv[0]} timed out after {self._timeout_ms} ms")
+            self.failed.emit(request_id, f"{argv[0]} timed out after {effective_timeout} ms")
 
         def on_finished(exit_code: int, exit_status: QProcess.ExitStatus) -> None:
             if self._inflight.get(request_id) is not proc:
@@ -309,6 +370,16 @@ class SystemdClient(QObject):  # type: ignore[misc]
             if exit_code != 0:
                 stderr = proc.readAllStandardError().data().decode(errors="replace").strip()
                 self.failed.emit(request_id, f"{argv[0]} exit {exit_code}: {stderr}")
+                return
+            if request_id.startswith("action:"):
+                # Actions print nothing useful to stdout, but systemd DOES
+                # explain itself on stderr even at exit 0 — probed 2026-06-11:
+                # `enable` on an [Install]-less unit exits 0 with its whole
+                # explanation on stderr. Deliver stderr as the payload so the
+                # window shows systemd's own words instead of a bare "ok"
+                # that misleads ("ok" + nothing changed + reason discarded).
+                stderr = proc.readAllStandardError().data().decode(errors="replace").strip()
+                self.finished.emit(request_id, stderr)
                 return
             stdout = proc.readAllStandardOutput().data().decode(errors="replace")
             self.finished.emit(request_id, stdout)
@@ -367,6 +438,10 @@ class SystemdClient(QObject):  # type: ignore[misc]
                 self._journalctl, *self._scope_args(scope),
                 "-u", unit, "-o", "json", "-n", "200", "--no-pager",
             ],
+            # Journal reverse-seek on big rotated journals routinely exceeds
+            # the 5s default — killing it exactly at investigate-this-unit
+            # moments. 15s per QA AT-F10.
+            timeout_ms=15_000,
         )
 
     def fetch_cat(self, scope: str, unit: str) -> bool:

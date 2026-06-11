@@ -97,12 +97,18 @@ def test_failed_service_status(qtbot):
     assert cell(model, 0, 1) == "✘ failed"
 
 
-def test_result_column_foreground_colors(qtbot):
+def test_result_column_foreground_tinting(qtbot):
+    # Relational assertions only — models.py declares the exact shades
+    # cosmetic (the information is also in the ✔/✘ glyphs), so the contract
+    # is: result column tinted iff result known, success ≠ failure brush,
+    # other columns untinted.
     model = TaskTableModel()
     model.set_timer_rows(TIMERS, SERVICES, RESULTS, now=NOW)
     role = Qt.ItemDataRole.ForegroundRole
-    assert model.index(0, 4).data(role).color().name() == "#4caf50"  # success → green
-    assert model.index(1, 4).data(role).color().name() == "#e57373"  # failure → red
+    success_brush = model.index(0, 4).data(role)
+    failure_brush = model.index(1, 4).data(role)
+    assert success_brush is not None and failure_brush is not None
+    assert success_brush.color() != failure_brush.color()
     assert model.index(0, 0).data(role) is None  # only the result column tints
     model.set_timer_rows(TIMERS, SERVICES, {}, now=NOW)
     assert model.index(0, 4).data(role) is None  # unknown result → no tint
@@ -114,6 +120,35 @@ def test_header_data(qtbot):
     display = Qt.ItemDataRole.DisplayRole
     assert model.headerData(0, horizontal, display) == "Task"
     assert model.headerData(0, Qt.Orientation.Vertical, display) is None
+
+
+def test_never_ran_timer_renders_honest_dashes_end_to_end(qtbot):
+    # THE compound-lie regression (QA TA-F1 + AT-F1): drive the REAL fixture
+    # through parser → model and assert a never-ran row shows "—" for Last
+    # run (not Dec 31 1969 from last:0) and "—" for Last result (no entry =
+    # no false ✔ from systemd's Result=success DEFAULT). This is the test
+    # that makes "the same fixtures drive both layers" true.
+    from pathlib import Path
+
+    from taskdeck.systemd_client import parse_list_timers
+
+    fixture = Path(__file__).parent / "fixtures" / "list_timers.json"
+    timers = parse_list_timers(fixture.read_text())
+    never = next(r for r in timers if r.last_usec == 0)
+    model = TaskTableModel()
+    model.set_timer_rows(timers, [], {}, now=NOW)
+    row = next(i for i in range(model.rowCount()) if cell(model, i, 0) == never.unit)
+    assert cell(model, row, 3) == "—"
+    assert cell(model, row, 4) == "—"
+
+
+def test_last_zero_sorts_as_oldest_sentinel(qtbot):
+    from taskdeck.models import _SORT_NO_LAST, ROLE_SORT
+
+    timers = [TimerRow("z.timer", "z.service", None, 0)]
+    model = TaskTableModel()
+    model.set_timer_rows(timers, [], {}, now=NOW)
+    assert model.index(0, 3).data(ROLE_SORT) == _SORT_NO_LAST
 
 
 def test_sort_role_is_chronological_not_alphabetical(qtbot):

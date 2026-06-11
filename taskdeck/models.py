@@ -5,6 +5,7 @@ transcription of systemd's µs epochs and the same fixtures drive both layers.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -14,6 +15,36 @@ from PySide6.QtGui import QBrush, QColor
 from taskdeck.systemd_client import LastResult, ServiceRow, TimerRow
 
 
+def ts_missing(ts_usec: int | None) -> bool:
+    """True when a µs timestamp means "never" — systemd encodes that BOTH ways.
+
+    list-timers emits null for a missing next elapse but 0 for a never-ran
+    last trigger (probed 2026-06-11: the drkonqi timers in the captured
+    fixture carry "last":0 alongside "passed":0). A genuine epoch-0 µs
+    timestamp cannot occur in any field this app renders, so 0-or-None →
+    missing is safe at every render site. One shared helper so the policy
+    cannot drift between call sites — it briefly did: the Log tab folded 0
+    into "—" while the table rendered the same value as Dec 31 1969.
+    """
+    return ts_usec is None or ts_usec == 0
+
+
+# Matches ECMA-48 CSI sequences (colors etc.) and OSC sequences (titles).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from journal text at RENDER time.
+
+    Daemons routinely log color; journald stores the raw bytes and -o json
+    passes them through — rendered literally they are noise in the Log tab.
+    Stripping happens at render, never in the parser: the client stays a
+    faithful transcription and the raw evidence survives for any future
+    export path.
+    """
+    return _ANSI_RE.sub("", text)
+
+
 def format_delta(seconds: float) -> str:
     """Render a positive duration with two significant units, DSM-style.
 
@@ -21,9 +52,12 @@ def format_delta(seconds: float) -> str:
     m / h+m / d+h, then bare days past ~5 weeks where hours are noise.
     """
     # Callers must pass non-negative durations (format_when negates past
-    # deltas before calling). A negative here is a caller bug — fail loudly
-    # at dev time rather than rendering "-345600s" in the table.
-    assert seconds >= 0, "format_delta requires non-negative seconds"
+    # deltas before calling). A negative here is a caller bug — raise rather
+    # than assert: ValueError is inside the window's surfaced exception set,
+    # so the guard stays loud under `python -O` AND if it ever fires in a
+    # refresh cycle it becomes a visible error instead of a silent freeze.
+    if seconds < 0:
+        raise ValueError(f"format_delta requires non-negative seconds, got {seconds}")
     s = int(seconds)
     if s < 60:
         return f"{s}s"
@@ -45,7 +79,9 @@ def format_when(ts_usec: int | None, now: datetime) -> str:
     the table can render one consistent instant per refresh. Absolute form
     scales with distance: today / weekday within 6 days / 'Mon DD' beyond.
     """
-    if ts_usec is None:
+    # ts_missing already implies the second clause; it is spelled out only
+    # for mypy's narrowing (a bool helper cannot negatively narrow int|None).
+    if ts_missing(ts_usec) or ts_usec is None:
         return "—"
     dt = datetime.fromtimestamp(ts_usec / 1_000_000)
     # Epoch-space subtraction, not (dt - now): both datetimes are naive LOCAL,
@@ -94,6 +130,12 @@ Row = tuple[DisplayTuple, SortTuple, str, str, bool | None]
 # sorts LAST ascending (max int64); a unit that never ran sorts OLDEST (-1).
 _SORT_NO_NEXT = 2**63 - 1
 _SORT_NO_LAST = -1
+
+
+def _ts_sort_key(ts_usec: int | None, missing_sentinel: int) -> int:
+    """Sort key for a µs timestamp: the value itself, or the sentinel when
+    missing (same 0-or-None policy as ts_missing — see its docstring)."""
+    return missing_sentinel if ts_missing(ts_usec) or ts_usec is None else ts_usec
 
 
 def _result_text(result: LastResult | None) -> str:
@@ -159,8 +201,8 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
             sort = (
                 t.unit,
                 status,
-                t.next_usec if t.next_usec is not None else _SORT_NO_NEXT,
-                t.last_usec if t.last_usec is not None else _SORT_NO_LAST,
+                _ts_sort_key(t.next_usec, _SORT_NO_NEXT),
+                _ts_sort_key(t.last_usec, _SORT_NO_LAST),
                 display[4],
             )
             ok = None if result is None else result.result == "success"

@@ -23,10 +23,18 @@ from PySide6.QtWidgets import (
 )
 
 from taskdeck.actions import ActionNotAllowed, action_argv
-from taskdeck.models import ROLE_ACTIVATES, ROLE_SORT, ROLE_UNIT, TaskTableModel
+from taskdeck.models import (
+    ROLE_ACTIVATES,
+    ROLE_SORT,
+    ROLE_UNIT,
+    TaskTableModel,
+    strip_ansi,
+    ts_missing,
+)
 from taskdeck.systemd_client import (
     SCOPE_SYSTEM,
     SCOPE_USER,
+    LastResult,
     ServiceRow,
     SystemdClient,
     TimerRow,
@@ -62,7 +70,23 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._timers: list[TimerRow] = []
         self._services: list[ServiceRow] = []
         self._pending: set[str] = set()
-        self._result_units: list[str] = []
+        # Unit list keyed by the EXACT results request id, so every response
+        # parses against the argv that produced it — a scope flip mid-flight
+        # can no longer misalign blocks against another scope's units
+        # (QA synthesis #6). Bounded: ≤1 in-flight per scope → ≤2 entries.
+        self._result_units_by_id: dict[str, list[str]] = {}
+        # Which scope the RENDERED rows came from. Action enablement requires
+        # it to match self.scope — otherwise the sub-second window after a
+        # scope flip leaves the old scope's rows interactive (QA synthesis #7).
+        self._data_scope: str | None = None
+        # Last parsed results, cached so the show-inactive toggle re-renders
+        # locally — a refresh() there would be single-flight-rejected
+        # mid-cycle and the checkbox would look dead for up to 10s.
+        self._last_results: dict[str, LastResult] = {}
+        # Kind of the currently displayed error, for kind-aware clearing:
+        # a fetch error is cleared by the SAME kind succeeding (recovery),
+        # while action messages persist until the next action (QA synthesis #5).
+        self._error_kind: str | None = None
         # Freshness filter for detail tabs: only responses whose FULL id is in
         # this set may write a tab (string equality, no id parsing — colons are
         # legal in unit names). Replaced wholesale on each selection, so stale
@@ -85,6 +109,12 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
 
         self._build_toolbar()
         self._build_central()
+        # Freshness lives in a PERMANENT widget: showMessage() would let the
+        # routine refresh line overwrite a posted error within one 10s cycle
+        # — the routine channel erasing the only record of a one-shot failure
+        # (QA synthesis #5). Permanent widgets coexist with showMessage.
+        self._freshness = QLabel("starting…")
+        self.statusBar().addPermanentWidget(self._freshness)
         self.statusBar().showMessage("Ready")
 
         self.client.finished.connect(self._on_finished)
@@ -122,6 +152,15 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self.view_box.currentIndexChanged.connect(lambda _i: self.refresh())
         bar.addWidget(QLabel(" View: "))
         bar.addWidget(self.view_box)
+
+        # Spec'd toggle (QA synthesis #10): without it, a service stopped
+        # from the GUI vanishes from the filtered view and the inverse
+        # operation is unreachable — Stop becomes a one-way door.
+        self.act_show_inactive = QAction("Show inactive", self)
+        self.act_show_inactive.setCheckable(True)
+        # Local re-render from cached data, deliberately NOT refresh().
+        self.act_show_inactive.toggled.connect(lambda _c: self._render_rows())
+        bar.addAction(self.act_show_inactive)
         bar.addSeparator()
 
         # QActions (not buttons) so enable/disable state is one flag per verb.
@@ -139,7 +178,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         bar.addSeparator()
 
         refresh = QAction("⟳ Refresh", self)
-        refresh.triggered.connect(self.refresh)
+        # Manual ⟳ is the universal recovery gesture: it also invalidates the
+        # detail-tab dedup, so frozen or stale tabs refetch (QA synthesis #4).
+        refresh.triggered.connect(self._manual_refresh)
         bar.addAction(refresh)
 
         self.filter_box = QLineEdit()
@@ -164,6 +205,16 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self.tab_details = self._make_text_tab("Details")
         self.tab_schedule = self._make_text_tab("Schedule")
         self.tab_unitfile = self._make_text_tab("Unit file")
+        # Shared by the failure AND parse-error paths — defined once, because
+        # a typo'd key in a duplicated literal would silently no-op (.get
+        # returning None is invisible), exactly the failure class this app
+        # exists to avoid.
+        self._kind_to_tab = {
+            "log": self.tab_log,
+            "details": self.tab_details,
+            "cat": self.tab_unitfile,
+            "calendar": self.tab_schedule,
+        }
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self.table)
@@ -189,11 +240,23 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
 
     def set_scope(self, scope: str) -> None:
         self.scope = scope
-        # Same unit name in another scope is a DIFFERENT unit — force refetch.
+        # Same unit name in another scope is a DIFFERENT unit — force refetch,
+        # drop in-flight tab responses from the old scope, and stop showing
+        # the old scope's tab content under the new label.
         self._last_detail_unit = None
+        self._expected_tab_ids = set()
+        for view in self._kind_to_tab.values():
+            view.setPlainText("(select a unit)")
         self._update_action_enablement()
         if self._auto_refresh:
             self.refresh()
+
+    def _manual_refresh(self) -> None:
+        """⟳: refresh AND invalidate the tab dedup so the selected unit's
+        tabs refetch — the user-reachable recovery path for any frozen or
+        stale detail state (parse failures deliberately do not auto-retry)."""
+        self._last_detail_unit = None
+        self.refresh()
 
     def refresh(self) -> None:
         self._pending = {f"timers:{self.scope}", f"services:{self.scope}"}
@@ -202,17 +265,40 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self.client.list_timers(self.scope)
         self.client.list_services(self.scope)
 
+    def _post_error(self, kind: str, message: str) -> None:
+        """All error posting routes through here: timestamped (a persistent
+        error must be self-dating, or a long-resolved one reads as current)
+        and kind-tagged for the clearing rule in _clear_error_if."""
+        self._error_kind = kind
+        self.statusBar().showMessage(f"ERROR {datetime.now():%H:%M:%S} {message}", 0)
+
+    def _clear_error_if(self, kind: str) -> None:
+        """Clear the displayed error when the SAME kind has now succeeded —
+        overwrite-on-recovery is correct for fetch channels. Action messages
+        use the kind 'action' and are never cleared here; they persist until
+        the next action or error replaces them."""
+        if self._error_kind == kind:
+            self._error_kind = None
+            self.statusBar().clearMessage()
+
     def _on_finished(self, request_id: str, stdout: str) -> None:
         # ONLY the kind is parsed from the id (see class docstring).
         kind = request_id.split(":", 1)[0]
         try:
             self._dispatch_finished(kind, request_id, stdout)
         except (ValueError, KeyError) as exc:
-            # Parse failures surface as error states, never an empty table
-            # pretending systemd has no units (no-silent-failure rule).
-            # KeyError covers parser records missing required fields; !r so
-            # its terse payload still names the missing key.
-            self.statusBar().showMessage(f"ERROR parsing {request_id}: {exc!r}", 0)
+            # Parse/validation failures surface as error states, never an
+            # empty table pretending systemd has no units. !r so a terse
+            # KeyError payload still names the missing key.
+            self._post_error(kind, f"parsing {request_id}: {exc!r}")
+            tab = self._kind_to_tab.get(kind)
+            if tab is not None and request_id in self._expected_tab_ids:
+                # A tab frozen at "loading…" would hide the failure. The
+                # dedup is deliberately LEFT SET: auto-retrying a persistently
+                # corrupt source would strobe "loading…" + three subprocess
+                # spawns every cycle (QA Phase B break) — ⟳ is the retry path,
+                # and the error stays visible right here meanwhile.
+                tab.setPlainText(f"(parse failed)\n{exc!r}")
 
     def _dispatch_finished(self, kind: str, request_id: str, stdout: str) -> None:
         if kind == "timers":
@@ -220,17 +306,39 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 return  # stale response from a scope the user left
             self._timers = parse_list_timers(stdout)
             self._pending.discard(request_id)
+            self._clear_error_if(kind)
         elif kind == "services":
             if request_id != f"services:{self.scope}":
                 return
             self._services = parse_list_units(stdout)
             self._pending.discard(request_id)
+            self._clear_error_if(kind)
         elif kind == "results":
-            if request_id == f"results:{self.scope}":
-                self._apply_results(stdout)
+            units = self._result_units_by_id.pop(request_id, None)
+            if units is None:
+                return  # response for a request we never recorded — drop
+            if request_id != f"results:{self.scope}":
+                return  # aligned, but belongs to a scope the user left — drop
+            self._clear_error_if(kind)
+            self._apply_results(stdout, units)
             return
         elif kind == "action":
-            self.statusBar().showMessage(f"{request_id} ok", 5000)
+            # The payload IS stderr for action ids (see the client): systemd
+            # explains no-ops there even at exit 0 — e.g. `enable` on an
+            # [Install]-less unit. Show its words, persistently; a bare "ok"
+            # would narrate nothing-happened as success.
+            unit = request_id.partition(":")[2]
+            self._error_kind = "action"
+            if stdout.strip():
+                self.statusBar().showMessage(
+                    f"{unit}: {datetime.now():%H:%M:%S} {stdout.strip()}", 0
+                )
+            else:
+                self.statusBar().showMessage(f"{unit}: command accepted", 0)
+            # The user just acted on this unit — fresh tabs are exactly what
+            # they want; clearing the dedup makes the post-refresh selection
+            # restore refetch them (QA synthesis #4).
+            self._last_detail_unit = None
             self.refresh()
             return
         elif kind in ("log", "details", "cat", "calendar"):
@@ -246,44 +354,72 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 {t.activates for t in self._timers} | {s.unit for s in self._services}
             )
             if not new_units:
-                self._result_units = []
-                self._apply_results("")
+                self._last_results = {}
+                self._data_scope = self.scope
+                self._render_rows()
                 return
             # Guard above is load-bearing: `show` with NO units dumps manager
             # properties, which the parser would reject downstream.
+            rid = f"results:{self.scope}"
             if self.client.fetch_results(self.scope, new_units):
-                self._result_units = new_units
-            # else: a previous results fetch is still in flight — keep the OLD
-            # unit list so its response parses against the argv that produced
-            # it (units and blocks must stay aligned). Fresh lists render on
-            # the next cycle.
+                self._result_units_by_id[rid] = new_units
+            # else: a previous results fetch is still in flight — its OWN
+            # entry stays recorded, so its response still parses against the
+            # argv that produced it. Fresh lists render on the next cycle.
 
-    def _apply_results(self, stdout: str) -> None:
-        results = parse_show_results(stdout, self._result_units)
+    def _apply_results(self, stdout: str, units: list[str]) -> None:
+        """Parse a results payload against ITS OWN unit list and render."""
+        self._last_results = parse_show_results(stdout, units)
+        self._data_scope = self.scope
+        self._render_rows()
+
+    def _render_rows(self) -> None:
+        """Render cached data into the model; restore selection and scroll.
+
+        Split from _apply_results so the show-inactive toggle can re-render
+        locally without a subprocess round-trip.
+        """
         now = datetime.now()
         # Model resets invalidate every index and clear the selection — left
         # alone, the 10s refresh would silently deselect the user's row and
-        # blank the action buttons. Capture and restore by unit name.
+        # blank the action buttons. Capture and restore by unit name. The
+        # viewport scroll position dies in the reset too (the view snaps to
+        # the top every cycle in long lists) — capture/restore around it.
         selected = self._selected()
         keep_unit = selected[0] if selected else None
+        scroll = self.table.verticalScrollBar().value()
         if self.view_box.currentIndex() == 0:  # 0 = Timers (index survives renames)
-            self.model.set_timer_rows(self._timers, self._services, results, now)
+            self.model.set_timer_rows(self._timers, self._services, self._last_results, now)
         else:
-            visible = [s for s in self._services if s.active != "inactive"]
-            self.model.set_service_rows(visible, results, now)
-        if keep_unit is not None:
-            self._reselect(keep_unit)
-        self.statusBar().showMessage(
-            f"{self.model.rowCount()} units · {self.scope} scope · refreshed {now:%H:%M:%S}", 0
+            services = self._services
+            if not self.act_show_inactive.isChecked():
+                services = [s for s in services if s.active != "inactive"]
+            self.model.set_service_rows(services, self._last_results, now)
+        self.table.verticalScrollBar().setValue(scroll)
+        if keep_unit is not None and not self._reselect(keep_unit):
+            # The selected unit VANISHED from the new data. A model reset
+            # clears the selection without any selectionChanged signal
+            # (QItemSelectionModel::reset is signal-free — QA Phase B), so
+            # invalidation must happen HERE; _on_selection never fires.
+            self._last_detail_unit = None
+            self._expected_tab_ids = set()
+            for view in self._kind_to_tab.values():
+                view.setPlainText("(unit no longer listed)")
+        self._freshness.setText(
+            f"{self.model.rowCount()} units · {self.scope} scope · refreshed {now:%H:%M:%S}"
         )
+        # The same signal-free reset means enablement is NOT re-evaluated
+        # when selection restoration fails — do it explicitly every render.
+        self._update_action_enablement()
 
-    def _reselect(self, unit: str) -> None:
-        """Re-select the row matching `unit` after a model reset, if present.
+    def _reselect(self, unit: str) -> bool:
+        """Re-select the row matching `unit` after a model reset.
 
-        Walks the PROXY (visible order) so filtering/sorting are respected;
-        a unit that vanished from the new data simply stays deselected. The
-        restored selection re-fires _on_selection, where _last_detail_unit
-        dedups the tab refetch.
+        Walks the PROXY (visible order) so filtering/sorting are respected.
+        Returns False when the unit is no longer present, so the caller can
+        invalidate tab state (no signal fires for that case). A successful
+        restore re-fires _on_selection, where _last_detail_unit dedups the
+        tab refetch.
         """
         for row in range(self.proxy.rowCount()):
             idx = self.proxy.index(row, 0)
@@ -293,23 +429,30 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                     QItemSelectionModel.SelectionFlag.ClearAndSelect
                     | QItemSelectionModel.SelectionFlag.Rows,
                 )
-                return
+                return True
+        return False
 
     def _on_failed(self, request_id: str, message: str) -> None:
-        # systemd's own words, verbatim — never an empty table pretending success.
-        self.statusBar().showMessage(f"ERROR [{request_id}]: {message}", 0)
+        # systemd's own words, verbatim — never an empty table pretending
+        # success. NOTE: a failed list fetch leaves _pending non-empty, so
+        # no render happens this cycle (last-good table + visible error);
+        # the next 10s refresh rebuilds _pending wholesale — self-heals.
+        kind = request_id.split(":", 1)[0]
+        self._post_error(kind, f"[{request_id}]: {message}")
+        # A failed results fetch must not leave its unit list behind — the
+        # id frees in the client, and a future response must not match it.
+        self._result_units_by_id.pop(request_id, None)
         # A detail tab frozen at "loading…" would hide the failure — write it
         # into the tab the response was meant for (freshness-gated like any
         # other tab write).
-        kind = request_id.split(":", 1)[0]
-        tab = {
-            "log": self.tab_log,
-            "details": self.tab_details,
-            "cat": self.tab_unitfile,
-            "calendar": self.tab_schedule,
-        }.get(kind)
+        tab = self._kind_to_tab.get(kind)
         if tab is not None and request_id in self._expected_tab_ids:
             tab.setPlainText(f"(fetch failed)\n{message}")
+            if kind == "cat":
+                # The Schedule tab is populated FROM the cat success branch;
+                # without this it stays at "loading…" forever for exactly the
+                # broken units this tool exists to investigate.
+                self.tab_schedule.setPlainText("(no schedule — unit file fetch failed)")
 
     # -- selection / detail tabs -----------------------------------------------
 
@@ -340,24 +483,40 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             f"details:{self.scope}:{unit}",
             f"cat:{self.scope}:{unit}",
         }
-        for view in (self.tab_log, self.tab_details, self.tab_schedule, self.tab_unitfile):
+        for view in self._kind_to_tab.values():
             view.setPlainText("loading…")
-        self.client.fetch_log(self.scope, unit)
-        self.client.fetch_details(self.scope, unit)
-        self.client.fetch_cat(self.scope, unit)
+        ok_log = self.client.fetch_log(self.scope, unit)
+        ok_details = self.client.fetch_details(self.scope, unit)
+        ok_cat = self.client.fetch_cat(self.scope, unit)
+        if not (ok_log and ok_details and ok_cat):
+            # RACE B (QA Phase B): a PRE-action fetch for this same unit may
+            # still be in flight; its id matches the freshly rebuilt
+            # freshness set, so its STALE payload will fill the tab as if
+            # fresh. Leaving the dedup unset makes the next cycle's reselect
+            # retry until all three fetches are actually accepted — bounded
+            # by the watchdog capping in-flight life.
+            self._last_detail_unit = None
 
     def _fill_tab(self, kind: str, stdout: str) -> None:
         if kind == "log":
             entries = parse_journal(stdout)
             lines = []
             for e in entries:
-                stamp = (
-                    datetime.fromtimestamp(e.ts_usec / 1_000_000).strftime("%b %d %H:%M:%S")
-                    if e.ts_usec
-                    else "—"
-                )
+                stamp = "—"
+                if not ts_missing(e.ts_usec) and e.ts_usec is not None:
+                    try:
+                        stamp = datetime.fromtimestamp(e.ts_usec / 1_000_000).strftime(
+                            "%b %d %H:%M:%S"
+                        )
+                    except (OverflowError, OSError, ValueError):
+                        # Corrupt-but-numeric epochs (this machine has journal
+                        # corruption) must render as missing — not crash the
+                        # whole tab, not clamp to a plausible-looking lie.
+                        stamp = "—"
                 marker = "✘ " if e.priority <= 3 else ""
-                lines.append(f"{stamp} {marker}{e.identifier}: {e.message}")
+                # ANSI stripped at render only — the parser stays a faithful
+                # transcription (see models.strip_ansi).
+                lines.append(f"{stamp} {marker}{e.identifier}: {strip_ansi(e.message)}")
             self.tab_log.setPlainText("\n".join(lines) or "(no journal entries)")
             self.tab_log.verticalScrollBar().setValue(
                 self.tab_log.verticalScrollBar().maximum()
@@ -392,7 +551,15 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
     # -- actions ---------------------------------------------------------------
 
     def _update_action_enablement(self) -> None:
-        allowed = self.scope == SCOPE_USER and self._selected() is not None
+        # _data_scope must match: in the sub-second window after a scope
+        # flip, the OLD scope's rows are still rendered and selectable —
+        # without this gate an action could target a same-named unit in the
+        # wrong scope (QA synthesis #7).
+        allowed = (
+            self.scope == SCOPE_USER
+            and self._data_scope == self.scope
+            and self._selected() is not None
+        )
         tooltip = "" if self.scope == SCOPE_USER else "system units are read-only by design"
         for act in self.action_buttons:
             act.setEnabled(allowed)
@@ -408,15 +575,22 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # service is what "run now" means to a Task Scheduler user.
         target = activates if run_now else unit
         if verb == "stop":
-            answer = QMessageBox.question(
-                self,
-                "Stop unit?",
-                f"Stop {target}?\n\nStopping can interrupt a job mid-run.",
-            )
+            # Per-view text: stopping a .timer cancels future SCHEDULING and
+            # never interrupts a currently running job — the generic warning
+            # would describe the wrong consequence (QA synthesis #13; the
+            # retarget-to-service alternative was rejected as racy in Phase B).
+            if self.view_box.currentIndex() == 0:
+                text = (
+                    f"Stop scheduling {target}?\n\nThis cancels future runs. A "
+                    "currently running job, if any, continues to completion."
+                )
+            else:
+                text = f"Stop {target}?\n\nStopping can interrupt a job mid-run."
+            answer = QMessageBox.question(self, "Stop unit?", text)
             if answer != QMessageBox.StandardButton.Yes:
                 return
         try:
-            argv = action_argv(verb, self.scope, target)
+            argv = action_argv(verb, self.scope, target, systemctl=self.client.systemctl_path)
         except ActionNotAllowed as exc:
             # Belt-and-suspenders: buttons are disabled in system scope, but if
             # enablement ever regresses, the guard still refuses — loudly.
