@@ -293,7 +293,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
         def on_timeout() -> None:
             if self._inflight.get(request_id) is not proc:
                 return  # already terminal (finished / spawn-failed / successor owns id)
-            proc.kill()  # triggers on_finished with CrashExit, which does the cleanup
+            proc.kill()  # the CrashExit echo is swallowed by on_finished's identity guard
             self._inflight.pop(request_id, None)
             self.failed.emit(request_id, f"{argv[0]} timed out after {self._timeout_ms} ms")
 
