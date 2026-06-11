@@ -282,7 +282,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
 
         def on_finished(exit_code: int, exit_status: QProcess.ExitStatus) -> None:
             if request_id not in self._inflight:
-                return  # timeout already reported; ignore the kill's echo
+                return  # timeout or on_error already reported; ignore the echo
             self._inflight.pop(request_id, None)
             watchdog.stop()
             if exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0:
@@ -309,6 +309,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
     # -- typed conveniences (argv assembly in ONE place) --------------------
 
     def _scope_args(self, scope: str) -> list[str]:
+        """Return the scope flag list for scope: ["--user"] for user, [] for system."""
         return ["--user"] if scope == SCOPE_USER else []
 
     def list_timers(self, scope: str) -> bool:
