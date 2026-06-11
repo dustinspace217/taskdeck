@@ -6,7 +6,7 @@ if a future refactor forgets to disable a button, the action still refuses.
 """
 from __future__ import annotations
 
-from taskdeck.systemd_client import SCOPE_USER, TimerRow
+from taskdeck.systemd_client import SCOPE_USER
 
 # v1 verb whitelist. Deliberately excludes mask/unmask/edit/daemon-reload —
 # anything that rewrites unit state on disk is v3 territory with its own
@@ -34,12 +34,3 @@ def action_argv(verb: str, scope: str, unit: str) -> list[str]:
     # from parsed systemd output, and leading-dash names are legal in systemd
     # (the root slice is "-.slice"). Probed 2026-06-11: systemctl accepts it.
     return ["systemctl", "--user", verb, "--", unit]
-
-
-def run_now_unit(row: TimerRow) -> str:
-    """'Run now' on a timer row starts the SERVICE it activates, not the timer.
-
-    Starting the .timer would merely (re)arm the schedule; starting the
-    activated .service is what Task Scheduler users mean by "run now".
-    """
-    return row.activates

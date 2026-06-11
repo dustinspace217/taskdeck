@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer
+from PySide6.QtCore import QItemSelectionModel, QSortFilterProxyModel, Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QComboBox,
@@ -63,6 +63,16 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._services: list[ServiceRow] = []
         self._pending: set[str] = set()
         self._result_units: list[str] = []
+        # Freshness filter for detail tabs: only responses whose FULL id is in
+        # this set may write a tab (string equality, no id parsing — colons are
+        # legal in unit names). Replaced wholesale on each selection, so stale
+        # responses for a unit the user left are dropped, and the calendar
+        # response can never append under another unit's schedule. Bounded: ≤4.
+        self._expected_tab_ids: set[str] = set()
+        # Dedup guard: the selected unit whose tabs are already loaded. Lets
+        # the post-refresh selection restore re-select without re-fetching
+        # (and re-flashing "loading…") every 10s cycle.
+        self._last_detail_unit: str | None = None
 
         self.model = TaskTableModel()
         self.proxy = QSortFilterProxyModel()
@@ -179,12 +189,16 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
 
     def set_scope(self, scope: str) -> None:
         self.scope = scope
+        # Same unit name in another scope is a DIFFERENT unit — force refetch.
+        self._last_detail_unit = None
         self._update_action_enablement()
         if self._auto_refresh:
             self.refresh()
 
     def refresh(self) -> None:
         self._pending = {f"timers:{self.scope}", f"services:{self.scope}"}
+        # Return values deliberately ignored: a single-flight rejection means
+        # the SAME id is already in flight, which satisfies _pending equally.
         self.client.list_timers(self.scope)
         self.client.list_services(self.scope)
 
@@ -193,10 +207,12 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         kind = request_id.split(":", 1)[0]
         try:
             self._dispatch_finished(kind, request_id, stdout)
-        except ValueError as exc:
+        except (ValueError, KeyError) as exc:
             # Parse failures surface as error states, never an empty table
             # pretending systemd has no units (no-silent-failure rule).
-            self.statusBar().showMessage(f"ERROR parsing {request_id}: {exc}", 0)
+            # KeyError covers parser records missing required fields; !r so
+            # its terse payload still names the missing key.
+            self.statusBar().showMessage(f"ERROR parsing {request_id}: {exc!r}", 0)
 
     def _dispatch_finished(self, kind: str, request_id: str, stdout: str) -> None:
         if kind == "timers":
@@ -218,35 +234,82 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             self.refresh()
             return
         elif kind in ("log", "details", "cat", "calendar"):
+            if request_id not in self._expected_tab_ids:
+                return  # stale response for a unit/scope no longer selected
             self._fill_tab(kind, stdout)
             return
+        else:
+            return  # unknown kind (future request types): never fall through
         if not self._pending:
             # Both lists landed → one batched show for every relevant service.
-            self._result_units = sorted(
+            new_units = sorted(
                 {t.activates for t in self._timers} | {s.unit for s in self._services}
             )
-            # Guard is load-bearing: `show` with NO units dumps manager
-            # properties, which the parser would reject downstream.
-            if self._result_units:
-                self.client.fetch_results(self.scope, self._result_units)
-            else:
+            if not new_units:
+                self._result_units = []
                 self._apply_results("")
+                return
+            # Guard above is load-bearing: `show` with NO units dumps manager
+            # properties, which the parser would reject downstream.
+            if self.client.fetch_results(self.scope, new_units):
+                self._result_units = new_units
+            # else: a previous results fetch is still in flight — keep the OLD
+            # unit list so its response parses against the argv that produced
+            # it (units and blocks must stay aligned). Fresh lists render on
+            # the next cycle.
 
     def _apply_results(self, stdout: str) -> None:
         results = parse_show_results(stdout, self._result_units)
         now = datetime.now()
-        if self.view_box.currentText() == "Timers":
+        # Model resets invalidate every index and clear the selection — left
+        # alone, the 10s refresh would silently deselect the user's row and
+        # blank the action buttons. Capture and restore by unit name.
+        selected = self._selected()
+        keep_unit = selected[0] if selected else None
+        if self.view_box.currentIndex() == 0:  # 0 = Timers (index survives renames)
             self.model.set_timer_rows(self._timers, self._services, results, now)
         else:
             visible = [s for s in self._services if s.active != "inactive"]
             self.model.set_service_rows(visible, results, now)
+        if keep_unit is not None:
+            self._reselect(keep_unit)
         self.statusBar().showMessage(
             f"{self.model.rowCount()} units · {self.scope} scope · refreshed {now:%H:%M:%S}", 0
         )
 
+    def _reselect(self, unit: str) -> None:
+        """Re-select the row matching `unit` after a model reset, if present.
+
+        Walks the PROXY (visible order) so filtering/sorting are respected;
+        a unit that vanished from the new data simply stays deselected. The
+        restored selection re-fires _on_selection, where _last_detail_unit
+        dedups the tab refetch.
+        """
+        for row in range(self.proxy.rowCount()):
+            idx = self.proxy.index(row, 0)
+            if idx.data(ROLE_UNIT) == unit:
+                self.table.selectionModel().select(
+                    idx,
+                    QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
+                return
+
     def _on_failed(self, request_id: str, message: str) -> None:
         # systemd's own words, verbatim — never an empty table pretending success.
         self.statusBar().showMessage(f"ERROR [{request_id}]: {message}", 0)
+        # A detail tab frozen at "loading…" would hide the failure — write it
+        # into the tab the response was meant for (freshness-gated like any
+        # other tab write).
+        kind = request_id.split(":", 1)[0]
+        tab = {
+            "log": self.tab_log,
+            "details": self.tab_details,
+            "cat": self.tab_unitfile,
+            "calendar": self.tab_schedule,
+        }.get(kind)
+        if tab is not None and request_id in self._expected_tab_ids:
+            tab.setPlainText(f"(fetch failed)\n{message}")
 
     # -- selection / detail tabs -----------------------------------------------
 
@@ -259,10 +322,24 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
 
     def _on_selection(self, *_args: object) -> None:
         self._update_action_enablement()
+        if not self._auto_refresh:
+            # Same contract as the constructor flag: ZERO subprocess side
+            # effects when disabled — selection fetches included. Gated before
+            # the placeholders so test screenshots don't freeze on "loading…".
+            return
         selected = self._selected()
         if selected is None:
             return
         unit, _activates = selected
+        if unit == self._last_detail_unit:
+            return  # same unit (e.g. post-refresh restore) — tabs already loaded
+        self._last_detail_unit = unit
+        # Freshness contract: only these exact ids may write tabs from now on.
+        self._expected_tab_ids = {
+            f"log:{self.scope}:{unit}",
+            f"details:{self.scope}:{unit}",
+            f"cat:{self.scope}:{unit}",
+        }
         for view in (self.tab_log, self.tab_details, self.tab_schedule, self.tab_unitfile):
             view.setPlainText("loading…")
         self.client.fetch_log(self.scope, unit)
@@ -299,6 +376,10 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             if cal_lines:
                 expr = cal_lines[0].partition("=")[2]
                 self.tab_schedule.setPlainText("\n".join(cal_lines) + "\n\n(calculating…)")
+                # Admit the calendar response into the freshness set BEFORE
+                # requesting it; a later selection replaces the whole set, so
+                # this response can never append under another unit's schedule.
+                self._expected_tab_ids.add(f"calendar:{expr}")
                 self.client.fetch_calendar(expr)
             else:
                 self.tab_schedule.setPlainText(
@@ -322,6 +403,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         if selected is None:
             return
         unit, activates = selected
+        # Run-now targets the ACTIVATED service (ROLE_ACTIVATES), not the
+        # timer: starting a .timer merely re-arms its schedule; starting the
+        # service is what "run now" means to a Task Scheduler user.
         target = activates if run_now else unit
         if verb == "stop":
             answer = QMessageBox.question(
