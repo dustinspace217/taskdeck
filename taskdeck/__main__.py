@@ -3,4 +3,7 @@ import sys
 
 from taskdeck.app import main
 
-sys.exit(main())
+# Guarded so importing taskdeck.__main__ (coverage tools, runpy edge cases)
+# can never launch the GUI as a side effect.
+if __name__ == "__main__":
+    sys.exit(main())

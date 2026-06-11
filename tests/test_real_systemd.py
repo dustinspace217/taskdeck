@@ -14,7 +14,11 @@ pytestmark = pytest.mark.realsystemd
 
 
 def run(argv):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=10, check=True).stdout
+    # check=False + explicit assert so a failure shows systemctl's actual
+    # stderr (CalledProcessError's default message omits it).
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=False)
+    assert proc.returncode == 0, f"{argv} failed: {proc.stderr}"
+    return proc.stdout
 
 
 def test_live_list_timers_parses():
@@ -26,4 +30,4 @@ def test_live_list_units_parses():
     rows = parse_list_units(
         run(["systemctl", "--user", "list-units", "--type=service", "-o", "json"])
     )
-    assert rows
+    assert rows, "a live user session always has loaded services; zero = contract drift"
