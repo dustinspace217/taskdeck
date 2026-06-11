@@ -58,3 +58,29 @@ def test_single_flight_coalesces_duplicate_request_ids(qtbot):
     # After completion the id frees up again:
     assert client.request("dup:test", [str(FAKEBIN / "fake_ok")]) is True
     qtbot.waitUntil(lambda: len(seen) == 2, timeout=3000)
+
+
+def test_spawn_failure_emits_failed(qtbot):
+    # Spawn failure (binary doesn't exist): finished() never fires, so the
+    # on_error path must report — and clean up — on its own. Closes DEF-A-02.
+    client = make_client(qtbot, "fake_ok")
+    with qtbot.waitSignal(client.failed, timeout=3000) as blocker:
+        client.request("spawn:fail", [str(FAKEBIN / "does_not_exist")])
+    rid, message = blocker.args
+    assert rid == "spawn:fail"
+    assert "failed to start" in message
+
+
+def test_timeout_emits_exactly_one_terminal_signal(qtbot):
+    # Regression test for the echo guards: after the watchdog reports a
+    # timeout, the killed process's death echoes (errorOccurred(Crashed) and
+    # finished(CrashExit)) arrive on later event-loop turns and must be
+    # swallowed — the regression is a second failed/finished for one request.
+    client = make_client(qtbot, "fake_hang", timeout_ms=300)
+    outcomes = []
+    client.finished.connect(lambda rid, out: outcomes.append(("finished", rid)))
+    client.failed.connect(lambda rid, msg: outcomes.append(("failed", rid)))
+    client.request("hang:once", [str(FAKEBIN / "fake_hang")])
+    qtbot.waitUntil(lambda: len(outcomes) >= 1, timeout=5000)
+    qtbot.wait(400)  # let the kill's echoes arrive and be (not) handled
+    assert outcomes == [("failed", "hang:once")]

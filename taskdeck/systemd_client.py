@@ -254,8 +254,9 @@ class SystemdClient(QObject):  # type: ignore[misc]
         self._analyze = analyze
         self._timeout_ms = timeout_ms
         # request_id -> QProcess; doubles as the single-flight registry.
-        # Bounded by the number of distinct request kinds (~8), not by call
-        # rate — that's the memory-bounding argument for keying by id.
+        # The dict itself is bounded by distinct request kinds (~8). Dead
+        # QProcess objects accumulate as children of this client — see the
+        # DEF-T4-01 comment in request() for why they are not freed.
         self._inflight: dict[str, QProcess] = {}
 
     # -- generic runner ----------------------------------------------------
@@ -268,6 +269,14 @@ class SystemdClient(QObject):  # type: ignore[misc]
         if request_id in self._inflight:
             return False
         proc = QProcess(self)
+        # KNOWN BOUNDED LEAK (DEF-T4-01): dead QProcess objects stay parented
+        # to this client until it is destroyed. Freeing them is deliberately
+        # NOT done — both deleteLater() inside a Python slot AND the canonical
+        # `proc.finished.connect(proc.deleteLater)` idiom segfault PySide6
+        # 6.11.1 / Python 3.14 during event processing (probed 2026-06-11,
+        # twice, different mechanisms — see plan deferments). Exposure is
+        # bounded by the on-demand window's lifetime (~3 small objects per
+        # 10s refresh). Revisit when PySide6 updates.
         self._inflight[request_id] = proc
 
         # QTimer (not QProcess.waitForFinished) keeps everything event-driven.
@@ -275,29 +284,47 @@ class SystemdClient(QObject):  # type: ignore[misc]
         watchdog.setSingleShot(True)
         watchdog.setInterval(self._timeout_ms)
 
+        # All three handlers guard on IDENTITY (`is proc`), not key presence:
+        # a killed process's death echoes arrive on a LATER event-loop turn,
+        # and if the same request_id was re-requested in that window, a bare
+        # key check would let the stale echo steal the successor's registry
+        # entry (spurious failed + the successor's real result swallowed).
+
         def on_timeout() -> None:
-            proc.kill()  # triggers on_finished with CrashExit
+            if self._inflight.get(request_id) is not proc:
+                return  # already terminal (finished / spawn-failed / successor owns id)
+            proc.kill()  # triggers on_finished with CrashExit, which does the cleanup
             self._inflight.pop(request_id, None)
             self.failed.emit(request_id, f"{argv[0]} timed out after {self._timeout_ms} ms")
 
         def on_finished(exit_code: int, exit_status: QProcess.ExitStatus) -> None:
-            if request_id not in self._inflight:
+            if self._inflight.get(request_id) is not proc:
                 return  # timeout or on_error already reported; ignore the echo
             self._inflight.pop(request_id, None)
             watchdog.stop()
-            if exit_status != QProcess.ExitStatus.NormalExit or exit_code != 0:
+            if exit_status != QProcess.ExitStatus.NormalExit:
+                stderr = proc.readAllStandardError().data().decode(errors="replace").strip()
+                self.failed.emit(request_id, f"{argv[0]} crashed: {stderr}")
+                return
+            if exit_code != 0:
                 stderr = proc.readAllStandardError().data().decode(errors="replace").strip()
                 self.failed.emit(request_id, f"{argv[0]} exit {exit_code}: {stderr}")
                 return
             stdout = proc.readAllStandardOutput().data().decode(errors="replace")
             self.finished.emit(request_id, stdout)
 
-        def on_error(_err: QProcess.ProcessError) -> None:
-            # Covers spawn failure (binary missing) — finished() never fires.
-            if request_id in self._inflight:
-                self._inflight.pop(request_id, None)
-                watchdog.stop()
-                self.failed.emit(request_id, f"failed to start {argv[0]}: {proc.errorString()}")
+        def on_error(err: QProcess.ProcessError) -> None:
+            # ONLY spawn failures (binary missing, fd exhaustion) — for those,
+            # finished() never fires, so cleanup must happen here. Crashes also
+            # fire errorOccurred, but they fall through to on_finished, which
+            # reads the real stderr instead of Qt's generic "Process crashed".
+            if err != QProcess.ProcessError.FailedToStart:
+                return
+            if self._inflight.get(request_id) is not proc:
+                return
+            self._inflight.pop(request_id, None)
+            watchdog.stop()
+            self.failed.emit(request_id, f"failed to start {argv[0]}: {proc.errorString()}")
 
         watchdog.timeout.connect(on_timeout)
         proc.finished.connect(on_finished)
@@ -357,9 +384,11 @@ class SystemdClient(QObject):  # type: ignore[misc]
     def fetch_calendar(self, expr: str) -> bool:
         # systemd-analyze calendar needs no scope; expression comes from the
         # unit file's OnCalendar= line. --iterations verified on systemd 258.
+        # "--" stops flag parsing: a malformed expression starting with "-"
+        # (this app exists to inspect broken units) must not become a flag.
         return self.request(
             f"calendar:{expr}",
-            [self._analyze, "calendar", "--iterations=5", expr],
+            [self._analyze, "calendar", "--iterations=5", "--", expr],
         )
 
     def run_action(self, argv: list[str], unit: str) -> bool:
