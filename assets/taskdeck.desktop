@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Task Deck
+GenericName=systemd Task Scheduler
+Comment=See and run your systemd timers and services
+# Path= sets the working directory — the flat taskdeck package is importable
+# from the repo root only (deliberately no pip packaging; RPM-only deps).
+Exec=python3 -m taskdeck
+Path=/home/dustin/Claude/systemd-task-gui
+Icon=/home/dustin/Claude/systemd-task-gui/assets/taskdeck.svg
+Terminal=false
+Categories=System;Monitor;Qt;
+Keywords=systemd;timer;service;task;scheduler;cron;job;unit;

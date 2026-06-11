@@ -13,6 +13,10 @@ def main() -> int:
     """Build the app and run the Qt event loop; returns the exit code."""
     app = QApplication(sys.argv)
     app.setApplicationName("Task Deck")
+    # Associates the Wayland window (app_id) with taskdeck.desktop, so the
+    # taskbar/switcher show the launcher's icon and group correctly when
+    # started from the Kickoff menu or KRunner.
+    app.setDesktopFileName("taskdeck")
     client = SystemdClient()
     window = MainWindow(client)
 

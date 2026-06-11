@@ -11,6 +11,11 @@ whether it worked, and its logs. Built with PySide6/Qt Widgets on Fedora KDE.
     sudo dnf install python3-pyside6
     python3 -m taskdeck
 
+## Desktop launcher (Start menu, KRunner search, taskbar pinning)
+    cp assets/taskdeck.desktop ~/.local/share/applications/
+The entry hardcodes this repo's path in `Exec=`/`Path=`/`Icon=` — if the repo
+moves, update those three lines. Already installed on the dev machine.
+
 ## Develop
     sudo dnf install python3-pytest-qt ruff python3-mypy
     python3 -m pytest          # hermetic suite (offscreen Qt)
