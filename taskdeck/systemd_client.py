@@ -45,7 +45,10 @@ class LastResult:
     """Last-run outcome of a service, from `systemctl show -p Result,ExecMainStatus`.
 
     result is systemd's Result property ("success", "exit-code", "timeout", …);
-    exec_status is the main process exit code, None if the unit never ran.
+    exec_status is ExecMainStatus as an int. NOTE: a loaded-but-never-run
+    service still reports ExecMainStatus=0 — None here means the KEY WAS
+    ABSENT from the unit's block (non-service unit, truncated output), not
+    "never ran".
     """
 
     result: str
@@ -67,6 +70,8 @@ def parse_list_timers(text: str) -> list[TimerRow]:
 
     Raises ValueError (from json) on malformed input — callers surface that as
     an error state, never an empty table (no-silent-failure rule).
+    Records missing required fields (unit/activates) raise KeyError — same policy:
+    surface, never swallow.
     """
     raw = json.loads(text)
     return [
@@ -81,7 +86,10 @@ def parse_list_timers(text: str) -> list[TimerRow]:
 
 
 def parse_list_units(text: str) -> list[ServiceRow]:
-    """Parse `systemctl list-units --type=service -o json` output."""
+    """Parse `systemctl list-units --type=service -o json` output.
+
+    Records missing the unit field raise KeyError — surfaced, never swallowed.
+    """
     raw = json.loads(text)
     return [
         ServiceRow(
@@ -98,27 +106,54 @@ def parse_list_units(text: str) -> list[ServiceRow]:
 def parse_show_results(text: str, units: list[str]) -> dict[str, LastResult]:
     """Parse batched `systemctl show U1 U2… -p Result,ExecMainStatus,…` output.
 
-    The output is one Key=Value block per unit, blank-line separated, in
-    ARGUMENT ORDER (verified empirically — systemd prints requested units in
-    the order given). `units` must therefore be the exact argv order. Units
-    beyond the block count (or with empty blocks) get no entry — absence
-    means "unknown", which the UI renders as "—", not as success.
+    systemctl prints one Key=Value block per requested unit, in ARGUMENT
+    ORDER, separated by blank lines. A unit that has NONE of the requested
+    properties (a .target, a dangling `activates` name) contributes an EMPTY
+    block — probed 2026-06-10: `show basic.target X.service -p Result,…`
+    emits a leading blank line. A naive strip()+split("\\n\\n") silently
+    shifts every later block onto the wrong unit (a failed unit could render
+    as success on the wrong row), so this walks lines and advances the unit
+    index at each blank line, preserving alignment under empty blocks.
+
+    Units with empty blocks (or beyond a truncated output) get no entry —
+    absence means "unknown", which the UI renders as "—", never as success.
+    Raises ValueError if systemctl emits MORE non-empty blocks than units
+    were given: that means the argv and this parser disagree on the contract.
     """
-    blocks = text.strip().split("\n\n")
     results: dict[str, LastResult] = {}
-    for unit, block in zip(units, blocks, strict=False):
-        props: dict[str, str] = {}
-        for line in block.splitlines():
-            key, sep, value = line.partition("=")
-            if sep:
-                props[key] = value
+    idx = 0
+    props: dict[str, str] = {}
+
+    def flush_block() -> None:
+        """Record the accumulated block for units[idx]; empty blocks no-op."""
+        nonlocal props
         if not props:
-            continue
+            return
+        if idx >= len(units):
+            raise ValueError(
+                f"systemctl show returned more blocks than the {len(units)} requested units"
+            )
         status_text = props.get("ExecMainStatus", "")
-        results[unit] = LastResult(
-            result=props.get("Result", ""),
-            exec_status=int(status_text) if status_text.lstrip("-").isdigit() else None,
+        # EAFP int parsing: .isdigit() guards accept strings int() rejects
+        # ("--1", unicode digits); try/except is both shorter and correct.
+        try:
+            exec_status: int | None = int(status_text)
+        except ValueError:
+            exec_status = None
+        results[units[idx]] = LastResult(
+            result=props.get("Result", ""), exec_status=exec_status
         )
+        props = {}
+
+    for line in text.splitlines():
+        if not line.strip():
+            flush_block()
+            idx += 1
+            continue
+        key, sep, value = line.partition("=")
+        if sep:
+            props[key] = value
+    flush_block()
     return results
 
 
@@ -146,13 +181,21 @@ def parse_journal(text: str) -> list[LogEntry]:
             # repr rather than dropping the line (visibility over beauty).
             message = str(message)
         ts_text = str(obj.get("__REALTIME_TIMESTAMP", ""))
+        try:
+            ts_usec: int | None = int(ts_text)
+        except ValueError:
+            ts_usec = None
         priority_text = str(obj.get("PRIORITY", "7"))
+        try:
+            priority = int(priority_text)
+        except ValueError:
+            priority = 7
         entries.append(
             LogEntry(
-                ts_usec=int(ts_text) if ts_text.isdigit() else None,
+                ts_usec=ts_usec,
                 identifier=str(obj.get("SYSLOG_IDENTIFIER", "")),
                 message=message,
-                priority=int(priority_text) if priority_text.isdigit() else 7,
+                priority=priority,
             )
         )
     if bad and not entries:

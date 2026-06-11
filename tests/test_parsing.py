@@ -62,8 +62,8 @@ def test_parse_show_results_blank_line_separated_blocks_in_arg_order():
 
 
 def test_parse_show_results_tolerates_missing_keys_and_short_output():
-    # A never-run unit can produce an empty block; a unit list longer than the
-    # output must not raise — absent units simply have no entry.
+    # A block can lack ExecMainStatus entirely (non-service units); a unit
+    # list longer than the output must not raise — absent units get no entry.
     results = parse_show_results("Result=success\n", ["a.service", "b.service"])
     assert results["a.service"].result == "success"
     assert results["a.service"].exec_status is None
@@ -86,3 +86,60 @@ def test_parse_journal_skips_garbage_lines_loudly():
     assert len(entries) == 1
     with pytest.raises(ValueError):
         parse_journal("not json at all\n")
+
+
+def test_parse_show_results_leading_empty_block_keeps_alignment():
+    # Probed 2026-06-10: a unit with none of the requested properties (e.g. a
+    # .target) emits an EMPTY block — `show basic.target a.service -p …`
+    # output begins with a blank line. The result must land on a.service;
+    # basic.target gets no entry, and nothing is misattributed.
+    text = "\nResult=success\nExecMainExitTimestamp=Wed\nExecMainStatus=0\n"
+    results = parse_show_results(text, ["basic.target", "a.service"])
+    assert "basic.target" not in results
+    assert results["a.service"] == LastResult("success", 0)
+
+
+def test_parse_show_results_middle_empty_block_keeps_alignment():
+    text = "Result=success\nExecMainStatus=0\n\n\nResult=exit-code\nExecMainStatus=1\n"
+    results = parse_show_results(text, ["a.service", "b.target", "c.service"])
+    assert results["a.service"] == LastResult("success", 0)
+    assert "b.target" not in results
+    assert results["c.service"] == LastResult("exit-code", 1)
+
+
+def test_parse_show_results_distinct_values_land_on_their_units():
+    # Guards the argument-order contract with DISTINGUISHABLE per-unit values
+    # (the real fixture's two blocks are identical, so it can't catch swaps).
+    text = "Result=success\nExecMainStatus=0\n\nResult=exit-code\nExecMainStatus=1\n"
+    results = parse_show_results(text, ["ok.service", "bad.service"])
+    assert results["ok.service"] == LastResult("success", 0)
+    assert results["bad.service"] == LastResult("exit-code", 1)
+
+
+def test_parse_show_results_more_blocks_than_units_raises():
+    text = "Result=success\n\nResult=exit-code\n"
+    with pytest.raises(ValueError):
+        parse_show_results(text, ["only.service"])
+
+
+def test_parse_journal_empty_output_is_empty_not_error():
+    # Probed 2026-06-10: `journalctl -o json` for a unit with no entries emits
+    # NOTHING on stdout (the "-- No entries --" marker is human-format only).
+    # Empty input is therefore a legitimate empty log, not a broken call.
+    assert parse_journal("") == []
+
+
+def test_parse_journal_bytearray_message_renders_as_repr():
+    # journald stores non-UTF8 payloads as byte arrays (the one documented
+    # contract quirk); they must render as their repr, not vanish.
+    line = '{"MESSAGE":[72,105],"__REALTIME_TIMESTAMP":"1781136604691295","PRIORITY":"6"}'
+    entries = parse_journal(line)
+    assert entries[0].message == "[72, 105]"
+
+
+def test_parse_list_units_preserves_escaped_unit_names():
+    # \x2d escapes in unit names are displayed AS-IS in v1 (spec decision);
+    # pin the passthrough so a future "helpful" unescape shows up as a diff.
+    rows = parse_list_units((FIXTURES / "list_units.json").read_text())
+    escaped = [r.unit for r in rows if "\\x2d" in r.unit]
+    assert escaped, "fixture contains escaped names; passthrough must preserve them"
