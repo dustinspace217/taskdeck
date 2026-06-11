@@ -12,7 +12,7 @@ from typing import Any
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPersistentModelIndex, Qt
 from PySide6.QtGui import QBrush, QColor
 
-from taskdeck.systemd_client import LastResult, ServiceRow, TimerRow
+from taskdeck.systemd_client import LastResult, ScheduleInfo, ServiceRow, TimerRow
 
 
 def ts_missing(ts_usec: int | None) -> bool:
@@ -43,6 +43,89 @@ def strip_ansi(text: str) -> str:
     export path.
     """
     return _ANSI_RE.sub("", text)
+
+
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+# Monotonic trigger kinds → human phrasing. systemd's `show` output spells
+# these with USec (not the unit-file *Sec forms). OnStartupUSec anchors to
+# the USER MANAGER's startup, which for a user instance means login.
+_MONOTONIC_LABELS = {
+    "OnBootUSec": "boot+{v}",
+    "OnStartupUSec": "login+{v}",
+    "OnUnitActiveUSec": "every {v}",
+    "OnUnitInactiveUSec": "{v} after stop",
+    "OnActiveUSec": "{v} after timer start",
+}
+
+
+def _classify_calendar(expr: str) -> str:
+    """Bucket a NORMALIZED OnCalendar expression into a cadence word.
+
+    `systemctl show` emits normalized expressions ("daily" arrives as
+    "*-*-* 00:00:00"), so the buckets match on the normalized shape.
+    Unrecognized shapes fall back to the raw expression — an honest raw
+    string beats a wrong bucket.
+    """
+    # A trailing timezone token (UTC, America/Los_Angeles, …) doesn't change
+    # the cadence bucket — strip it before shape-matching.
+    parts = expr.split()
+    if parts and (parts[-1] == "UTC" or "/" in parts[-1]):
+        parts = parts[:-1]
+    if not parts:
+        return expr
+    weekday: str | None = None
+    idx = 0
+    if parts[0][0].isalpha():
+        weekday = parts[0]
+        idx = 1
+    date = parts[idx] if idx < len(parts) else "*-*-*"
+    time = parts[idx + 1] if idx + 1 < len(parts) else "00:00:00"
+    if weekday is not None:
+        normalized_span = weekday.replace("..", "-")
+        if normalized_span in ("Mon-Fri", "Mon,Tue,Wed,Thu,Fri"):
+            return "weekdays"
+        return f"weekly ({weekday})"
+    hours = time.partition(":")[0]
+    if hours == "*":
+        return "hourly"
+    if "," in hours:
+        return f"{len(hours.split(','))}×/day"
+    year, _, month_day = date.partition("-")
+    month, _, day = month_day.partition("-")
+    if (year, month, day) == ("*", "*", "*"):
+        return "daily"
+    if (year, month) == ("*", "*"):
+        return "monthly"
+    if year == "*":
+        return "yearly"
+    return expr
+
+
+def classify_cadence(info: ScheduleInfo | None) -> str:
+    """One human phrase for how often a timer fires — Dustin's request
+    (2026-06-11): "daily, weekly, monthly, weekdays, every boot, etc."
+
+    Multi-trigger timers join their buckets with " + " (e.g. a timer with
+    OnUnitActiveUSec=1d and OnBootUSec=12h reads "every 1d + boot+12h").
+    """
+    if info is None:
+        return "—"
+    parts = [_classify_calendar(expr) for expr in info.calendar]
+    parts += [_classify_monotonic(spec) for spec in info.monotonic]
+    deduped: list[str] = []
+    for part in parts:
+        if part not in deduped:
+            deduped.append(part)
+    return " + ".join(deduped) if deduped else "—"
+
+
+def _classify_monotonic(spec: str) -> str:
+    key, _, value = spec.partition("=")
+    template = _MONOTONIC_LABELS.get(key)
+    if template is None:
+        return spec  # unrecognized trigger kind: show it raw, never guess
+    return template.format(v=value)
 
 
 def format_delta(seconds: float) -> str:
@@ -98,7 +181,7 @@ def format_when(ts_usec: int | None, now: datetime) -> str:
     return f"{absolute} ({relative})"
 
 
-COLUMNS = ("Task", "Status", "Next run", "Last run", "Last result")
+COLUMNS = ("Task", "Status", "Cadence", "Next run", "Last run", "Last result")
 
 # Custom item roles so the window can recover unit names from a selected row
 # without parsing display text (display strings are for humans only).
@@ -122,8 +205,8 @@ _RED = QBrush(QColor(0xE5, 0x73, 0x73))
 # Type aliases keep the row-tuple annotations readable. DisplayTuple holds one
 # rendered string per column; SortTuple holds the per-column sort key served
 # via ROLE_SORT (ints for the time columns → chronological sorting).
-DisplayTuple = tuple[str, str, str, str, str]
-SortTuple = tuple[str, str, int, int, str]
+DisplayTuple = tuple[str, str, str, str, str, str]
+SortTuple = tuple[str, str, str, int, int, str]
 Row = tuple[DisplayTuple, SortTuple, str, str, bool | None]
 
 # Sentinels for missing timestamps in sort keys: a timer with no next elapse
@@ -169,12 +252,14 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
         timers: list[TimerRow],
         services: list[ServiceRow],
         results: dict[str, LastResult],
+        schedules: dict[str, ScheduleInfo],
         now: datetime,
     ) -> None:
         """Populate the Timers view: one row per timer, joined to its service.
 
         services supplies live state for the activated unit; results supplies
-        last-run outcomes (absent key = unknown, rendered "—").
+        last-run outcomes; schedules supplies effective triggers for the
+        Cadence column (absent key = unknown, rendered "—" in each case).
         """
         services_by_name = {s.unit: s for s in services}
         rows: list[Row] = []
@@ -191,9 +276,11 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
             else:
                 status = "○ inactive"
             result = results.get(t.activates)
+            cadence = classify_cadence(schedules.get(t.unit))
             display = (
                 t.unit,
                 status,
+                cadence,
                 format_when(t.next_usec, now),
                 format_when(t.last_usec, now),
                 _result_text(result),
@@ -201,9 +288,10 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
             sort = (
                 t.unit,
                 status,
+                cadence,
                 _ts_sort_key(t.next_usec, _SORT_NO_NEXT),
                 _ts_sort_key(t.last_usec, _SORT_NO_LAST),
-                display[4],
+                display[5],
             )
             ok = None if result is None else result.result == "success"
             rows.append((display, sort, t.unit, t.activates, ok))
@@ -225,8 +313,9 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
             if s.active == "failed":
                 status = "✘ failed"
             result = results.get(s.unit)
-            display = (s.unit, status, "—", "—", _result_text(result))
-            sort = (s.unit, status, _SORT_NO_NEXT, _SORT_NO_LAST, display[4])
+            # Services have no schedule of their own — cadence is "—".
+            display = (s.unit, status, "—", "—", "—", _result_text(result))
+            sort = (s.unit, status, "—", _SORT_NO_NEXT, _SORT_NO_LAST, display[5])
             ok = None if result is None else result.result == "success"
             # Services activate themselves; ROLE_ACTIVATES = own unit name.
             rows.append((display, sort, s.unit, s.unit, ok))

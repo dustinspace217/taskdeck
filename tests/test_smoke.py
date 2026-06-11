@@ -9,7 +9,13 @@ from datetime import datetime
 from pathlib import Path
 
 from taskdeck.main_window import MainWindow
-from taskdeck.systemd_client import LastResult, ServiceRow, SystemdClient, TimerRow
+from taskdeck.systemd_client import (
+    LastResult,
+    ScheduleInfo,
+    ServiceRow,
+    SystemdClient,
+    TimerRow,
+)
 
 ARTIFACTS = Path(__file__).parent / "artifacts"
 FAKEBIN = Path(__file__).parent / "fakebin"
@@ -31,6 +37,7 @@ def test_window_builds_and_renders(qtbot):
         [TimerRow("a.timer", "a.service", 1781136604691295, 1781115051863104)],
         [ServiceRow("a.service", "loaded", "active", "running", "A")],
         {"a.service": LastResult("success", 0)},
+        {"a.timer": ScheduleInfo(calendar=("*-*-* 03:50:00",), monotonic=())},
         now=datetime(2026, 6, 10, 19, 0, 0),
     )
     # Enablement requires the rendered data's scope to match the active scope

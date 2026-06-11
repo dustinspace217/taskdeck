@@ -11,12 +11,14 @@ import pytest
 from taskdeck.systemd_client import (
     LastResult,
     LogEntry,
+    ScheduleInfo,
     ServiceRow,
     TimerRow,
     parse_journal,
     parse_list_timers,
     parse_list_units,
     parse_show_results,
+    parse_show_schedules,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -179,6 +181,43 @@ def test_parse_list_timers_rejects_non_array_payload():
 def test_parse_list_units_rejects_null_unit_name():
     with pytest.raises(ValueError, match="unit"):
         parse_list_units('[{"unit":null,"load":"loaded","active":"active","sub":"r"}]')
+
+
+def test_parse_show_schedules_fixture_round_trip():
+    # Real capture (probed 2026-06-11): single calendar trigger with a tz
+    # suffix; a TWO-trigger monotonic timer (the key repeats per trigger);
+    # a calendar trigger with an IANA timezone. Re-capture prerequisite:
+    # keep one multi-trigger monotonic timer in the set.
+    text = (FIXTURES / "show_schedules.txt").read_text()
+    units = [
+        "astrowidget-fetch.timer",
+        "boothang-update-check.timer",
+        "memory-consolidation.timer",
+    ]
+    schedules = parse_show_schedules(text, units)
+    fetch = schedules["astrowidget-fetch.timer"]
+    assert fetch.calendar == ("*-*-* 00,06,12,18:10:00 UTC",)
+    assert fetch.monotonic == ()
+    assert fetch.next_elapse.startswith("Thu")
+    boothang = schedules["boothang-update-check.timer"]
+    assert boothang.calendar == ()
+    assert boothang.monotonic == ("OnUnitActiveUSec=1d", "OnBootUSec=12h")
+    assert boothang.next_elapse == ""
+    memory = schedules["memory-consolidation.timer"]
+    assert memory.calendar == ("Mon *-*-* 06:00:00 America/Los_Angeles",)
+
+
+def test_parse_show_schedules_rejects_unrecognized_trigger_shape():
+    # Fail-loud contract: a half-parsed schedule rendered confidently is the
+    # bug class this parser replaced (QA AT-F6).
+    with pytest.raises(ValueError, match="unrecognized trigger"):
+        parse_show_schedules("TimersCalendar=garbage without braces\n", ["x.timer"])
+
+
+def test_parse_show_schedules_empty_property_means_no_triggers():
+    text = "TimersCalendar=\nTimersMonotonic=\nNextElapseUSecRealtime=\n"
+    schedules = parse_show_schedules(text, ["x.timer"])
+    assert schedules["x.timer"] == ScheduleInfo((), (), "")
 
 
 def test_parse_journal_empty_output_is_empty_not_error():

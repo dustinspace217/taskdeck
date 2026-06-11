@@ -1,0 +1,9 @@
+TimersCalendar={ OnCalendar=*-*-* 00,06,12,18:10:00 UTC ; next_elapse=Thu 2026-06-11 17:10:00 PDT }
+NextElapseUSecRealtime=Thu 2026-06-11 17:10:27 PDT
+
+TimersMonotonic={ OnUnitActiveUSec=1d ; next_elapse=5d 13h 3min 51.865797s }
+TimersMonotonic={ OnBootUSec=12h ; next_elapse=12h }
+NextElapseUSecRealtime=
+
+TimersCalendar={ OnCalendar=Mon *-*-* 06:00:00 America/Los_Angeles ; next_elapse=Mon 2026-06-15 06:00:00 PDT }
+NextElapseUSecRealtime=Mon 2026-06-15 06:02:23 PDT

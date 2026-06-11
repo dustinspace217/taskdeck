@@ -10,6 +10,7 @@ docs/superpowers/plans/2026-06-10-taskdeck-v1.md "Verified data contracts".
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
@@ -55,6 +56,24 @@ class LastResult:
 
     result: str
     exec_status: int | None
+
+
+@dataclass(frozen=True)
+class ScheduleInfo:
+    """A timer's EFFECTIVE triggers, from `systemctl show` — never re-derived
+    from unit-file text (drop-in overrides, `OnCalendar =` spacing, and
+    multi-line schedules all made text-scraping lie; QA AT-F6 / DEF-V11-02).
+
+    calendar holds normalized OnCalendar expressions (may carry a timezone
+    suffix like "UTC" or "America/Los_Angeles"); monotonic holds spec strings
+    like "OnBootUSec=12h" — note systemd's USec-spelled property names, not
+    the unit-file *Sec forms; next_elapse is systemd's human-readable
+    NextElapseUSecRealtime ("" when empty/none).
+    """
+
+    calendar: tuple[str, ...]
+    monotonic: tuple[str, ...]
+    next_elapse: str = ""
 
 
 @dataclass(frozen=True)
@@ -154,19 +173,12 @@ def parse_show_results(text: str, units: list[str]) -> dict[str, LastResult]:
     were given: that means the argv and this parser disagree on the contract.
     """
     results: dict[str, LastResult] = {}
-    idx = 0
-    props: dict[str, str] = {}
-
-    def flush_block() -> None:
-        """Record the accumulated block for units[idx]; empty blocks no-op."""
-        nonlocal props
-        if not props:
-            return
-        if idx >= len(units):
-            raise ValueError(
-                f"systemctl show returned more blocks than the {len(units)} requested units"
-            )
-        status_text = props.get("ExecMainStatus", "")
+    for unit, lines in _walk_show_blocks(text, units):
+        props: dict[str, str] = {}
+        for line in lines:
+            key, sep, value = line.partition("=")
+            if sep:
+                props[key] = value
         # NEVER-RAN GATE (probed 2026-06-11): a loaded-but-never-run service
         # reports Result=success and ExecMainStatus=0 — those are DEFAULTS,
         # not evidence; rendering them green told the user "it ran and it
@@ -181,29 +193,88 @@ def parse_show_results(text: str, units: list[str]) -> dict[str, LastResult]:
         # converts false-success to unknown, not to truth — post-relogin the
         # only surviving failure evidence is the journal.
         if not props.get("ExecMainExitTimestamp", ""):
-            props = {}
-            return
+            continue
         # EAFP int parsing: .isdigit() guards accept strings int() rejects
         # ("--1", unicode digits); try/except is both shorter and correct.
         try:
-            exec_status: int | None = int(status_text)
+            exec_status: int | None = int(props.get("ExecMainStatus", ""))
         except ValueError:
             exec_status = None
-        results[units[idx]] = LastResult(
-            result=props.get("Result", ""), exec_status=exec_status
-        )
-        props = {}
+        results[unit] = LastResult(result=props.get("Result", ""), exec_status=exec_status)
+    return results
+
+
+def _walk_show_blocks(text: str, units: list[str]) -> list[tuple[str, list[str]]]:
+    """Split batched `systemctl show` output into (unit, lines) blocks.
+
+    The alignment contract parse_show_results documents lives HERE so every
+    show-parser shares one implementation: blocks arrive in ARGUMENT ORDER
+    separated by blank lines, and a property-less unit emits an EMPTY block
+    (probed 2026-06-10) — so the walk advances the unit index at each blank
+    line; empty blocks yield nothing; more NON-EMPTY blocks than units raises
+    (the argv and the parser disagree about the contract).
+    """
+    out: list[tuple[str, list[str]]] = []
+    idx = 0
+    acc: list[str] = []
+
+    def flush() -> None:
+        nonlocal acc
+        if not acc:
+            return
+        if idx >= len(units):
+            raise ValueError(
+                f"systemctl show returned more blocks than the {len(units)} requested units"
+            )
+        out.append((units[idx], acc))
+        acc = []
 
     for line in text.splitlines():
         if not line.strip():
-            flush_block()
+            flush()
             idx += 1
             continue
-        key, sep, value = line.partition("=")
-        if sep:
-            props[key] = value
-    flush_block()
-    return results
+        acc.append(line)
+    flush()
+    return out
+
+
+# One trigger per line: `TimersCalendar={ OnCalendar=<expr> ; next_elapse=<ts> }`
+# with the key REPEATED for multi-trigger timers (probed 2026-06-11).
+_TRIGGER_RE = re.compile(r"\{ (\w+)=(.+?) ; next_elapse=")
+
+
+def parse_show_schedules(text: str, units: list[str]) -> dict[str, ScheduleInfo]:
+    """Parse batched `show -p TimersCalendar,TimersMonotonic,NextElapse…`.
+
+    Fail-loud contract: an unrecognized trigger-line shape raises ValueError —
+    a half-parsed schedule rendered confidently is exactly the bug class this
+    parser replaced (text-scraped unit files, QA AT-F6).
+    """
+    out: dict[str, ScheduleInfo] = {}
+    for unit, lines in _walk_show_blocks(text, units):
+        calendar: list[str] = []
+        monotonic: list[str] = []
+        next_elapse = ""
+        for line in lines:
+            key, _, value = line.partition("=")
+            if key in ("TimersCalendar", "TimersMonotonic"):
+                if not value:
+                    continue  # property present but empty — no trigger of this kind
+                match = _TRIGGER_RE.match(value)
+                if match is None:
+                    raise ValueError(f"schedules: unrecognized trigger line for {unit}: {line!r}")
+                spec_key, spec_value = match.group(1), match.group(2)
+                if key == "TimersCalendar":
+                    # spec_key is always OnCalendar here; the expression alone
+                    # is what classification and systemd-analyze consume.
+                    calendar.append(spec_value)
+                else:
+                    monotonic.append(f"{spec_key}={spec_value}")
+            elif key == "NextElapseUSecRealtime":
+                next_elapse = value
+        out[unit] = ScheduleInfo(tuple(calendar), tuple(monotonic), next_elapse)
+    return out
 
 
 def parse_journal(text: str) -> list[LogEntry]:
@@ -265,6 +336,9 @@ DETAIL_PROPS = (
     "MemoryCurrent,MemoryPeak,CPUUsageNSec,TriggeredBy,Triggers"
 )
 RESULT_PROPS = "Result,ExecMainStatus,ExecMainExitTimestamp"
+# Effective trigger data for the Cadence column AND the Schedule tab — one
+# property set so both consumers share fixtures and parsing (DEF-V11-02).
+SCHEDULE_PROPS = "TimersCalendar,TimersMonotonic,NextElapseUSecRealtime"
 
 
 class SystemdClient(QObject):  # type: ignore[misc]
@@ -429,6 +503,20 @@ class SystemdClient(QObject):  # type: ignore[misc]
         return self.request(
             f"results:{scope}",
             [self._systemctl, *self._scope_args(scope), "show", *units, "-p", RESULT_PROPS],
+        )
+
+    def fetch_schedules(self, scope: str, units: list[str]) -> bool:
+        """Batched effective-trigger fetch for the Cadence column."""
+        return self.request(
+            f"schedules:{scope}",
+            [self._systemctl, *self._scope_args(scope), "show", *units, "-p", SCHEDULE_PROPS],
+        )
+
+    def fetch_tab_schedule(self, scope: str, unit: str) -> bool:
+        """Single-unit effective-trigger fetch for the Schedule tab."""
+        return self.request(
+            f"schedtab:{scope}:{unit}",
+            [self._systemctl, *self._scope_args(scope), "show", unit, "-p", SCHEDULE_PROPS],
         )
 
     def fetch_log(self, scope: str, unit: str) -> bool:

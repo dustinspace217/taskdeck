@@ -28,6 +28,7 @@ from taskdeck.models import (
     ROLE_SORT,
     ROLE_UNIT,
     TaskTableModel,
+    classify_cadence,
     strip_ansi,
     ts_missing,
 )
@@ -35,6 +36,7 @@ from taskdeck.systemd_client import (
     SCOPE_SYSTEM,
     SCOPE_USER,
     LastResult,
+    ScheduleInfo,
     ServiceRow,
     SystemdClient,
     TimerRow,
@@ -42,6 +44,7 @@ from taskdeck.systemd_client import (
     parse_list_timers,
     parse_list_units,
     parse_show_results,
+    parse_show_schedules,
 )
 
 
@@ -70,11 +73,17 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._timers: list[TimerRow] = []
         self._services: list[ServiceRow] = []
         self._pending: set[str] = set()
-        # Unit list keyed by the EXACT results request id, so every response
-        # parses against the argv that produced it — a scope flip mid-flight
-        # can no longer misalign blocks against another scope's units
-        # (QA synthesis #6). Bounded: ≤1 in-flight per scope → ≤2 entries.
+        # Unit lists keyed by the EXACT request id, so every response parses
+        # against the argv that produced it — a scope flip mid-flight can no
+        # longer misalign blocks against another scope's units (QA synthesis
+        # #6). Bounded: ≤1 in-flight per scope per kind → ≤2 entries each.
         self._result_units_by_id: dict[str, list[str]] = {}
+        self._schedule_units_by_id: dict[str, list[str]] = {}
+        # Enrichment fetches still outstanding for the current cycle; the
+        # table renders when this empties so the Cadence and Last-result
+        # columns appear together instead of popping in separately.
+        self._pending_enrich: set[str] = set()
+        self._last_schedules: dict[str, ScheduleInfo] = {}
         # Which scope the RENDERED rows came from. Action enablement requires
         # it to match self.scope — otherwise the sub-second window after a
         # scope flip leaves the old scope's rows interactive (QA synthesis #7).
@@ -214,6 +223,7 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             "details": self.tab_details,
             "cat": self.tab_unitfile,
             "calendar": self.tab_schedule,
+            "schedtab": self.tab_schedule,
         }
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -320,7 +330,20 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             if request_id != f"results:{self.scope}":
                 return  # aligned, but belongs to a scope the user left — drop
             self._clear_error_if(kind)
-            self._apply_results(stdout, units)
+            self._last_results = parse_show_results(stdout, units)
+            self._pending_enrich.discard("results")
+            self._maybe_render()
+            return
+        elif kind == "schedules":
+            units = self._schedule_units_by_id.pop(request_id, None)
+            if units is None:
+                return
+            if request_id != f"schedules:{self.scope}":
+                return
+            self._clear_error_if(kind)
+            self._last_schedules = parse_show_schedules(stdout, units)
+            self._pending_enrich.discard("schedules")
+            self._maybe_render()
             return
         elif kind == "action":
             # The payload IS stderr for action ids (see the client): systemd
@@ -341,7 +364,7 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             self._last_detail_unit = None
             self.refresh()
             return
-        elif kind in ("log", "details", "cat", "calendar"):
+        elif kind in ("log", "details", "cat", "calendar", "schedtab"):
             if request_id not in self._expected_tab_ids:
                 return  # stale response for a unit/scope no longer selected
             self._fill_tab(kind, stdout)
@@ -349,29 +372,38 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         else:
             return  # unknown kind (future request types): never fall through
         if not self._pending:
-            # Both lists landed → one batched show for every relevant service.
-            new_units = sorted(
+            # Both lists landed → batched enrichment: one `show` for every
+            # relevant service's last result, one for every timer's triggers.
+            # The render waits for BOTH so the columns appear together.
+            result_units = sorted(
                 {t.activates for t in self._timers} | {s.unit for s in self._services}
             )
-            if not new_units:
+            timer_units = sorted(t.unit for t in self._timers)
+            self._pending_enrich = set()
+            # Empty-list guards are load-bearing: `show` with NO units dumps
+            # manager properties, which the parsers would reject downstream.
+            if result_units:
+                self._pending_enrich.add("results")
+                if self.client.fetch_results(self.scope, result_units):
+                    self._result_units_by_id[f"results:{self.scope}"] = result_units
+                # else: a previous fetch is still in flight — its OWN entry
+                # stays recorded, so its response parses against the argv
+                # that produced it. Fresh lists render on the next cycle.
+            else:
                 self._last_results = {}
-                self._data_scope = self.scope
-                self._render_rows()
-                return
-            # Guard above is load-bearing: `show` with NO units dumps manager
-            # properties, which the parser would reject downstream.
-            rid = f"results:{self.scope}"
-            if self.client.fetch_results(self.scope, new_units):
-                self._result_units_by_id[rid] = new_units
-            # else: a previous results fetch is still in flight — its OWN
-            # entry stays recorded, so its response still parses against the
-            # argv that produced it. Fresh lists render on the next cycle.
+            if timer_units:
+                self._pending_enrich.add("schedules")
+                if self.client.fetch_schedules(self.scope, timer_units):
+                    self._schedule_units_by_id[f"schedules:{self.scope}"] = timer_units
+            else:
+                self._last_schedules = {}
+            self._maybe_render()
 
-    def _apply_results(self, stdout: str, units: list[str]) -> None:
-        """Parse a results payload against ITS OWN unit list and render."""
-        self._last_results = parse_show_results(stdout, units)
-        self._data_scope = self.scope
-        self._render_rows()
+    def _maybe_render(self) -> None:
+        """Render once all enrichment for the current cycle has landed."""
+        if not self._pending_enrich:
+            self._data_scope = self.scope
+            self._render_rows()
 
     def _render_rows(self) -> None:
         """Render cached data into the model; restore selection and scroll.
@@ -389,7 +421,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         keep_unit = selected[0] if selected else None
         scroll = self.table.verticalScrollBar().value()
         if self.view_box.currentIndex() == 0:  # 0 = Timers (index survives renames)
-            self.model.set_timer_rows(self._timers, self._services, self._last_results, now)
+            self.model.set_timer_rows(
+                self._timers, self._services, self._last_results, self._last_schedules, now
+            )
         else:
             services = self._services
             if not self.act_show_inactive.isChecked():
@@ -439,20 +473,20 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # the next 10s refresh rebuilds _pending wholesale — self-heals.
         kind = request_id.split(":", 1)[0]
         self._post_error(kind, f"[{request_id}]: {message}")
-        # A failed results fetch must not leave its unit list behind — the
+        # A failed enrichment fetch must not leave its unit list behind — the
         # id frees in the client, and a future response must not match it.
         self._result_units_by_id.pop(request_id, None)
+        self._schedule_units_by_id.pop(request_id, None)
         # A detail tab frozen at "loading…" would hide the failure — write it
         # into the tab the response was meant for (freshness-gated like any
         # other tab write).
         tab = self._kind_to_tab.get(kind)
         if tab is not None and request_id in self._expected_tab_ids:
+            # Every tab covers its own failure now — including the Schedule
+            # tab, whose schedtab fetch is freshness-gated like the others.
+            # (The old design populated Schedule from the cat branch and
+            # needed a special-case stamp here; DEF-V11-02 removed that.)
             tab.setPlainText(f"(fetch failed)\n{message}")
-            if kind == "cat":
-                # The Schedule tab is populated FROM the cat success branch;
-                # without this it stays at "loading…" forever for exactly the
-                # broken units this tool exists to investigate.
-                self.tab_schedule.setPlainText("(no schedule — unit file fetch failed)")
 
     # -- selection / detail tabs -----------------------------------------------
 
@@ -485,10 +519,19 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         }
         for view in self._kind_to_tab.values():
             view.setPlainText("loading…")
+        ok_sched = True
+        if unit.endswith(".timer"):
+            # The Schedule tab reads systemd's EFFECTIVE triggers (show), not
+            # the unit-file text — drop-ins and exotic syntax made text
+            # scraping lie (DEF-V11-02, resolved here).
+            self._expected_tab_ids.add(f"schedtab:{self.scope}:{unit}")
+            ok_sched = self.client.fetch_tab_schedule(self.scope, unit)
+        else:
+            self.tab_schedule.setPlainText("(not a timer — no schedule)")
         ok_log = self.client.fetch_log(self.scope, unit)
         ok_details = self.client.fetch_details(self.scope, unit)
         ok_cat = self.client.fetch_cat(self.scope, unit)
-        if not (ok_log and ok_details and ok_cat):
+        if not (ok_log and ok_details and ok_cat and ok_sched):
             # RACE B (QA Phase B): a PRE-action fetch for this same unit may
             # still be in flight; its id matches the freshly rebuilt
             # freshness set, so its STALE payload will fill the tab as if
@@ -524,26 +567,34 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         elif kind == "details":
             self.tab_details.setPlainText(stdout.strip() or "(no properties)")
         elif kind == "cat":
+            # Unit file only — the Schedule tab has its own show-based fetch
+            # (schedtab) so it reflects EFFECTIVE triggers, drop-ins included.
             self.tab_unitfile.setPlainText(stdout.strip() or "(unit file not found)")
-            # Schedule tab: pull OnCalendar= lines out of the unit file and ask
-            # systemd-analyze for the next elapses of the first one.
-            cal_lines = [
-                line.strip()
-                for line in stdout.splitlines()
-                if line.strip().startswith("OnCalendar=")
-            ]
-            if cal_lines:
-                expr = cal_lines[0].partition("=")[2]
-                self.tab_schedule.setPlainText("\n".join(cal_lines) + "\n\n(calculating…)")
-                # Admit the calendar response into the freshness set BEFORE
-                # requesting it; a later selection replaces the whole set, so
-                # this response can never append under another unit's schedule.
+        elif kind == "schedtab":
+            # Single-unit fetch; the freshness gate guarantees this response
+            # belongs to the current selection, so the placeholder unit name
+            # used for block alignment never surfaces anywhere.
+            info = parse_show_schedules(stdout, ["selected"]).get("selected")
+            if info is None or (not info.calendar and not info.monotonic):
+                self.tab_schedule.setPlainText("(no triggers configured)")
+                return
+            lines = ["Triggers (effective, drop-ins included):"]
+            lines += [f"  OnCalendar={expr}" for expr in info.calendar]
+            lines += [f"  {spec}" for spec in info.monotonic]
+            lines.append(f"\nCadence: {classify_cadence(info)}")
+            if info.next_elapse:
+                lines.append(f"Next elapse: {info.next_elapse}")
+            text = "\n".join(lines)
+            if info.calendar:
+                # systemd-analyze appends the next five elapses for the first
+                # calendar trigger. Admit the response into the freshness set
+                # BEFORE requesting; a later selection replaces the whole set,
+                # so it can never append under another unit's schedule.
+                expr = info.calendar[0]
+                text += "\n\n(calculating…)"
                 self._expected_tab_ids.add(f"calendar:{expr}")
                 self.client.fetch_calendar(expr)
-            else:
-                self.tab_schedule.setPlainText(
-                    "(no OnCalendar= schedule — boot/login-triggered or plain service)"
-                )
+            self.tab_schedule.setPlainText(text)
         elif kind == "calendar":
             current = self.tab_schedule.toPlainText().replace("(calculating…)", "").rstrip()
             self.tab_schedule.setPlainText(current + "\n\n" + stdout.strip())

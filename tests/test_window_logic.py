@@ -27,6 +27,13 @@ RESULTS_TEXT = (
     "Result=success\nExecMainExitTimestamp=Wed\nExecMainStatus=0\n\n"
     "Result=exit-code\nExecMainExitTimestamp=Thu\nExecMainStatus=1\n"
 )
+# A schedules payload for the one timer (a.timer) in LIST_TIMERS_JSON —
+# the wire shape `systemctl show -p TimersCalendar,…` actually emits.
+SCHEDULES_TEXT = (
+    "TimersCalendar={ OnCalendar=*-*-* 03:50:00 ; "
+    "next_elapse=Fri 2026-06-12 03:50:00 PDT }\n"
+    "NextElapseUSecRealtime=Fri 2026-06-12 03:50:00 PDT\n"
+)
 
 
 class FakeClient(QObject):
@@ -61,6 +68,12 @@ class FakeClient(QObject):
     def fetch_results(self, scope: str, units: list) -> bool:
         return self._record("fetch_results", scope, list(units))
 
+    def fetch_schedules(self, scope: str, units: list) -> bool:
+        return self._record("fetch_schedules", scope, list(units))
+
+    def fetch_tab_schedule(self, scope: str, unit: str) -> bool:
+        return self._record("fetch_tab_schedule", scope, unit)
+
     def fetch_log(self, scope: str, unit: str) -> bool:
         return self._record("fetch_log", scope, unit)
 
@@ -85,11 +98,17 @@ def make_window(qtbot):
 
 
 def run_full_cycle(window, timers_json=LIST_TIMERS_JSON, units_json=LIST_UNITS_JSON):
-    """Drive one complete refresh cycle through _on_finished."""
+    """Drive one complete refresh cycle through _on_finished.
+
+    The render waits for BOTH enrichments (results + schedules); when the
+    cycle has no timers the schedules fetch never fired, and the delivery
+    below is dropped by the by-id alignment guard — harmless either way.
+    """
     window.refresh()
     window._on_finished("timers:user", timers_json)
     window._on_finished("services:user", units_json)
     window._on_finished("results:user", RESULTS_TEXT)
+    window._on_finished("schedules:user", SCHEDULES_TEXT)
 
 
 def calls_of(client, name):
@@ -227,6 +246,42 @@ def test_other_scope_results_are_consumed_but_not_rendered(qtbot):
     assert window.model.rowCount() == 0
 
 
+# -- schedules enrichment ---------------------------------------------------------
+
+
+def test_render_waits_for_both_enrichments(qtbot):
+    # Results landing FIRST must not render a table with a blank Cadence
+    # column that flickers full a beat later — the render is a barrier on
+    # both enrichment fetches of the cycle.
+    window, client = make_window(qtbot)
+    window.refresh()
+    window._on_finished("timers:user", LIST_TIMERS_JSON)
+    window._on_finished("services:user", LIST_UNITS_JSON)
+    assert ("fetch_schedules", "user", ["a.timer"]) in client.calls
+    window._on_finished("results:user", RESULTS_TEXT)
+    assert window.model.rowCount() == 0  # schedules still pending — no render
+    window._on_finished("schedules:user", SCHEDULES_TEXT)
+    assert window.model.rowCount() == 1
+
+
+def test_cadence_column_renders_from_schedules(qtbot):
+    from PySide6.QtCore import Qt
+
+    window, client = make_window(qtbot)
+    run_full_cycle(window)
+    cadence = window.model.index(0, 2).data(Qt.ItemDataRole.DisplayRole)
+    assert cadence == "daily"  # *-*-* 03:50:00 from SCHEDULES_TEXT
+
+
+def test_schedules_response_without_recorded_units_is_dropped(qtbot):
+    # Same by-id alignment guard as results: a response we never recorded
+    # (or whose entry a failure already freed) is dropped, never parsed
+    # against a guessed unit list.
+    window, client = make_window(qtbot)
+    window._on_finished("schedules:user", SCHEDULES_TEXT)
+    assert window._last_schedules == {}
+
+
 # -- detail-tab lifecycle --------------------------------------------------------
 
 
@@ -241,10 +296,13 @@ def test_selection_fetches_and_freshness_ids(qtbot):
     run_full_cycle(window)
     select_with_fetches(qtbot, window)
     assert ("fetch_log", "user", "a.timer") in client.calls
+    # a.timer is a timer, so the Schedule tab gets its own show-based fetch.
+    assert ("fetch_tab_schedule", "user", "a.timer") in client.calls
     assert window._expected_tab_ids == {
         "log:user:a.timer",
         "details:user:a.timer",
         "cat:user:a.timer",
+        "schedtab:user:a.timer",
     }
 
 
@@ -326,17 +384,79 @@ def test_parse_failure_writes_tab_and_keeps_dedup(qtbot):
     assert window._last_detail_unit == "a.timer"
 
 
-def test_on_failed_writes_expected_tab_and_cat_stamps_schedule(qtbot):
+def test_on_failed_writes_expected_tab_only(qtbot):
+    # Since DEF-V11-02 the Schedule tab has its OWN fetch (schedtab) — a cat
+    # failure must write the Unit file tab and leave a good schedule alone
+    # (the old design populated Schedule from cat and stamped it here too).
     window, client = make_window(qtbot)
-    window._expected_tab_ids = {"cat:user:a.timer"}
+    window._expected_tab_ids = {"cat:user:a.timer", "schedtab:user:a.timer"}
+    window.tab_schedule.setPlainText("Triggers (effective, drop-ins included):")
     window._on_failed("cat:user:a.timer", "No files found")
     assert "(fetch failed)" in window.tab_unitfile.toPlainText()
     assert "No files found" in window.tab_unitfile.toPlainText()
-    # The Schedule tab is populated from the cat SUCCESS branch — a cat
-    # failure must not strand it at loading… (QA SFH-F5).
-    assert "fetch failed" in window.tab_schedule.toPlainText()
+    assert window.tab_schedule.toPlainText().startswith("Triggers")
     # And the status bar still carries the error.
     assert "No files found" in window.statusBar().currentMessage()
+
+
+def test_on_failed_schedtab_writes_schedule_tab(qtbot):
+    # The Schedule tab covers its own failure — never stranded at loading…
+    # for exactly the broken units this tool exists to investigate (SFH-F5).
+    window, client = make_window(qtbot)
+    window._expected_tab_ids = {"schedtab:user:a.timer"}
+    window.tab_schedule.setPlainText("loading…")
+    window._on_failed("schedtab:user:a.timer", "Failed to get properties")
+    assert "(fetch failed)" in window.tab_schedule.toPlainText()
+    assert "Failed to get properties" in window.tab_schedule.toPlainText()
+
+
+def test_schedtab_fill_renders_triggers_cadence_and_chains_calendar(qtbot):
+    # The Schedule tab pipeline: schedtab payload → triggers + cadence line,
+    # then a chained systemd-analyze fetch for the first calendar trigger
+    # (admitted into the freshness set BEFORE requesting).
+    window, client = make_window(qtbot)
+    window._expected_tab_ids = {"schedtab:user:a.timer"}
+    window._on_finished("schedtab:user:a.timer", SCHEDULES_TEXT)
+    text = window.tab_schedule.toPlainText()
+    assert "OnCalendar=*-*-* 03:50:00" in text
+    assert "Cadence: daily" in text
+    assert "Next elapse: Fri 2026-06-12 03:50:00 PDT" in text
+    assert "(calculating…)" in text
+    assert ("fetch_calendar", "*-*-* 03:50:00") in client.calls
+    assert "calendar:*-*-* 03:50:00" in window._expected_tab_ids
+    window._on_finished("calendar:*-*-* 03:50:00", "Next elapse: …five iterations…")
+    text = window.tab_schedule.toPlainText()
+    assert "(calculating…)" not in text
+    assert "five iterations" in text
+
+
+def test_schedtab_fill_no_triggers_is_honest(qtbot):
+    window, client = make_window(qtbot)
+    window._expected_tab_ids = {"schedtab:user:x.timer"}
+    window._on_finished(
+        "schedtab:user:x.timer",
+        "TimersCalendar=\nTimersMonotonic=\nNextElapseUSecRealtime=\n",
+    )
+    assert window.tab_schedule.toPlainText() == "(no triggers configured)"
+    assert not calls_of(client, "fetch_calendar")
+
+
+def test_schedtab_monotonic_only_skips_calendar_chain(qtbot):
+    # A monotonic-only timer has no calendar expression for systemd-analyze;
+    # the tab must finish WITHOUT a dangling "(calculating…)".
+    window, client = make_window(qtbot)
+    window._expected_tab_ids = {"schedtab:user:b.timer"}
+    window._on_finished(
+        "schedtab:user:b.timer",
+        "TimersMonotonic={ OnUnitActiveUSec=1d ; next_elapse=5d 13h }\n"
+        "TimersMonotonic={ OnBootUSec=12h ; next_elapse=12h }\n"
+        "NextElapseUSecRealtime=\n",
+    )
+    text = window.tab_schedule.toPlainText()
+    assert "OnUnitActiveUSec=1d" in text
+    assert "Cadence: every 1d + boot+12h" in text
+    assert "(calculating…)" not in text
+    assert not calls_of(client, "fetch_calendar")
 
 
 def test_on_failed_unexpected_id_leaves_tab_untouched(qtbot):
