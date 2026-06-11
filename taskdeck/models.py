@@ -14,6 +14,10 @@ def format_delta(seconds: float) -> str:
     Unit pairs chosen for glanceability: seconds alone under a minute, then
     m / h+m / d+h, then bare days past ~5 weeks where hours are noise.
     """
+    # Callers must pass non-negative durations (format_when negates past
+    # deltas before calling). A negative here is a caller bug — fail loudly
+    # at dev time rather than rendering "-345600s" in the table.
+    assert seconds >= 0, "format_delta requires non-negative seconds"
     s = int(seconds)
     if s < 60:
         return f"{s}s"
@@ -38,7 +42,10 @@ def format_when(ts_usec: int | None, now: datetime) -> str:
     if ts_usec is None:
         return "—"
     dt = datetime.fromtimestamp(ts_usec / 1_000_000)
-    delta = (dt - now).total_seconds()
+    # Epoch-space subtraction, not (dt - now): both datetimes are naive LOCAL,
+    # and wall-clock subtraction goes off by ±1h when the interval spans a DST
+    # transition. now.timestamp() interprets naive-local consistently.
+    delta = ts_usec / 1_000_000 - now.timestamp()
     if dt.date() == now.date():
         absolute = f"today {dt:%H:%M}"
     elif abs(delta) < 6 * 86400:
