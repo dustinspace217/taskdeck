@@ -28,6 +28,17 @@ strict = true
 [[tool.mypy.overrides]]
 module = "PySide6.*"
 ignore_missing_imports = true
+# follow_imports=skip forces PySide6 to be treated as Any REGARDLESS of whether
+# a py.typed marker is present. This keeps local and CI in agreement: locally
+# the Fedora RPM omits py.typed so Qt is already Any (above), but CI pip-installs
+# PySide6 — which DOES ship py.typed — and without this mypy would type-check
+# against Qt's real stubs and surface 8 strict errors local never sees (unused
+# `# type: ignore[misc]` because the real base isn't Any; QByteArray.data()'s
+# conservative memoryview union lacking .decode(); closeEvent's loose param).
+# Treating Qt as Any everywhere matches the project's documented typing decision
+# (see the [tool.mypy] header) — the alternative is re-validating the whole Qt
+# surface against stubs the machine it runs on doesn't even have.
+follow_imports = "skip"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
