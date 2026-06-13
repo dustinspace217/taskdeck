@@ -89,6 +89,9 @@ class FakeClient(QObject):
     def run_action(self, argv: list, unit: str) -> bool:
         return self._record("run_action", list(argv), unit)
 
+    def flush_finished(self) -> None:
+        self.calls.append(("flush_finished",))
+
 
 def make_window(qtbot):
     client = FakeClient()

@@ -51,20 +51,40 @@ def is_autostart_enabled() -> bool:
     return autostart_desktop_path().exists()
 
 
+def _quote_exec(path: str) -> str:
+    """Quote an Exec path per the Desktop Entry spec when it needs it.
+
+    A path with a space (a home dir or install prefix containing one) MUST be
+    double-quoted or the DE splits it on the space and the autostart entry
+    silently fails to launch. Inside the quotes, literal " and \\ are
+    backslash-escaped. A clean path is left bare so common entries stay readable.
+    """
+    if any(c in path for c in ' \t"\\'):
+        escaped = path.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return path
+
+
 def set_autostart(enabled: bool, exec_path: str) -> None:
-    """Create or remove the autostart entry. Idempotent both ways."""
+    """Create or remove the autostart entry. Idempotent both ways. May raise
+    OSError (read-only ~/.config, full disk) — callers surface it, never swallow."""
     path = autostart_desktop_path()
     if enabled:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_AUTOSTART_TEMPLATE.format(exec_path=exec_path))
+        path.write_text(_AUTOSTART_TEMPLATE.format(exec_path=_quote_exec(exec_path)))
     else:
         # missing_ok: removing an already-absent entry is success, not an error.
         path.unlink(missing_ok=True)
 
 
 def notification_text(unit: str, description: str) -> tuple[str, str]:
-    """(title, body) for a failure notification; drop the dash when there's no
-    description so the body never trails an empty ' — '."""
+    """(title, body) for a failure notification. The description is free text a
+    package controls — flatten newlines and bound the length so a pathological
+    Description= can't make a multi-line / wall-of-text balloon. The body has no
+    dash when there's no description (never a trailing empty ' — ')."""
+    description = " ".join(description.split())  # collapse newlines/runs of space
+    if len(description) > 120:
+        description = description[:119] + "…"
     body = f"{unit} failed — {description}" if description else f"{unit} failed"
     return "Task Deck", body
 
@@ -88,7 +108,13 @@ class Tray:
         self._window = window
         self._exec_path = exec_path
         self._tray = QSystemTrayIcon(QIcon.fromTheme("taskdeck"))
-        self._tray.setToolTip("Task Deck — watching systemd services")
+        # showMessage() is best-effort and silently no-ops when the DE has no
+        # notification service — surface that on hover so the tray's persistent
+        # presence carries the warning (the tooltip needs no notification daemon).
+        if self._tray.supportsMessages():
+            self._tray.setToolTip("Task Deck — watching systemd services")
+        else:
+            self._tray.setToolTip("Task Deck — notifications unavailable; open to view failures")
 
         menu = QMenu()
         open_action = menu.addAction("Open Task Deck")
@@ -106,6 +132,7 @@ class Tray:
         self._tray.activated.connect(self._on_activated)
         monitor.unit_failed.connect(self._notify_failure)
         monitor.startup_failures.connect(self._notify_startup)
+        monitor.monitor_blind.connect(self._notify_blind)
         self._tray.show()
 
     def _show_window(self) -> None:
@@ -125,13 +152,41 @@ class Tray:
                 self._show_window()
 
     def _on_autostart_toggled(self, checked: bool) -> None:
-        set_autostart(checked, self._exec_path)
+        try:
+            set_autostart(checked, self._exec_path)
+        except OSError as exc:
+            # Revert the checkmark to GROUND TRUTH (the actual file state) so it
+            # can never claim something the filesystem contradicts, and say why.
+            # blockSignals stops the revert from re-firing this slot into a loop.
+            self._autostart_action.blockSignals(True)
+            self._autostart_action.setChecked(is_autostart_enabled())
+            self._autostart_action.blockSignals(False)
+            self._tray.showMessage(
+                "Task Deck",
+                f"Couldn't change autostart: {exc}",
+                QSystemTrayIcon.MessageIcon.Critical,
+                10_000,
+            )
 
     def _notify_failure(self, unit: str, description: str) -> None:
         title, body = notification_text(unit, description)
         self._tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Critical, 10_000)
 
+    def _notify_blind(self, message: str) -> None:
+        # The monitor can no longer read systemd — silence would falsely read as
+        # "all healthy". Make it loud AND persistent on the tooltip, since this
+        # is exactly the state where a one-shot balloon is easy to miss.
+        self._tray.setToolTip(f"Task Deck — monitoring STOPPED: {message}")
+        self._tray.showMessage(
+            "Task Deck — monitoring stopped",
+            f"The failure monitor can't read systemd: {message}",
+            QSystemTrayIcon.MessageIcon.Critical,
+            10_000,
+        )
+
     def _notify_startup(self, items: list[tuple[str, str]]) -> None:
+        if not items:
+            return  # the monitor only emits with >=1, but keep the contract local
         # One summary for whatever was already failed at login. Cap the names so
         # a pathological failure storm can't produce a wall-of-text balloon.
         names = ", ".join(unit for unit, _ in items[:5])

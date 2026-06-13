@@ -496,10 +496,19 @@ class SystemdClient(QObject):  # type: ignore[misc]
         self._inflight.pop(request_id, None)
         self._finished.append((proc, watchdog))
 
+    def flush_finished(self) -> None:
+        """Free parked processes now, for shutdown paths where no further
+        request() will run to sweep them (the quit branch of closeEvent). Safe
+        for the same reason _sweep_finished is — it runs outside any emission of
+        the parked objects. Without it, procs that finished after the last
+        request() linger until the client is garbage-collected."""
+        self._sweep_finished()
+
     def _sweep_finished(self) -> None:
-        """Delete processes retired in a PRIOR request cycle. Called only at the
-        top of request(), so it runs outside any signal emission of these
-        objects — the condition that makes deleteLater safe here (DEF-T4-01).
+        """Delete processes retired in a PRIOR request cycle. Called at the top
+        of request() (and from flush_finished on shutdown), so it runs outside
+        any signal emission of these objects — the condition that makes
+        deleteLater safe here (DEF-T4-01).
         Each proc's slots are disconnected first, both to break the
         proc<->closure reference cycle (so Python can GC the wrappers) and so a
         stray queued echo can never reach a closure mid-teardown."""

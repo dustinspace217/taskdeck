@@ -136,3 +136,79 @@ def test_poll_error_keeps_baseline_and_does_not_emit(qtbot):
         ("backup.service", "Nightly backup"), ("sync.service", "Cloud sync"),
     ]))
     assert failures == [("sync.service", "Cloud sync")]
+
+
+def test_start_polls_immediately_and_arms_timer(qtbot, monkeypatch):
+    # start() must poll at once (so the login summary fires immediately) AND
+    # arm the periodic timer; stop() disarms it.
+    mon, _ = make_monitor(qtbot)
+    polls = []
+    monkeypatch.setattr(mon, "_poll", lambda: polls.append(1))
+    mon.start()
+    assert polls == [1]            # immediate first poll
+    assert mon._timer.isActive()
+    assert mon._timer.interval() == FailureMonitor.POLL_MS
+    mon.stop()
+    assert not mon._timer.isActive()
+
+
+def collect_blind(mon):
+    blind: list[str] = []
+    mon.monitor_blind.connect(lambda msg: blind.append(msg))
+    return blind
+
+
+def test_transient_failure_below_threshold_is_silent(qtbot):
+    # A blip or two must NOT cry wolf — only persistent blindness escalates.
+    mon, client = make_monitor(qtbot)
+    blind = collect_blind(mon)
+    for _ in range(FailureMonitor.BLIND_THRESHOLD - 1):
+        mon._poll()
+        client.fail("failed:user", "transient")
+    assert blind == []
+
+
+def test_persistent_failures_emit_monitor_blind_once(qtbot):
+    # P0 fix: a monitor that has silently stopped working is the worst failure
+    # for this feature (no notification reads as "all healthy"). After
+    # BLIND_THRESHOLD consecutive failed polls it announces once, carrying
+    # systemd's own words.
+    mon, client = make_monitor(qtbot)
+    blind = collect_blind(mon)
+    for _ in range(FailureMonitor.BLIND_THRESHOLD):
+        mon._poll()
+        client.fail("failed:user", "Failed to connect to user bus")
+    assert blind == ["Failed to connect to user bus"]
+    # Stays blind silently (no re-spam) until it recovers.
+    mon._poll()
+    client.fail("failed:user", "Failed to connect to user bus")
+    assert blind == ["Failed to connect to user bus"]
+
+
+def test_recovery_resets_the_blind_counter(qtbot):
+    mon, client = make_monitor(qtbot)
+    blind = collect_blind(mon)
+    for _ in range(FailureMonitor.BLIND_THRESHOLD - 1):
+        mon._poll()
+        client.fail("failed:user", "transient")
+    mon._poll()
+    client.deliver("failed:user", payload([]))   # a good poll resets the count
+    for _ in range(FailureMonitor.BLIND_THRESHOLD - 1):
+        mon._poll()
+        client.fail("failed:user", "transient")
+    assert blind == []  # never reached the threshold consecutively
+
+
+def test_unparseable_output_counts_as_a_failed_poll_not_a_crash(qtbot):
+    # parse_list_units raises ValueError on malformed JSON. Inside a Qt slot
+    # that would escape to the excepthook AND leave the baseline un-advanced,
+    # re-poisoning every tick. It must instead count as a failed poll, silently
+    # until the threshold, then escalate — never crash, never re-raise forever.
+    mon, client = make_monitor(qtbot)
+    blind = collect_blind(mon)
+    failures, _ = collect(mon)
+    for _ in range(FailureMonitor.BLIND_THRESHOLD):
+        mon._poll()
+        client.deliver("failed:user", "not json at all")
+    assert failures == []
+    assert len(blind) == 1 and "unparseable" in blind[0].lower()

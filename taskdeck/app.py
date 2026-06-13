@@ -88,6 +88,16 @@ def build(
     else:
         # No tray → nowhere to live in the background; behave as a plain window.
         window.show()
+        if start_in_tray:
+            # The user asked for hidden/background operation (--tray, e.g. from
+            # the autostart entry) but there's no tray — don't silently drop the
+            # half they wanted. The window is visible here, so the status bar is
+            # the right channel.
+            window.statusBar().showMessage(
+                "No system tray available — running as a normal window; "
+                "background monitoring is off, and closing will quit.",
+                0,
+            )
 
     return window
 

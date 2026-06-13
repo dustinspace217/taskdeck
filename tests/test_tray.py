@@ -74,6 +74,29 @@ def test_notification_text_omits_dash_when_no_description():
     assert body == "x.service failed"
 
 
+def test_notification_text_flattens_and_bounds_description():
+    # A package-controlled Description= can be long or multi-line; the body must
+    # stay one bounded line (QA adversarial P2).
+    _, body = notification_text("x.service", "line one\nline two\n" + "z" * 300)
+    assert "\n" not in body
+    assert len(body) <= 160  # "x.service failed — " + 120-cap
+
+
+def test_set_autostart_quotes_exec_path_with_spaces(tmp_config):
+    # A home dir / install prefix with a space MUST be quoted or the DE splits
+    # the Exec on the space and autostart silently never launches (QA adv P1-3).
+    set_autostart(True, "/home/Dustin Space/.local/bin/taskdeck")
+    line = next(
+        ln for ln in autostart_desktop_path().read_text().splitlines() if ln.startswith("Exec=")
+    )
+    assert line == 'Exec="/home/Dustin Space/.local/bin/taskdeck" --tray'
+
+
+def test_set_autostart_leaves_clean_path_unquoted(tmp_config):
+    set_autostart(True, "/x/taskdeck")
+    assert "Exec=/x/taskdeck --tray" in autostart_desktop_path().read_text()
+
+
 # -- Tray wiring (construct the real Tray; QSystemTrayIcon no-ops offscreen) ----
 
 
@@ -119,3 +142,42 @@ def test_startup_failures_route_to_one_summary(tmp_config, qtbot, monkeypatch):
     body = calls[0][1]
     assert "2 services currently failed" in body
     assert "a.service" in body and "b.service" in body
+
+
+def test_startup_summary_singular_and_name_cap(tmp_config, qtbot, monkeypatch):
+    tray, _, monitor = make_tray(qtbot)
+    calls = []
+    monkeypatch.setattr(tray._tray, "showMessage", lambda *a: calls.append(a))
+    monitor.startup_failures.emit([("only.service", "Only")])
+    assert "1 service currently failed" in calls[0][1]   # singular, not "services"
+    calls.clear()
+    monitor.startup_failures.emit([(f"u{i}.service", f"U{i}") for i in range(6)])
+    assert "6 services currently failed" in calls[0][1]
+    assert "(+1 more)" in calls[0][1]                     # names capped at 5
+
+
+def test_monitor_blind_routes_to_notification_and_tooltip(tmp_config, qtbot, monkeypatch):
+    # P0 surfacing: a blind monitor must produce a loud, persistent signal.
+    tray, _, monitor = make_tray(qtbot)
+    calls = []
+    monkeypatch.setattr(tray._tray, "showMessage", lambda *a: calls.append(a))
+    monitor.monitor_blind.emit("Failed to connect to user bus")
+    assert calls and calls[0][2] == QSystemTrayIcon.MessageIcon.Critical
+    assert "Failed to connect to user bus" in calls[0][1]
+    assert "monitoring STOPPED" in tray._tray.toolTip()
+
+
+def test_autostart_write_failure_reverts_checkbox_and_notifies(tmp_config, qtbot, monkeypatch):
+    # If the write fails, the menu must not lie: revert the checkmark to ground
+    # truth (no file → unchecked) and surface why (QA SFH P1).
+    tray, _, _ = make_tray(qtbot)
+    calls = []
+    monkeypatch.setattr(tray._tray, "showMessage", lambda *a: calls.append(a))
+
+    def boom(*_a, **_k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("taskdeck.tray.set_autostart", boom)
+    tray._autostart_action.setChecked(True)  # fires toggled → write → OSError
+    assert tray._autostart_action.isChecked() is False  # reverted to ground truth
+    assert calls and "read-only file system" in calls[0][1]

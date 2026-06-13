@@ -120,25 +120,52 @@ def test_list_failed_services_emits_expected_id_and_argv(qtbot):
 
 def test_finished_processes_are_swept_not_leaked(qtbot):
     # DEF-T4-01 regression (the leak fix): finished QProcess objects must be
-    # freed, not accumulated for the client's lifetime. Each is parked on
+    # FREED, not accumulated for the client's lifetime. Each is parked on
     # completion and deleted at the top of the NEXT request — deferred OUT of
     # the finished emission, because deleting in-slot (or via the
     # finished.connect(deleteLater) idiom) segfaults PySide6 6.11.1/py3.14.
-    # Driving several cycles with an event drain between them exercises the
-    # deleteLater sweep under the exact pytest-qt event processing that the
-    # original crash needed — a regression would crash the run here.
+    #
+    # Shiboken.isValid() reports whether the C++ object behind a wrapper is
+    # alive, so it proves actual FREEING — not just that the bookkeeping list
+    # was cleared. (Asserting only len(_finished) would be vacuous: .clear()
+    # alone satisfies it even if the deleteLater were gutted — QA finding.)
+    from shiboken6 import Shiboken
+
     client = make_client(qtbot, "fake_ok")
     seen = []
     client.finished.connect(lambda rid, out: seen.append(rid))
-    for i in range(5):
-        assert client.request(f"sweep:{i}", [str(FAKEBIN / "fake_ok")]) is True
-        qtbot.waitUntil(lambda i=i: len(seen) == i + 1, timeout=3000)
-        qtbot.wait(10)  # let the next request's DeferredDelete events drain
-    # Between any two requests at most ONE finished proc is parked (the prior
-    # one); the request before it swept everything earlier. The backlog is
-    # bounded, not the lifetime-of-the-client accumulation it used to be.
-    assert len(client._finished) <= 1
+
+    client.request("free:1", [str(FAKEBIN / "fake_ok")])
+    qtbot.waitUntil(lambda: len(seen) == 1, timeout=3000)
+    assert len(client._finished) == 1, "a finished proc is parked for deferred deletion"
+    parked = client._finished[0][0]
+    assert Shiboken.isValid(parked), "parked, still alive — safe to read in-slot"
+
+    # The next request sweeps the parked proc; drain DeferredDelete.
+    client.request("free:2", [str(FAKEBIN / "fake_ok")])
+    qtbot.waitUntil(lambda: len(seen) == 2, timeout=3000)
+    qtbot.wait(50)
+    assert not Shiboken.isValid(parked), "swept proc is actually deleted, not leaked"
+    assert len(client._finished) <= 1  # bounded backlog, not lifetime accumulation
     assert client._inflight == {}
+
+
+def test_flush_finished_frees_parked_procs_on_shutdown(qtbot):
+    # The no-next-request path (closeEvent quit branch): a proc that finished
+    # after the last request() must still be freed via flush_finished(), not
+    # left to linger until GC (QA adversarial finding).
+    from shiboken6 import Shiboken
+
+    client = make_client(qtbot, "fake_ok")
+    done = []
+    client.finished.connect(lambda rid, out: done.append(rid))
+    client.request("flush:1", [str(FAKEBIN / "fake_ok")])
+    qtbot.waitUntil(lambda: len(done) == 1, timeout=3000)
+    parked = client._finished[0][0]
+    client.flush_finished()          # shutdown sweep — no further request()
+    qtbot.wait(50)
+    assert not Shiboken.isValid(parked)
+    assert client._finished == []
 
 
 def test_timeout_emits_exactly_one_terminal_signal(qtbot):

@@ -24,10 +24,45 @@ def _restore_excepthook():
 
 def test_build_without_tray_shows_window(qapp, qtbot, monkeypatch):
     monkeypatch.setattr(appmod, "_tray_available", lambda: False)
-    window = appmod.build(qapp, start_in_tray=True, auto_refresh=False)  # no tray
+    if hasattr(qapp, "_taskdeck_refs"):
+        delattr(qapp, "_taskdeck_refs")  # clear a prior tray test's leftover
+    window = appmod.build(qapp, start_in_tray=False, auto_refresh=False)
     qtbot.addWidget(window)
     assert window.isVisible()
-    assert window._hide_to_tray is False  # close still quits
+    assert window._hide_to_tray is False           # close still quits
+    assert not hasattr(qapp, "_taskdeck_refs")     # no monitor/tray was created
+
+
+def test_build_no_tray_with_flag_announces_monitoring_off(qapp, qtbot, monkeypatch):
+    # --tray on a machine with no tray must not silently drop the background
+    # half the user asked for (QA SFH P1).
+    monkeypatch.setattr(appmod, "_tray_available", lambda: False)
+    window = appmod.build(qapp, start_in_tray=True, auto_refresh=False)
+    qtbot.addWidget(window)
+    msg = window.statusBar().currentMessage()
+    assert "No system tray" in msg and "monitoring is off" in msg
+
+
+def test_tray_quit_sets_quitting_flag(qapp, qtbot, monkeypatch):
+    # The real_quit producer of _quitting (the closeEvent tests pin the
+    # consumer; this pins the producer the only real exit path uses).
+    monkeypatch.setattr(appmod, "_tray_available", lambda: True)
+    monkeypatch.setattr(FailureMonitor, "start", lambda self: None)
+    try:
+        window = appmod.build(qapp, start_in_tray=True, auto_refresh=False)
+        qtbot.addWidget(window)
+        _monitor, tray = qapp._taskdeck_refs
+        tray._menu.actions()[-1].trigger()   # last menu entry is Quit → real_quit
+        assert window._quitting is True
+    finally:
+        qapp.setQuitOnLastWindowClosed(True)
+
+
+def test_autostart_exec_path_prefers_which_then_falls_back(monkeypatch):
+    monkeypatch.setattr(appmod.shutil, "which", lambda name: "/usr/bin/taskdeck")
+    assert appmod._autostart_exec_path() == "/usr/bin/taskdeck"
+    monkeypatch.setattr(appmod.shutil, "which", lambda name: None)
+    assert appmod._autostart_exec_path().endswith("/.local/bin/taskdeck")
 
 
 def test_build_with_tray_enables_hide_and_starts_hidden_on_flag(qapp, qtbot, monkeypatch):

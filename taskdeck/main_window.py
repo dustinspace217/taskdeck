@@ -716,4 +716,8 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             self.hide()
             return
         self._timer.stop()
+        # This is the last request()-issuing path; free any QProcess parked by a
+        # fetch/action that finished after the last refresh, which would
+        # otherwise linger until GC (no further request() would sweep it).
+        self.client.flush_finished()
         super().closeEvent(event)
