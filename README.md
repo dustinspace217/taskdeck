@@ -34,6 +34,21 @@ launcher just records where the repo is, so the menu entry keeps working even if
 you move the checkout (re-run `./install.sh` after a move). `./uninstall.sh`
 removes all three and leaves the repo untouched.
 
+## Background monitoring (tray)
+
+When a system tray is available, Task Deck lives in the tray and watches your
+user services in the background — even with the window closed — and pops a
+desktop notification when a service enters the `failed` state (failures only, no
+noise). Anything already failed at login is surfaced once, as a summary.
+
+- Closing the window hides it to the tray; the monitor keeps watching. **Quit**
+  in the tray menu is the only thing that exits.
+- Left-click the tray icon to show/hide the window.
+- **Start at login** in the tray menu toggles an autostart entry, so Task Deck
+  comes up to the tray when you log in.
+
+Start hidden in the tray with `taskdeck --tray` (what the autostart entry uses).
+
 ## Develop
 
     sudo dnf install python3-pytest-qt ruff python3-mypy
