@@ -105,6 +105,29 @@ def test_fetch_calendar_emits_expected_id_and_flag_stop_argv(qtbot):
     assert argv_lines == ["calendar", "--iterations=5", "--", "*-*-* 03:50:00"]
 
 
+def test_finished_processes_are_swept_not_leaked(qtbot):
+    # DEF-T4-01 regression (the leak fix): finished QProcess objects must be
+    # freed, not accumulated for the client's lifetime. Each is parked on
+    # completion and deleted at the top of the NEXT request — deferred OUT of
+    # the finished emission, because deleting in-slot (or via the
+    # finished.connect(deleteLater) idiom) segfaults PySide6 6.11.1/py3.14.
+    # Driving several cycles with an event drain between them exercises the
+    # deleteLater sweep under the exact pytest-qt event processing that the
+    # original crash needed — a regression would crash the run here.
+    client = make_client(qtbot, "fake_ok")
+    seen = []
+    client.finished.connect(lambda rid, out: seen.append(rid))
+    for i in range(5):
+        assert client.request(f"sweep:{i}", [str(FAKEBIN / "fake_ok")]) is True
+        qtbot.waitUntil(lambda i=i: len(seen) == i + 1, timeout=3000)
+        qtbot.wait(10)  # let the next request's DeferredDelete events drain
+    # Between any two requests at most ONE finished proc is parked (the prior
+    # one); the request before it swept everything earlier. The backlog is
+    # bounded, not the lifetime-of-the-client accumulation it used to be.
+    assert len(client._finished) <= 1
+    assert client._inflight == {}
+
+
 def test_timeout_emits_exactly_one_terminal_signal(qtbot):
     # Regression test for the echo guards: after the watchdog reports a
     # timeout, the killed process's death echoes (errorOccurred(Crashed) and

@@ -378,11 +378,18 @@ class SystemdClient(QObject):  # type: ignore[misc]
         self._journalctl = journalctl
         self._analyze = analyze
         self._timeout_ms = timeout_ms
-        # request_id -> QProcess; doubles as the single-flight registry.
-        # The dict itself is bounded by distinct request kinds (~8). Dead
-        # QProcess objects accumulate as children of this client — see the
-        # DEF-T4-01 comment in request() for why they are not freed.
+        # request_id -> QProcess; doubles as the single-flight registry,
+        # bounded by distinct request kinds (~8).
         self._inflight: dict[str, QProcess] = {}
+        # Finished processes awaiting deletion. They are NOT freed in their own
+        # finished/timeout slot: deleting a QProcess (even via deleteLater)
+        # during its own signal emission segfaults PySide6 6.11.1 / py3.14
+        # (DEF-T4-01, probed twice — both in-slot deleteLater and the
+        # `finished.connect(deleteLater)` idiom). Instead each is parked here
+        # and freed at the top of the NEXT request() (see _sweep_finished),
+        # which runs entirely outside any emission of these objects. Bounded by
+        # how many can finish between two requests (~8).
+        self._finished: list[tuple[QProcess, QTimer]] = []
 
     @property
     def systemctl_path(self) -> str:
@@ -406,16 +413,13 @@ class SystemdClient(QObject):  # type: ignore[misc]
         """
         if request_id in self._inflight:
             return False
+        # Free the previous cycle's finished processes now — safe here because
+        # we are at the top of a fresh request(), outside any of their signal
+        # emissions (the DEF-T4-01 fix). Any late death-echoes they had were
+        # already processed and dropped by the identity guards below.
+        self._sweep_finished()
         effective_timeout = timeout_ms if timeout_ms is not None else self._timeout_ms
         proc = QProcess(self)
-        # KNOWN BOUNDED LEAK (DEF-T4-01): dead QProcess objects stay parented
-        # to this client until it is destroyed. Freeing them is deliberately
-        # NOT done — both deleteLater() inside a Python slot AND the canonical
-        # `proc.finished.connect(proc.deleteLater)` idiom segfault PySide6
-        # 6.11.1 / Python 3.14 during event processing (probed 2026-06-11,
-        # twice, different mechanisms — see plan deferments). Exposure is
-        # bounded by the on-demand window's lifetime (~3 small objects per
-        # 10s refresh). Revisit when PySide6 updates.
         self._inflight[request_id] = proc
 
         # QTimer (not QProcess.waitForFinished) keeps everything event-driven.
@@ -433,14 +437,14 @@ class SystemdClient(QObject):  # type: ignore[misc]
             if self._inflight.get(request_id) is not proc:
                 return  # already terminal (finished / spawn-failed / successor owns id)
             proc.kill()  # the CrashExit echo is swallowed by on_finished's identity guard
-            self._inflight.pop(request_id, None)
+            self._retire(request_id, proc, watchdog)
             self.failed.emit(request_id, f"{argv[0]} timed out after {effective_timeout} ms")
 
         def on_finished(exit_code: int, exit_status: QProcess.ExitStatus) -> None:
             if self._inflight.get(request_id) is not proc:
                 return  # timeout or on_error already reported; ignore the echo
-            self._inflight.pop(request_id, None)
-            watchdog.stop()
+            # proc is parked, not deleted — still safe to read its buffers below.
+            self._retire(request_id, proc, watchdog)
             if exit_status != QProcess.ExitStatus.NormalExit:
                 stderr = proc.readAllStandardError().data().decode(errors="replace").strip()
                 self.failed.emit(request_id, f"{argv[0]} crashed: {stderr}")
@@ -471,8 +475,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
                 return
             if self._inflight.get(request_id) is not proc:
                 return
-            self._inflight.pop(request_id, None)
-            watchdog.stop()
+            self._retire(request_id, proc, watchdog)
             self.failed.emit(request_id, f"failed to start {argv[0]}: {proc.errorString()}")
 
         watchdog.timeout.connect(on_timeout)
@@ -481,6 +484,33 @@ class SystemdClient(QObject):  # type: ignore[misc]
         proc.start(argv[0], argv[1:])
         watchdog.start()
         return True
+
+    def _retire(self, request_id: str, proc: QProcess, watchdog: QTimer) -> None:
+        """Mark a request terminal: stop its watchdog, drop it from the
+        single-flight registry, and PARK the QProcess for deletion at the next
+        request(). Deletion is deferred (not done here) because freeing a
+        QProcess during its own finished/timeout emission segfaults PySide6
+        6.11.1 / py3.14 (DEF-T4-01). proc stays valid to read after this — it is
+        only parked, not deleted."""
+        watchdog.stop()
+        self._inflight.pop(request_id, None)
+        self._finished.append((proc, watchdog))
+
+    def _sweep_finished(self) -> None:
+        """Delete processes retired in a PRIOR request cycle. Called only at the
+        top of request(), so it runs outside any signal emission of these
+        objects — the condition that makes deleteLater safe here (DEF-T4-01).
+        Each proc's slots are disconnected first, both to break the
+        proc<->closure reference cycle (so Python can GC the wrappers) and so a
+        stray queued echo can never reach a closure mid-teardown."""
+        for proc, watchdog in self._finished:
+            for signal in (proc.finished, proc.errorOccurred, watchdog.timeout):
+                try:
+                    signal.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # no remaining connection — already clean
+            proc.deleteLater()
+        self._finished.clear()
 
     # -- typed conveniences (argv assembly in ONE place) --------------------
 
