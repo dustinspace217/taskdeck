@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from PySide6.QtCore import QItemSelectionModel, QSortFilterProxyModel, Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QLabel,
@@ -137,6 +137,11 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # auto_refresh=False lets tests build the window with zero subprocess
         # side effects (and set_scope honors the same flag).
         self._auto_refresh = auto_refresh
+        # Close-to-tray state. _hide_to_tray is flipped on by app.py ONLY when a
+        # system tray is available; without a tray, close quits as usual.
+        # _quitting is set by the tray's Quit so a real exit isn't intercepted.
+        self._hide_to_tray = False
+        self._quitting = False
         self._timer = QTimer(self)
         self._timer.setInterval(self.REFRESH_MS)
         self._timer.timeout.connect(self.refresh)
@@ -699,6 +704,16 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             return
         self.statusBar().showMessage(f"{verb} {target}…", 0)
 
-    def closeEvent(self, event: object) -> None:  # noqa: N802 (Qt naming)
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt naming)
+        # With a tray present, the X button HIDES to the tray and keeps the
+        # background monitor watching — Quit (tray menu) is the only real exit,
+        # and it sets _quitting first. The refresh timer keeps running while
+        # hidden so the table is current the instant the window is re-shown;
+        # the cost is a few `systemctl` reads per 10s, which is cheap and
+        # bounded (see DEF-TR-01 if that ever needs binding to visibility).
+        if self._hide_to_tray and not self._quitting:
+            event.ignore()
+            self.hide()
+            return
         self._timer.stop()
         super().closeEvent(event)

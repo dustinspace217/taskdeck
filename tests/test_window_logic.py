@@ -704,3 +704,44 @@ def test_scroll_position_survives_refresh(qtbot):
     run_full_cycle(window, timers_json=payload, units_json="[]")
     qtbot.wait(20)
     assert bar.value() == kept
+
+
+# -- close-to-tray ----------------------------------------------------------------
+
+
+def test_closeevent_hides_when_tray_active(qtbot):
+    # With a tray, the X button hides to the tray (event ignored, window kept)
+    # instead of quitting — the background monitor keeps watching.
+    from PySide6.QtGui import QCloseEvent
+
+    window, client = make_window(qtbot)
+    window._hide_to_tray = True
+    window.show()
+    qtbot.waitExposed(window)
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert not event.isAccepted()   # ignored → not really closed
+    assert not window.isVisible()   # hidden to tray
+
+
+def test_closeevent_accepts_without_tray(qtbot):
+    # No tray (default): close behaves normally — accept and stop the timer.
+    from PySide6.QtGui import QCloseEvent
+
+    window, client = make_window(qtbot)
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert event.isAccepted()
+
+
+def test_closeevent_accepts_when_quitting_even_with_tray(qtbot):
+    # Quit (tray menu) sets _quitting so the real exit isn't intercepted into
+    # another hide.
+    from PySide6.QtGui import QCloseEvent
+
+    window, client = make_window(qtbot)
+    window._hide_to_tray = True
+    window._quitting = True
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert event.isAccepted()
