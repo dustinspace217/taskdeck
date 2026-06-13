@@ -59,6 +59,20 @@ _MONOTONIC_LABELS = {
 }
 
 
+def _simple_field(field: str) -> bool:
+    """True when a calendar subfield is a shape the cadence buckets actually
+    understand: "*", a plain number, or a comma list of plain numbers.
+
+    Step values ("00/6" = every 6 hours), ranges ("09..17"), and anything
+    else are NOT simple — callers fall back to the raw expression per the
+    honest-raw-beats-wrong-bucket contract. Before this gate existed, an
+    every-6-hours timer classified as "daily" (QA 2026-06-12 CADENCE-1).
+    """
+    if field == "*":
+        return True
+    return all(part.isdigit() for part in field.split(","))
+
+
 def _classify_calendar(expr: str) -> str:
     """Bucket a NORMALIZED OnCalendar expression into a cadence word.
 
@@ -68,9 +82,12 @@ def _classify_calendar(expr: str) -> str:
     string beats a wrong bucket.
     """
     # A trailing timezone token (UTC, America/Los_Angeles, …) doesn't change
-    # the cadence bucket — strip it before shape-matching.
+    # the cadence bucket — strip it before shape-matching. Letters-shaped
+    # tokens only (alpha first char, no colon): the old `"/" in token` check
+    # ate /-bearing TIME fields ("*:00/15:00") as timezones, silently
+    # relabeling every-N-minutes timers "daily" (QA 2026-06-12 CADENCE-1).
     parts = expr.split()
-    if parts and (parts[-1] == "UTC" or "/" in parts[-1]):
+    if parts and parts[-1][0].isalpha() and ":" not in parts[-1]:
         parts = parts[:-1]
     if not parts:
         return expr
@@ -81,14 +98,29 @@ def _classify_calendar(expr: str) -> str:
         idx = 1
     date = parts[idx] if idx < len(parts) else "*-*-*"
     time = parts[idx + 1] if idx + 1 < len(parts) else "00:00:00"
+    time_fields = time.split(":")
+    hours = time_fields[0]
+    minutes = time_fields[1] if len(time_fields) > 1 else "00"
+    # The buckets below only reason about simple hour/minute shapes; step
+    # values and ranges have no honest one-word cadence — show them raw.
+    if not (_simple_field(hours) and _simple_field(minutes)):
+        return expr
     if weekday is not None:
-        normalized_span = weekday.replace("..", "-")
-        if normalized_span in ("Mon-Fri", "Mon,Tue,Wed,Thu,Fri"):
+        # Validate per-component: spans ("Mon..Fri") and non-contiguous comma
+        # lists ("Mon,Wed,Fri") both occur — probed 2026-06-12: systemd
+        # collapses contiguous lists to span form but keeps non-contiguous
+        # ones, so the old "Mon,Tue,Wed,Thu,Fri" literal was dead code. An
+        # alpha-leading token that ISN'T weekdays gets the raw fallback
+        # instead of a bogus "weekly (...)" label.
+        components = [c for span in weekday.split(",") for c in span.split("..")]
+        if not all(c in _WEEKDAYS for c in components):
+            return expr
+        if weekday == "Mon..Fri":
             return "weekdays"
         return f"weekly ({weekday})"
-    hours = time.partition(":")[0]
     if hours == "*":
-        return "hourly"
+        # Every hour — unless minutes is also "*", which fires every minute.
+        return "minutely" if minutes == "*" else "hourly"
     if "," in hours:
         return f"{len(hours.split(','))}×/day"
     year, _, month_day = date.partition("-")
@@ -106,8 +138,16 @@ def classify_cadence(info: ScheduleInfo | None) -> str:
     """One human phrase for how often a timer fires — Dustin's request
     (2026-06-11): "daily, weekly, monthly, weekdays, every boot, etc."
 
-    Multi-trigger timers join their buckets with " + " (e.g. a timer with
+    Multi-trigger timers join DISTINCT buckets with " + " (a timer with
     OnUnitActiveUSec=1d and OnBootUSec=12h reads "every 1d + boot+12h").
+
+    Deliberate approximation: triggers that bucket IDENTICALLY collapse to one
+    phrase, so a twice-daily timer (two distinct "*-*-* HH:00:00" calendars)
+    reads "daily", not "2×/day". The request was explicitly "doesn't have to be
+    too involved"; cross-trigger frequency aggregation is the involved version.
+    A single calendar with a comma hour-list ("00,12") DOES read "2×/day" — that
+    count lives in one expression, where it's cheap and unambiguous. (QA
+    2026-06-12 kept this as designed.)
     """
     if info is None:
         return "—"
@@ -121,6 +161,12 @@ def classify_cadence(info: ScheduleInfo | None) -> str:
 
 
 def _classify_monotonic(spec: str) -> str:
+    """Render one monotonic trigger ("OnBootUSec=12h") as a cadence phrase.
+
+    `spec` is a "Key=value" string built by parse_show_schedules. Known kinds
+    map through _MONOTONIC_LABELS; an unrecognized kind returns the raw spec —
+    same honest-raw-beats-wrong-bucket contract as _classify_calendar.
+    """
     key, _, value = spec.partition("=")
     template = _MONOTONIC_LABELS.get(key)
     if template is None:
@@ -232,7 +278,7 @@ def _result_text(result: LastResult | None) -> str:
 
 
 class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
-    """Five-column model serving both the Timers and Services views.
+    """Six-column model (see COLUMNS) serving both the Timers and Services views.
 
     Rows are precomputed display tuples: set_*_rows() renders everything once
     per refresh (cheap — tens of rows), so data() is a trivial lookup and the

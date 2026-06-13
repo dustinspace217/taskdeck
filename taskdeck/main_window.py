@@ -52,11 +52,14 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
     """Assembles the v1 UI and orchestrates refresh cycles.
 
     Refresh design: a cycle = list-timers + list-units for the active scope;
-    when both land, one batched `show` fetches last-results for every relevant
-    service. Tab content (log/details/schedule/unit file) loads lazily on row
-    selection. SystemdClient's single-flight coalescing bounds concurrent
-    subprocesses; responses for a scope the user has already navigated away
-    from are dropped by the scope check in _on_finished.
+    when both land, TWO batched `show` fetches enrich them — one for every
+    relevant service's last result, one for every timer's effective triggers
+    (the Cadence column). A render barrier (_pending_enrich) holds the table
+    until BOTH land, so Cadence and Last-result appear together. Tab content
+    (log/details/schedule/unit file) loads lazily on row selection.
+    SystemdClient's single-flight coalescing bounds concurrent subprocesses;
+    responses for a scope the user has already navigated away from are dropped
+    by the scope check in _on_finished.
 
     Request-id dispatch convention: only the KIND (text before the first ":")
     is ever parsed out of a request id. Unit names are NEVER recovered from
@@ -301,6 +304,22 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # empty table pretending systemd has no units. !r so a terse
             # KeyError payload still names the missing key.
             self._post_error(kind, f"parsing {request_id}: {exc!r}")
+            if kind in ("results", "schedules"):
+                # An enrichment parse failure must NOT freeze the table. Release
+                # the render barrier so the cycle renders with STALE (or empty)
+                # results/cadence — a table that never shows new Next-run times
+                # is a worse failure than one stale column, and re-raising every
+                # 10s on a poison payload (one exotic trigger line, or systemd
+                # reshaping its `show` text) would freeze BOTH views forever
+                # (QA 2026-06-12 FREEZE-1). The by-id entry was already popped
+                # before the raising parse — nothing dangles — and the failed
+                # assignment left _last_results/_last_schedules at their prior
+                # value, which is exactly the stale data we want to render. The
+                # error stays loud on the status bar; ⟳ and the next clean cycle
+                # self-heal.
+                self._pending_enrich.discard(kind)
+                self._maybe_render()
+                return
             tab = self._kind_to_tab.get(kind)
             if tab is not None and request_id in self._expected_tab_ids:
                 # A tab frozen at "loading…" would hide the failure. The
@@ -468,24 +487,44 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
 
     def _on_failed(self, request_id: str, message: str) -> None:
         # systemd's own words, verbatim — never an empty table pretending
-        # success. NOTE: a failed list fetch leaves _pending non-empty, so
-        # no render happens this cycle (last-good table + visible error);
-        # the next 10s refresh rebuilds _pending wholesale — self-heals.
+        # success. NOTE: a failed LIST fetch (timers/services) leaves _pending
+        # non-empty, so no render happens this cycle (last-good table + visible
+        # error); the next 10s refresh rebuilds _pending wholesale — self-heals.
         kind = request_id.split(":", 1)[0]
         self._post_error(kind, f"[{request_id}]: {message}")
         # A failed enrichment fetch must not leave its unit list behind — the
         # id frees in the client, and a future response must not match it.
         self._result_units_by_id.pop(request_id, None)
         self._schedule_units_by_id.pop(request_id, None)
+        if kind in ("results", "schedules"):
+            # Same freeze-prevention as the parse-failure path (FREEZE-1):
+            # release the render barrier so a DETERMINISTIC enrichment fetch
+            # failure (a systemd version that rejects the -p props, say) renders
+            # the cycle with stale data instead of freezing both views forever.
+            # Unlike a list fetch, the lists DID land — only the barrier is
+            # stuck — so without this the table never updates again. The error
+            # stays loud; ⟳ and the next clean cycle self-heal.
+            self._pending_enrich.discard(kind)
+            self._maybe_render()
+            return
+        if kind == "calendar" and request_id in self._expected_tab_ids:
+            # The chained elapse preview failed AFTER schedtab already rendered
+            # triggers + cadence — replace ONLY the "(calculating…)" placeholder
+            # so the good content survives (QA 2026-06-12 P2-6). The status bar
+            # carries the full error regardless.
+            current = self.tab_schedule.toPlainText().replace(
+                "(calculating…)", f"(elapse preview failed: {message})"
+            )
+            self.tab_schedule.setPlainText(current)
+            return
         # A detail tab frozen at "loading…" would hide the failure — write it
         # into the tab the response was meant for (freshness-gated like any
-        # other tab write).
+        # other tab write). Every tab covers its own failure now — including
+        # the Schedule tab, whose schedtab fetch is freshness-gated like the
+        # others. (The old design populated Schedule from the cat branch and
+        # needed a special-case stamp here; DEF-V11-02 removed that.)
         tab = self._kind_to_tab.get(kind)
         if tab is not None and request_id in self._expected_tab_ids:
-            # Every tab covers its own failure now — including the Schedule
-            # tab, whose schedtab fetch is freshness-gated like the others.
-            # (The old design populated Schedule from the cat branch and
-            # needed a special-case stamp here; DEF-V11-02 removed that.)
             tab.setPlainText(f"(fetch failed)\n{message}")
 
     # -- selection / detail tabs -----------------------------------------------
@@ -593,7 +632,12 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 expr = info.calendar[0]
                 text += "\n\n(calculating…)"
                 self._expected_tab_ids.add(f"calendar:{expr}")
-                self.client.fetch_calendar(expr)
+                # Return deliberately ignored: a single-flight rejection means a
+                # previous selection already chained this SAME expression, whose
+                # calendar:{expr} id was just re-admitted above and whose elapse
+                # output is identical — so "(calculating…)" still resolves from
+                # that in-flight response. Nothing to retry. (Power-of-Ten r7.)
+                _ = self.client.fetch_calendar(expr)
             self.tab_schedule.setPlainText(text)
         elif kind == "calendar":
             current = self.tab_schedule.toPlainText().replace("(calculating…)", "").rstrip()

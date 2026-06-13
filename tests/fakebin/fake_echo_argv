@@ -1,0 +1,5 @@
+#!/bin/bash
+# Prints each argument on its own line so a test can assert the exact argv the
+# client built (e.g. the "--" flag-stop before a calendar expression). Exits 0
+# so the client emits finished() with this argv dump as stdout.
+printf '%s\n' "$@"

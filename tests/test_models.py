@@ -195,6 +195,25 @@ CADENCE_CASES = [
     (("*-*-01 04:00:00",), (), "monthly"),
     (("*-01-01 00:00:00",), (), "yearly"),
     (("*-*-* *:15:00",), (), "hourly"),
+    (("*-*-* *:*:00",), (), "minutely"),
+    # STEP and RANGE time fields (QA 2026-06-12 CADENCE-1): every-N-hours,
+    # every-N-minutes, and hour ranges have no honest one-word cadence — they
+    # fall back to the raw expression rather than a confident wrong bucket.
+    # These ALL classified "daily" before the fix (the `/` in the time field
+    # was eaten by the timezone-strip heuristic; ranges fell through to the
+    # date checks).
+    (("*-*-* 00/06:00:00",), (), "*-*-* 00/06:00:00"),    # every 6h
+    (("*-*-* *:00/15:00",), (), "*-*-* *:00/15:00"),      # every 15min
+    (("*-*-* 09..17:00:00",), (), "*-*-* 09..17:00:00"),  # hourly 9am-5pm
+    # Timezone strip still fires for a real tz token (letters, no colon) — a
+    # `/`-bearing IANA zone must NOT be confused with a `/`-step time field.
+    (("*-*-* 12:00:00 UTC",), (), "daily"),
+    (("Mon *-*-* 06:00:00 Europe/Berlin",), (), "weekly (Mon)"),
+    # Non-contiguous weekday list survives systemd normalization (probed
+    # 2026-06-12) — distinct from the Mon..Fri span that becomes "weekdays".
+    (("Mon,Wed,Fri *-*-* 09:00:00",), (), "weekly (Mon,Wed,Fri)"),
+    # Alpha-leading token that ISN'T weekdays → raw, not a bogus "weekly (...)".
+    (("Xyz *-*-* 09:00:00",), (), "Xyz *-*-* 09:00:00"),
     # Unrecognized calendar shape falls back to the raw expression — an
     # honest raw string beats a wrong bucket.
     (("2026-06-15 12:00:00",), (), "2026-06-15 12:00:00"),
@@ -202,6 +221,8 @@ CADENCE_CASES = [
     ((), ("OnUnitActiveUSec=1d",), "every 1d"),
     ((), ("OnBootUSec=12h",), "boot+12h"),
     ((), ("OnStartupUSec=5min",), "login+5min"),
+    ((), ("OnUnitInactiveUSec=30min",), "30min after stop"),
+    ((), ("OnActiveUSec=1h",), "1h after timer start"),
     ((), ("OnUnitActiveUSec=1d", "OnBootUSec=12h"), "every 1d + boot+12h"),
     # Unrecognized monotonic kind: show it raw, never guess.
     ((), ("OnClockChangeUSec=0",), "OnClockChangeUSec=0"),

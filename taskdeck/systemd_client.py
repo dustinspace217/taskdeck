@@ -240,8 +240,12 @@ def _walk_show_blocks(text: str, units: list[str]) -> list[tuple[str, list[str]]
 
 
 # One trigger per line: `TimersCalendar={ OnCalendar=<expr> ; next_elapse=<ts> }`
-# with the key REPEATED for multi-trigger timers (probed 2026-06-11).
-_TRIGGER_RE = re.compile(r"\{ (\w+)=(.+?) ; next_elapse=")
+# with the key REPEATED for multi-trigger timers (probed 2026-06-11). The
+# next_elapse timestamp is brace-free ([^{}]*) and the pattern is anchored to a
+# single closing brace at end-of-line, so trailing content — a future systemd
+# packing two `{…} {…}` entries on one line — fails to match and raises the loud
+# ValueError below instead of being silently dropped (QA 2026-06-12 P2-7).
+_TRIGGER_RE = re.compile(r"\{ (\w+)=([^{}]+?) ; next_elapse=[^{}]* \}$")
 
 
 def parse_show_schedules(text: str, units: list[str]) -> dict[str, ScheduleInfo]:
@@ -545,10 +549,12 @@ class SystemdClient(QObject):  # type: ignore[misc]
         )
 
     def fetch_calendar(self, expr: str) -> bool:
-        # systemd-analyze calendar needs no scope; expression comes from the
-        # unit file's OnCalendar= line. --iterations verified on systemd 258.
-        # "--" stops flag parsing: a malformed expression starting with "-"
-        # (this app exists to inspect broken units) must not become a flag.
+        # systemd-analyze calendar needs no scope; since the Task 10 redesign
+        # the expression is a NORMALIZED OnCalendar form from `systemctl show`
+        # (not raw unit-file text), so it is well-formed by construction.
+        # "--" stops flag parsing anyway — belt-and-suspenders now rather than
+        # load-bearing, kept because it costs nothing and survives a future
+        # caller passing unnormalized text. --iterations verified on 258.
         return self.request(
             f"calendar:{expr}",
             [self._analyze, "calendar", "--iterations=5", "--", expr],

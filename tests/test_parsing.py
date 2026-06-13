@@ -214,10 +214,44 @@ def test_parse_show_schedules_rejects_unrecognized_trigger_shape():
         parse_show_schedules("TimersCalendar=garbage without braces\n", ["x.timer"])
 
 
+def test_parse_show_schedules_rejects_trailing_content_after_trigger():
+    # QA 2026-06-12 P2-7: _TRIGGER_RE is anchored to the closing brace at
+    # end-of-line, so a second `{…}` packed onto one line (a hypothetical
+    # future systemd shape) raises loudly rather than silently dropping it.
+    line = (
+        "TimersCalendar={ OnCalendar=*-*-* 03:00:00 ; next_elapse=Fri } "
+        "{ OnCalendar=*-*-* 15:00:00 ; next_elapse=Fri }\n"
+    )
+    with pytest.raises(ValueError, match="unrecognized trigger"):
+        parse_show_schedules(line, ["x.timer"])
+
+
 def test_parse_show_schedules_empty_property_means_no_triggers():
     text = "TimersCalendar=\nTimersMonotonic=\nNextElapseUSecRealtime=\n"
     schedules = parse_show_schedules(text, ["x.timer"])
     assert schedules["x.timer"] == ScheduleInfo((), (), "")
+
+
+def test_parse_show_schedules_leading_empty_block_keeps_alignment():
+    # The schedules parser shares _walk_show_blocks with parse_show_results;
+    # this pins the alignment contract THROUGH the schedules path (a unit with
+    # none of the requested props — a vanished timer loading as not-found —
+    # emits an empty leading block, and the result must land on the next unit).
+    text = "\nTimersCalendar={ OnCalendar=*-*-* 03:50:00 ; next_elapse=Fri }\n"
+    schedules = parse_show_schedules(text, ["gone.timer", "real.timer"])
+    assert "gone.timer" not in schedules
+    assert schedules["real.timer"].calendar == ("*-*-* 03:50:00",)
+
+
+def test_parse_show_schedules_more_blocks_than_units_raises():
+    # Overflow guard through the schedules path: argv and parser disagreeing
+    # about how many units came back is a loud error, never a misattribution.
+    text = (
+        "TimersCalendar={ OnCalendar=*-*-* 03:00:00 ; next_elapse=Fri }\n\n"
+        "TimersCalendar={ OnCalendar=*-*-* 15:00:00 ; next_elapse=Fri }\n"
+    )
+    with pytest.raises(ValueError, match="more blocks than"):
+        parse_show_schedules(text, ["only.timer"])
 
 
 def test_parse_journal_empty_output_is_empty_not_error():

@@ -71,6 +71,40 @@ def test_spawn_failure_emits_failed(qtbot):
     assert "failed to start" in message
 
 
+def test_fetch_schedules_emits_expected_request_id(qtbot):
+    # PIN-3 (QA 2026-06-12): the window hand-types "schedules:{scope}" into its
+    # FakeClient and gates responses on an exact-id match; this pins the REAL
+    # client to the same string. A drift here would pass every window test
+    # while freezing the production Cadence/Schedule path at "loading…".
+    client = SystemdClient(systemctl=str(FAKEBIN / "fake_ok"))
+    with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
+        client.fetch_schedules("user", ["a.timer"])
+    assert blocker.args[0] == "schedules:user"
+
+
+def test_fetch_tab_schedule_emits_expected_request_id(qtbot):
+    # The schedtab id carries the unit name (the window's freshness gate keys
+    # on the full id) — pin its exact shape too.
+    client = SystemdClient(systemctl=str(FAKEBIN / "fake_ok"))
+    with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
+        client.fetch_tab_schedule("user", "a.timer")
+    assert blocker.args[0] == "schedtab:user:a.timer"
+
+
+def test_fetch_calendar_emits_expected_id_and_flag_stop_argv(qtbot):
+    # Pins both the "calendar:{expr}" id AND the "--" flag-stop: a normalized
+    # expression is benign, but the guard must survive a future caller passing
+    # unnormalized text starting with "-" (it must reach systemd-analyze as an
+    # operand, never a flag). fake_echo_argv dumps the argv it received.
+    client = SystemdClient(analyze=str(FAKEBIN / "fake_echo_argv"))
+    with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
+        client.fetch_calendar("*-*-* 03:50:00")
+    request_id, stdout = blocker.args
+    assert request_id == "calendar:*-*-* 03:50:00"
+    argv_lines = stdout.splitlines()
+    assert argv_lines == ["calendar", "--iterations=5", "--", "*-*-* 03:50:00"]
+
+
 def test_timeout_emits_exactly_one_terminal_signal(qtbot):
     # Regression test for the echo guards: after the watchdog reports a
     # timeout, the killed process's death echoes (errorOccurred(Crashed) and

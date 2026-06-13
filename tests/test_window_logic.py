@@ -132,6 +132,9 @@ def test_empty_scope_renders_zero_rows_without_results_fetch(qtbot):
     window._on_finished("timers:user", "[]")
     window._on_finished("services:user", "[]")
     assert not calls_of(client, "fetch_results")
+    # The empty-timer-list guard is load-bearing: `show` with NO units dumps
+    # manager properties, which _walk_show_blocks would reject (QA 2026-06-12).
+    assert not calls_of(client, "fetch_schedules")
     assert window.model.rowCount() == 0
     # Freshness moved to the permanent label (QA synthesis #5).
     assert "0 units" in window._freshness.text()
@@ -264,6 +267,21 @@ def test_render_waits_for_both_enrichments(qtbot):
     assert window.model.rowCount() == 1
 
 
+def test_render_waits_for_both_enrichments_schedules_first(qtbot):
+    # The MIRROR of the test above (QA 2026-06-12 PIN-1): the barrier must
+    # block on the RESULTS side too. Delivering schedules first and asserting
+    # no render pins `_pending_enrich.add("results")` — without it, this would
+    # render early with a blank Last-result column.
+    window, client = make_window(qtbot)
+    window.refresh()
+    window._on_finished("timers:user", LIST_TIMERS_JSON)
+    window._on_finished("services:user", LIST_UNITS_JSON)
+    window._on_finished("schedules:user", SCHEDULES_TEXT)
+    assert window.model.rowCount() == 0  # results still pending — no render
+    window._on_finished("results:user", RESULTS_TEXT)
+    assert window.model.rowCount() == 1
+
+
 def test_cadence_column_renders_from_schedules(qtbot):
     from PySide6.QtCore import Qt
 
@@ -280,6 +298,82 @@ def test_schedules_response_without_recorded_units_is_dropped(qtbot):
     window, client = make_window(qtbot)
     window._on_finished("schedules:user", SCHEDULES_TEXT)
     assert window._last_schedules == {}
+
+
+def test_other_scope_schedules_are_consumed_but_not_rendered(qtbot):
+    # PIN-2 (QA 2026-06-12): the schedules twin of the results scope guard.
+    # A user-scope schedules response landing after a flip must NOT pollute
+    # _last_schedules or stamp the wrong scope onto rendered rows — without the
+    # guard, the barrier could empty and _data_scope would mislabel rows,
+    # defeating the action-enablement gate (QA synthesis #7). The entry is
+    # still popped (alignment bookkeeping) but nothing renders.
+    window, client = make_window(qtbot)
+    window._schedule_units_by_id["schedules:system"] = ["a.timer"]
+    window._on_finished("schedules:system", SCHEDULES_TEXT)
+    assert "schedules:system" not in window._schedule_units_by_id
+    assert window._last_schedules == {}
+    assert window.model.rowCount() == 0
+
+
+def test_rejected_schedules_fetch_keeps_recorded_unit_list(qtbot):
+    # The schedules twin of test_rejected_results_fetch_keeps_recorded_unit_list:
+    # if a previous batched schedules `show` is still in flight, its by-id entry
+    # must survive so its response parses against the argv it was built from.
+    window, client = make_window(qtbot)
+    window._schedule_units_by_id["schedules:user"] = ["old.timer"]
+    client.accept = False
+    window.refresh()
+    window._on_finished("timers:user", LIST_TIMERS_JSON)
+    window._on_finished("services:user", LIST_UNITS_JSON)
+    assert window._schedule_units_by_id["schedules:user"] == ["old.timer"]
+
+
+def test_malformed_schedules_releases_barrier_and_renders_stale(qtbot):
+    # FREEZE-1 (QA 2026-06-12): one unparseable trigger line must NOT freeze
+    # the table. The render barrier releases, the cycle renders (with no/stale
+    # cadence), and the error is loud. Before the fix, the parse raised between
+    # the by-id pop and the barrier discard, and every 10s cycle re-raised on
+    # the same poison payload — both views frozen at last-good forever.
+    window, client = make_window(qtbot)
+    window.refresh()
+    window._on_finished("timers:user", LIST_TIMERS_JSON)
+    window._on_finished("services:user", LIST_UNITS_JSON)
+    window._on_finished("results:user", RESULTS_TEXT)
+    window._on_finished("schedules:user", "TimersCalendar=garbage no braces\n")
+    assert window.model.rowCount() == 1  # rendered despite the bad schedule
+    assert window.model.index(0, 2).data() == "—"  # cadence honest-unknown
+    message = window.statusBar().currentMessage()
+    assert message.startswith("ERROR") and "schedules" in message
+
+
+def test_malformed_schedules_recovers_next_cycle(qtbot):
+    # The self-heal half of FREEZE-1: once the source emits a good payload,
+    # the next cycle restores cadence and clears the error.
+    window, client = make_window(qtbot)
+    window.refresh()
+    window._on_finished("timers:user", LIST_TIMERS_JSON)
+    window._on_finished("services:user", LIST_UNITS_JSON)
+    window._on_finished("results:user", RESULTS_TEXT)
+    window._on_finished("schedules:user", "TimersCalendar=garbage no braces\n")
+    assert "ERROR" in window.statusBar().currentMessage()
+    run_full_cycle(window)  # good payload this time
+    assert window.model.index(0, 2).data() == "daily"
+    assert "ERROR" not in window.statusBar().currentMessage()
+
+
+def test_failed_schedules_fetch_releases_barrier(qtbot):
+    # The fetch-failure twin of FREEZE-1: a DETERMINISTIC schedules fetch
+    # failure (a systemd version rejecting the -p props) would also freeze the
+    # table forever — the lists land every cycle but the barrier never clears.
+    # _on_failed releases it so the table renders with stale data + error.
+    window, client = make_window(qtbot)
+    window.refresh()
+    window._on_finished("timers:user", LIST_TIMERS_JSON)
+    window._on_finished("services:user", LIST_UNITS_JSON)
+    window._on_finished("results:user", RESULTS_TEXT)
+    window._on_failed("schedules:user", "Unknown property SCHEDULE_PROPS")
+    assert window.model.rowCount() == 1  # not frozen
+    assert "Unknown property" in window.statusBar().currentMessage()
 
 
 # -- detail-tab lifecycle --------------------------------------------------------
@@ -457,6 +551,38 @@ def test_schedtab_monotonic_only_skips_calendar_chain(qtbot):
     assert "Cadence: every 1d + boot+12h" in text
     assert "(calculating…)" not in text
     assert not calls_of(client, "fetch_calendar")
+
+
+def test_calendar_preview_failure_preserves_triggers(qtbot):
+    # P2-6 (QA 2026-06-12): the chained elapse preview failing must replace
+    # ONLY the "(calculating…)" placeholder — the triggers and cadence already
+    # rendered by the schedtab fill must survive (the old code blanked the whole
+    # tab to "(fetch failed)").
+    window, client = make_window(qtbot)
+    window._expected_tab_ids = {"schedtab:user:a.timer"}
+    window._on_finished("schedtab:user:a.timer", SCHEDULES_TEXT)
+    assert "(calculating…)" in window.tab_schedule.toPlainText()
+    window._on_failed("calendar:*-*-* 03:50:00", "systemd-analyze timed out")
+    text = window.tab_schedule.toPlainText()
+    assert "OnCalendar=*-*-* 03:50:00" in text  # triggers survive
+    assert "Cadence: daily" in text
+    assert "(calculating…)" not in text
+    assert "elapse preview failed" in text
+    # The status bar still carries the full error.
+    assert "timed out" in window.statusBar().currentMessage()
+
+
+def test_non_timer_selection_stamps_schedule_tab(qtbot):
+    # PIN-4 (QA 2026-06-12): selecting a SERVICE row (not a timer) stamps the
+    # Schedule tab "(not a timer — no schedule)" and fires NO schedtab fetch —
+    # without the else branch the tab strands at "loading…" for every service.
+    window, client = make_window(qtbot)
+    window.view_box.setCurrentIndex(1)  # Services view: row 0 is a.service
+    run_full_cycle(window)
+    select_with_fetches(qtbot, window)
+    assert window.tab_schedule.toPlainText() == "(not a timer — no schedule)"
+    assert not calls_of(client, "fetch_tab_schedule")
+    assert not any(i.startswith("schedtab:") for i in window._expected_tab_ids)
 
 
 def test_on_failed_unexpected_id_leaves_tab_untouched(qtbot):
