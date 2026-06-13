@@ -105,6 +105,19 @@ def test_fetch_calendar_emits_expected_id_and_flag_stop_argv(qtbot):
     assert argv_lines == ["calendar", "--iterations=5", "--", "*-*-* 03:50:00"]
 
 
+def test_list_failed_services_emits_expected_id_and_argv(qtbot):
+    # The monitor's poll (Task 2). --state=failed narrows server-side so the
+    # diff sees only failures. Pins both the request id and the exact argv.
+    client = SystemdClient(systemctl=str(FAKEBIN / "fake_echo_argv"))
+    with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
+        client.list_failed_services("user")
+    request_id, stdout = blocker.args
+    assert request_id == "failed:user"
+    assert stdout.splitlines() == [
+        "--user", "list-units", "--type=service", "--state=failed", "--all", "-o", "json",
+    ]
+
+
 def test_finished_processes_are_swept_not_leaked(qtbot):
     # DEF-T4-01 regression (the leak fix): finished QProcess objects must be
     # freed, not accumulated for the client's lifetime. Each is parked on

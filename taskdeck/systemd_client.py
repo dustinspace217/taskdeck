@@ -533,6 +533,19 @@ class SystemdClient(QObject):  # type: ignore[misc]
             ],
         )
 
+    def list_failed_services(self, scope: str) -> bool:
+        """Failed services only — the background monitor's poll. --state=failed
+        narrows the query server-side so the monitor's diff compares just the
+        failures, not the full unit list. Same JSON shape as list_services, so
+        parse_list_units reads it unchanged."""
+        return self.request(
+            f"failed:{scope}",
+            [
+                self._systemctl, *self._scope_args(scope),
+                "list-units", "--type=service", "--state=failed", "--all", "-o", "json",
+            ],
+        )
+
     def fetch_results(self, scope: str, units: list[str]) -> bool:
         return self.request(
             f"results:{scope}",
