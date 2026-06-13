@@ -8,13 +8,42 @@
 
 **Tech Stack:** PySide6 (QSystemTrayIcon, QSystemTrayIcon.showMessage for notifications — no extra deps), the existing async SystemdClient.
 
-## Status (updated 2026-06-13, planning)
-Phase: Planning complete — design decisions locked with Dustin (2026-06-13):
-close→hide-to-tray, autostart as an in-app toggle (off by default), notify on
-failures only. Building next.
-Done: nothing yet (plan written).
-Next: Task 1 — FailureMonitor (headless, TDD).
+## Status (updated 2026-06-13, feature COMPLETE + QA done)
+Phase: All 6 tasks done. Tasks 1-5 built (list_failed_services, FailureMonitor,
+Tray, closeEvent hide-to-tray, app.py wiring + --tray). Three-phase QA ran
+(4 reviewers; docs/qa/2026-06-13-tray/qa.md) and found a P0 (monitor blindness)
++ several P1s — all fixed in a QA batch. 155 hermetic + 3 live, ruff + mypy clean.
+Done: Tasks 1-6 + QA fix batch.
+Next: push, verify CI, Dustin's verdict on the running feature (real-tray
+rendering of the icon/notifications is the one thing only a live desktop can
+confirm — the logic is all tested).
 Blocked: nothing.
+
+### Deviation summary (2026-06-13)
+Built per the locked design. One structural choice during implementation: the
+window and monitor use SEPARATE SystemdClient instances (the monitor's is
+headless) rather than sharing one — cleaner isolation, no shared signal-bus
+races (behavioral-change, additive). QA fix batch fixed two found bugs (P0
+monitor-blindness, P1s) — behavioral fixes, not deferments. New deferments
+registered below.
+
+### Appendix: Deferments originated in the tray feature
+- **DEF-TR-01** (LOW): the window's 10s refresh keeps running while hidden to
+  tray (a few `systemctl` reads/10s). Found in design; fix direction: bind the
+  refresh timer to window visibility (show/hide events) so a tray-resident app
+  is fully idle. Obsolete if the window is ever always-visible.
+- **DEF-TR-02** (LOW, code-reviewer): if the tray icon dies mid-session, the
+  window is hidden + `setQuitOnLastWindowClosed(False)` leaves no reachable
+  Quit (must `kill`). Accepted corner — robust mid-session tray-death detection
+  is hard and a guard risks its own bugs. Fix direction: poll
+  `tray.isVisible()` and fall back to quit-on-close if the icon vanishes.
+- **DEF-TR-03** (LOW, silent-failure-hunter): the tray tooltip doesn't reflect
+  the LIVE failure count (only a static string / the blind warning). Enhancement:
+  set the tooltip to "N service(s) failed" when the monitor reports failures, so
+  state is visible on hover even when the notification daemon swallows balloons.
+- **DEF-TR-04** (LOW, silent-failure-hunter): no first-time "still running in the
+  tray" hint when the user first closes the window. One-shot informational
+  balloon would close the surprise.
 
 ## Design decisions (from Dustin, 2026-06-13)
 1. **Close behavior:** the window's close button hides to tray and keeps monitoring. Quit lives in the tray menu (and is the ONLY thing that exits).
