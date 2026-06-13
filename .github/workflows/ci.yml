@@ -38,6 +38,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "PySide6>=6.11,<6.12" pytest pytest-qt ruff mypy
 
+      # Type-check Qt the way the app actually ships. Locally Qt comes from the
+      # Fedora RPM, which bundles .pyi stubs but no PEP 561 py.typed marker, so
+      # mypy ignores the stubs and treats PySide6 as Any (documented in
+      # pyproject). The pip wheel DOES ship py.typed, which would make CI's mypy
+      # check against Qt's real stubs and flag errors local can't see. Drop the
+      # marker so CI reproduces the deployment environment's type-checking
+      # exactly. (Runtime/tests are unaffected — they don't read py.typed.)
+      - name: Match local typing (strip pip's Qt py.typed marker)
+        run: |
+          site=$(python -c "import site; print(site.getsitepackages()[0])")
+          rm -f "$site/PySide6/py.typed" "$site/shiboken6/py.typed"
+          echo "Stripped py.typed (if present) so Qt is Any to mypy, as on Fedora."
+
       - name: Lint (ruff)
         run: ruff check .
 
