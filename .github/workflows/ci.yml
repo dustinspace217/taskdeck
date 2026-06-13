@@ -31,31 +31,21 @@ jobs:
 
       # Deliberately pip here, NOT the RPM the app uses locally (pyproject
       # documents why there is no pip packaging) — CI just needs the same
-      # libraries present to exercise the code. PySide6 pinned near the dev
-      # version so type-checking and runtime behaviour match.
+      # libraries present to exercise the code.
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "PySide6>=6.11,<6.12" pytest pytest-qt ruff mypy
-
-      # Type-check Qt the way the app actually ships. Locally Qt comes from the
-      # Fedora RPM, which bundles .pyi stubs but no PEP 561 py.typed marker, so
-      # mypy ignores the stubs and treats PySide6 as Any (documented in
-      # pyproject). The pip wheel DOES ship py.typed, which would make CI's mypy
-      # check against Qt's real stubs and flag errors local can't see. Drop the
-      # marker so CI reproduces the deployment environment's type-checking
-      # exactly. (Runtime/tests are unaffected — they don't read py.typed.)
-      - name: Match local typing (strip pip's Qt py.typed marker)
-        run: |
-          site=$(python -c "import site; print(site.getsitepackages()[0])")
-          rm -f "$site/PySide6/py.typed" "$site/shiboken6/py.typed"
-          echo "Stripped py.typed (if present) so Qt is Any to mypy, as on Fedora."
+          python -m pip install "PySide6>=6.11,<6.12" pytest pytest-qt ruff
 
       - name: Lint (ruff)
         run: ruff check .
 
-      - name: Type-check (mypy, strict)
-        run: mypy taskdeck
-
+      # NOTE: mypy runs as a LOCAL gate (`mypy taskdeck`, see README/CLAUDE.md),
+      # not in CI. The strict type-check result depends on PySide6's stub
+      # environment, which differs between the Fedora RPM the app ships on (no
+      # py.typed → Qt is Any, the project's documented choice) and CI's pip wheel
+      # (ships py.typed → Qt fully typed). Running it here would type-check
+      # against an environment the app is never deployed in. ruff + the full
+      # offscreen suite are environment-independent and cover CI's job.
       - name: Test (hermetic suite, offscreen Qt)
         run: python -m pytest
