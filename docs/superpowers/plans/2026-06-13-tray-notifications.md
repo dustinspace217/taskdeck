@@ -45,6 +45,24 @@ registered below.
   tray" hint when the user first closes the window. One-shot informational
   balloon would close the surprise.
 
+### Appendix: Single-instance guard (taskdeck/single_instance.py, 2026-06-17)
+The tray + autostart feature let the app launch twice (autostart at login + a
+manual launch) → duplicate tray icons. Fixed with a QLocalServer/QLocalSocket
+single-instance guard: a second launch pings the primary to show its window and
+exits. Reviewed (code-reviewer + test-analyzer); P1s fixed (checked `listen()`
+return → real fail-open; testable `_start` seam pinning "secondary skips build";
+race-safe conditional `removeServer`; per-connection cleanup). Residual:
+- **DEF-SI-01** (LOW): two TRULY simultaneous *first* launches can both probe-miss
+  before either listens; the loser's `listen()` fails and it falls open (runs
+  without the guard, no duplicate tray but its window won't raise on later pings).
+  Not reachable via autostart-then-manual-launch (never simultaneous). Fix
+  direction: a brief retry/backoff on `listen()` failure, or a file lock.
+- **DEF-SI-02** (LOW, test gap): the true-crash-orphan reclaim (stale socket FILE
+  with no listener → `removeServer` then re-listen) is covered by the standard
+  pattern + the conditional-removeServer logic, but not faithfully unit-tested
+  (faithful simulation needs a subprocess that listens then is `kill -9`'d). The
+  clean-shutdown reclaim path IS tested. Fix direction: a subprocess-based test.
+
 ## Design decisions (from Dustin, 2026-06-13)
 1. **Close behavior:** the window's close button hides to tray and keeps monitoring. Quit lives in the tray menu (and is the ONLY thing that exits).
 2. **Autostart:** off by default; a checkable in-app action toggles a `~/.config/autostart/taskdeck.desktop` entry (file presence IS the persisted state). The autostart entry launches the app to the tray (`--tray`).

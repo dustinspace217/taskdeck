@@ -111,20 +111,37 @@ def _raise_window(window: MainWindow) -> None:
     window.activateWindow()
 
 
-def main() -> int:
-    """Build the app and run the Qt event loop; returns the exit code."""
-    app = QApplication(sys.argv)
-    # Single-instance guard FIRST — before build() spawns a window/tray/monitor —
-    # so a second launch (e.g. autostart at login + a manual launch) surfaces the
-    # running copy and exits instead of stacking a duplicate tray icon.
-    instance = SingleInstance()
+def _start(
+    app: QApplication,
+    instance: SingleInstance,
+    start_in_tray: bool,
+    auto_refresh: bool = True,
+) -> MainWindow | None:
+    """The single-instance decision + wiring, WITHOUT entering the event loop.
+
+    Returns the window when this process is the primary (caller runs app.exec()),
+    or None when it's a secondary (caller exits without building anything — the
+    whole point of the guard). Split from main() so the secondary-skips-build
+    path is testable, mirroring why build() was split out."""
     if instance.is_secondary():
+        # Another copy is running — surface it and exit, instead of stacking a
+        # second tray icon + monitor.
         instance.ping_primary()
-        return 0
-    window = build(app, start_in_tray="--tray" in sys.argv[1:])
+        return None
+    window = build(app, start_in_tray=start_in_tray, auto_refresh=auto_refresh)
     instance.set_window_shower(lambda: _raise_window(window))
     # The instance owns the listening QLocalServer — keep it alive for the run.
     app._taskdeck_instance = instance
+    return window
+
+
+def main() -> int:
+    """Build the app and run the Qt event loop; returns the exit code."""
+    app = QApplication(sys.argv)
+    # Single-instance guard FIRST — before build() spawns a window/tray/monitor.
+    window = _start(app, SingleInstance(), start_in_tray="--tray" in sys.argv[1:])
+    if window is None:
+        return 0  # secondary launch: it pinged the primary and we exit
     # QApplication.exec() returns Any under PySide6's Any-typed stubs (the RPM
     # ships no py.typed marker — see pyproject.toml). Cast to int so the -> int
     # return type holds; Qt always returns an integer exit code.

@@ -52,11 +52,22 @@ def test_ping_before_shower_is_set_does_not_crash(qtbot, key):
     qtbot.wait(50)  # let the connection be processed; nothing should blow up
 
 
-def test_stale_socket_does_not_block_a_fresh_primary(qtbot, key):
-    # A crashed primary can leave the name bound on Linux. A new instance must
-    # reclaim it (removeServer before listen), not be falsely seen as secondary.
+def test_prior_instance_shutdown_does_not_block_a_fresh_primary(qtbot, key):
+    # After a prior instance's server is gone, a new instance must become a
+    # WORKING primary (listening), not be falsely seen as secondary and not fail
+    # open as a deaf primary.
+    from PySide6.QtNetwork import QLocalSocket
+
     stale = QLocalServer()
     stale.listen(key)
-    stale.close()  # "crash": stop serving; the name may linger
+    stale.close()  # prior instance stops serving
     inst = SingleInstance(key=key)
-    assert inst.is_secondary() is False  # reclaimed, not mistaken for secondary
+    assert inst.is_secondary() is False
+    # Stronger than "not secondary": confirm it is actually LISTENING (a fresh
+    # probe connects) — i.e. listen() succeeded, so it's a real primary that will
+    # surface its window on a future launch, not a fail-open deaf one.
+    checker = QLocalSocket()
+    checker.connectToServer(key)
+    assert checker.waitForConnected(500)
+    checker.disconnectFromServer()
+    checker.close()

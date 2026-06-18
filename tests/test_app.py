@@ -87,3 +87,49 @@ def test_build_with_tray_shows_window_without_flag(qapp, qtbot, monkeypatch):
         assert window.isVisible()                 # no flag → normal show
     finally:
         qapp.setQuitOnLastWindowClosed(True)
+
+
+# -- _start single-instance seam ---------------------------------------------------
+
+
+class _FakeInstance:
+    """Stand-in for SingleInstance so the _start decision is testable without a
+    real second process: records ping_primary / set_window_shower calls."""
+
+    def __init__(self, secondary: bool) -> None:
+        self._secondary = secondary
+        self.pinged = False
+        self.shower = None
+
+    def is_secondary(self) -> bool:
+        return self._secondary
+
+    def ping_primary(self) -> None:
+        self.pinged = True
+
+    def set_window_shower(self, shower) -> None:
+        self.shower = shower
+
+
+def test_start_secondary_pings_and_skips_build(qapp, qtbot):
+    # The feature's whole point: a secondary launch must NOT build a window/tray,
+    # just ping the primary and let the caller exit.
+    fake = _FakeInstance(secondary=True)
+    result = appmod._start(qapp, fake, start_in_tray=False, auto_refresh=False)
+    assert result is None          # caller exits
+    assert fake.pinged is True     # primary was told to show
+    assert fake.shower is None     # build()/wiring was skipped
+
+
+def test_start_primary_builds_and_wires_shower(qapp, qtbot, monkeypatch):
+    monkeypatch.setattr(appmod, "_tray_available", lambda: False)  # keep it light
+    fake = _FakeInstance(secondary=False)
+    window = appmod._start(qapp, fake, start_in_tray=False, auto_refresh=False)
+    qtbot.addWidget(window)
+    assert window is not None
+    assert fake.shower is not None                       # shower registered
+    assert getattr(qapp, "_taskdeck_instance", None) is fake  # kept alive
+    # The registered shower raises the window — exercises _raise_window.
+    window.hide()
+    fake.shower()
+    assert window.isVisible()
