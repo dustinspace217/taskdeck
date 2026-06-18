@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from taskdeck.main_window import MainWindow
 from taskdeck.monitor import FailureMonitor
+from taskdeck.single_instance import SingleInstance
 from taskdeck.systemd_client import SystemdClient
 from taskdeck.tray import Tray
 
@@ -102,10 +103,28 @@ def build(
     return window
 
 
+def _raise_window(window: MainWindow) -> None:
+    """Bring the window to the foreground — called when a second launch pings the
+    primary. showNormal restores from BOTH minimized and hidden-to-tray states."""
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
+
+
 def main() -> int:
     """Build the app and run the Qt event loop; returns the exit code."""
     app = QApplication(sys.argv)
-    build(app, start_in_tray="--tray" in sys.argv[1:])
+    # Single-instance guard FIRST — before build() spawns a window/tray/monitor —
+    # so a second launch (e.g. autostart at login + a manual launch) surfaces the
+    # running copy and exits instead of stacking a duplicate tray icon.
+    instance = SingleInstance()
+    if instance.is_secondary():
+        instance.ping_primary()
+        return 0
+    window = build(app, start_in_tray="--tray" in sys.argv[1:])
+    instance.set_window_shower(lambda: _raise_window(window))
+    # The instance owns the listening QLocalServer — keep it alive for the run.
+    app._taskdeck_instance = instance
     # QApplication.exec() returns Any under PySide6's Any-typed stubs (the RPM
     # ships no py.typed marker — see pyproject.toml). Cast to int so the -> int
     # return type holds; Qt always returns an integer exit code.
