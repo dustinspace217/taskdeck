@@ -6,7 +6,7 @@ spawn subprocesses); all action policy lives in actions.py.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from PySide6.QtCore import QItemSelectionModel, QSortFilterProxyModel, Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent
@@ -18,11 +18,22 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QSplitter,
+    QStackedWidget,
     QTableView,
     QTabWidget,
 )
 
 from taskdeck.actions import ActionNotAllowed, action_argv
+from taskdeck.calendar_model import (
+    GAP_TOLERANCE_USEC,
+    CalendarEvent,
+    cadence_interval_usec,
+    compute_gaps,
+    parse_projection,
+    parse_run_journal,
+    projection_iterations,
+)
+from taskdeck.calendar_view import CalendarView
 from taskdeck.models import (
     ROLE_ACTIVATES,
     ROLE_SORT,
@@ -110,6 +121,36 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # (and re-flashing "loading…") every 10s cycle.
         self._last_detail_unit: str | None = None
 
+        # -- Calendar-page build state (page 1 of the central stack) ----------
+        # The calendar fans MANY fetches in per build (one journal query + one
+        # projection per eligible timer) and renders only when they ALL land —
+        # a separate fan-in barrier from the table's _pending_enrich, because the
+        # two pages are independent and a calendar build must never stall (or be
+        # stalled by) a table refresh cycle. _cal_pending holds the calproj/
+        # caljournal ids still outstanding for the CURRENT build; it is reset
+        # wholesale at the start of each build, so a response whose id is not in
+        # the (new) set — a leftover from a navigated-away window — is dropped.
+        # _cal_events accumulates parsed events across those responses.
+        self._cal_pending: set[str] = set()
+        self._cal_events: list[CalendarEvent] = []
+        self._cal_units: list[str] = []
+        self._cal_window: tuple[int, int] = (0, 0)
+        self._cal_now: int = 0
+        # Per-timer slots accumulated from projection responses in THIS build,
+        # held until the journal lands so gaps can be computed (a gap needs both
+        # the scheduled slots AND the actual runs). Keyed by timer unit name.
+        self._cal_slots: dict[str, list[int]] = {}
+        # calproj request id → its timer unit name, recorded at fire time. The
+        # unit is NOT recovered by splitting the id (":" is legal inside unit
+        # names — see the class docstring's request-id convention); it is looked
+        # up here exactly as _result_units_by_id recovers a results fetch's unit
+        # list. Bounded by the number of eligible timers in one build.
+        self._cal_proj_unit_by_id: dict[str, str] = {}
+        # service-name → timer-name map for THIS build, so the pure journal
+        # parser can bucket run records back to their timer (runs/projections/
+        # gaps are all keyed by timer, not the activated service).
+        self._cal_service_to_timer: dict[str, str] = {}
+
         self.model = TaskTableModel()
         self.proxy = QSortFilterProxyModel()
         self.proxy.setSourceModel(self.model)
@@ -165,8 +206,14 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         bar.addWidget(self.scope_box)
 
         self.view_box = QComboBox()
-        self.view_box.addItems(["Timers", "Services"])
-        self.view_box.currentIndexChanged.connect(lambda _i: self.refresh())
+        # "Calendar" is a THIRD view, not a third scope: it swaps the central
+        # stack to the CalendarView page rather than re-querying the table.
+        # _on_view_changed branches on the selected text so the Timers/Services
+        # table refresh and the Calendar page-swap stay distinct — a bare
+        # refresh() here would re-query systemctl when the user only wanted to
+        # look at the calendar.
+        self.view_box.addItems(["Timers", "Services", "Calendar"])
+        self.view_box.currentIndexChanged.connect(lambda _i: self._on_view_changed())
         bar.addWidget(QLabel(" View: "))
         bar.addWidget(self.view_box)
 
@@ -239,7 +286,25 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         splitter.addWidget(self.tabs)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
-        self.setCentralWidget(splitter)
+
+        # Central widget is a QStackedWidget so the table view and the calendar
+        # view are two independent pages the View dropdown swaps between. A
+        # stack (not a tab widget) because the page is chosen from the existing
+        # View dropdown, not a second set of tabs — one selection control, no
+        # redundant chrome. Page 0 = the table+tabs splitter (the default v1
+        # surface); page 1 = the CalendarView. CalendarView owns its OWN nav
+        # state (mode + window), so swapping pages never disturbs the table's
+        # selection/scroll restore path (spec §7).
+        self._stack = QStackedWidget()
+        self._stack.addWidget(splitter)              # index 0 — table page
+        self.calendar_view = CalendarView()
+        self._stack.addWidget(self.calendar_view)    # index 1 — calendar page
+        # selected(unit): a calendar row click feeds the SAME detail tabs the
+        # table selection uses, via the adapter. rebuild(start, end): a nav move
+        # asks the host to refetch exactly the new window.
+        self.calendar_view.selected.connect(self._on_calendar_selected)
+        self.calendar_view.rebuild.connect(self._build_calendar)
+        self.setCentralWidget(self._stack)
         self._update_action_enablement()
 
     def _make_text_tab(self, title: str) -> QPlainTextEdit:
@@ -268,6 +333,33 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._update_action_enablement()
         if self._auto_refresh:
             self.refresh()
+
+    def _on_view_changed(self) -> None:
+        """Handle a View-dropdown change: Timers/Services refresh the table page;
+        Calendar swaps to the calendar page and triggers a build.
+
+        Branching on the selected TEXT (not the index) keeps this readable and
+        rename-safe — the alternative, a bare refresh() on every change, would
+        re-query systemctl when the user only wanted to view the calendar, and
+        would fall the calendar's index into _render_rows' Services `else`
+        branch (rendering the calendar index as a service table). The page swap
+        is the whole point of the Calendar entry.
+        """
+        if self.view_box.currentText() == "Calendar":
+            self._stack.setCurrentWidget(self.calendar_view)
+            # Build the visible window now so the page isn't blank on first show.
+            # The CalendarView starts in Day mode; build a one-day window ending
+            # at now (past-facing — "what happened today" plus today's upcoming
+            # slots). auto_refresh=False (tests) fires zero subprocesses here.
+            if self._auto_refresh:
+                now_usec = int(datetime.now(UTC).timestamp() * 1_000_000)
+                day = 86_400_000_000
+                self._build_calendar(now_usec - day, now_usec)
+            return
+        # Timers or Services → back to the table page, and refresh it (the
+        # column set differs between the two, so a re-query is correct).
+        self._stack.setCurrentIndex(0)
+        self.refresh()
 
     def _manual_refresh(self) -> None:
         """⟳: refresh AND invalidate the tab dedup so the selected unit's
@@ -393,6 +485,12 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 return  # stale response for a unit/scope no longer selected
             self._fill_tab(kind, stdout)
             return
+        elif kind == "caljournal":
+            self._on_cal_journal(request_id, stdout)
+            return
+        elif kind == "calproj":
+            self._on_cal_projection(request_id, stdout)
+            return
         else:
             return  # unknown kind (future request types): never fall through
         if not self._pending:
@@ -428,6 +526,222 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         if not self._pending_enrich:
             self._data_scope = self.scope
             self._render_rows()
+
+    # -- calendar build --------------------------------------------------------
+
+    def _build_calendar(self, win_start: int, win_end: int) -> None:
+        """Fan out the fetches for a calendar window [win_start, win_end] (µs).
+
+        Fires ONE journal query for all timer-run outcomes in the window, plus
+        ONE projection per ELIGIBLE calendar timer (spec §9 eligibility below).
+        The responses fan IN via _dispatch_finished's calproj/caljournal
+        branches and _finalize_calendar renders when they all land — a separate
+        counter from the table's render barrier so the two pages never block
+        each other.
+
+        Timer eligibility (spec §9):
+        - DISABLED timer (next is None): contributes past runs + gaps but NO
+          projection — a disabled timer has no future schedule to project.
+        - NEVER-RAN timer (last 0/None): still projected; gaps need a run
+          baseline they lack, so they simply produce none.
+        - EMPTY `activates`: shown as `—`, skipped for journal AND projection —
+          there is no service to mine runs for and projecting it alone is noise.
+        - Monotonic-only / unclassifiable cadence: cadence_interval_usec returns
+          None → projection_iterations returns 0 → no projection fetch (its
+          single next run would come from list-timers as an `approx` event, a
+          later task; v1's Day slice omits it).
+
+        `win_start/win_end` come either from _on_view_changed (first show) or the
+        CalendarView's rebuild signal (a nav move). The journal is clamped to
+        [win_start, now] — never query the future, where no run can have happened.
+        """
+        scope = self.scope
+        now_usec = int(datetime.now(UTC).timestamp() * 1_000_000)
+        # Reset the per-build accumulators FIRST. Replacing _cal_pending wholesale
+        # is what drops a late response from a superseded window — its id is no
+        # longer in the set, so the dispatch branch ignores it.
+        self._cal_pending = set()
+        self._cal_events = []
+        self._cal_slots = {}
+        self._cal_proj_unit_by_id = {}
+        self._cal_window = (win_start, win_end)
+        self._cal_now = now_usec
+        # Row order + the service→timer map are derived from the live timers.
+        # Timers with an empty `activates` are listed (so the row shows) but
+        # excluded from the service→timer map (no runs to bucket to them).
+        self._cal_units = [t.unit for t in self._timers]
+        self._cal_service_to_timer = {
+            t.activates: t.unit for t in self._timers if t.activates
+        }
+
+        # ONE journal query for the whole window, clamped to the past. Recorded
+        # in the fan-in set BEFORE firing so a synchronous test-client response
+        # finds its id already expected.
+        journal_until = min(now_usec, win_end)
+        cal_journal_id = f"caljournal:{scope}"
+        self._cal_pending.add(cal_journal_id)
+        # Return ignored: a single-flight rejection means an identical query is
+        # already in flight for this scope; its response will still satisfy the
+        # fan-in (same id), so re-firing is unnecessary (Power of Ten r7).
+        _ = self.client.fetch_cal_journal(scope, win_start, journal_until)
+
+        span = max(1, win_end - win_start)
+        for timer in self._timers:
+            if timer.next_usec is None:
+                continue  # disabled — past runs/gaps only, never a projection
+            if not timer.activates:
+                continue  # no service to mine — listed but not projected (§9)
+            info = self._last_schedules.get(timer.unit)
+            interval = cadence_interval_usec(info)
+            iterations = projection_iterations(interval, span)
+            if iterations <= 0:
+                continue  # monotonic-only / unclassifiable → no calendar series
+            # iterations > 0 implies cadence_interval_usec saw a real interval,
+            # which it derives ONLY from a non-empty info.calendar — so info is
+            # non-None and has at least one expression here. The guard is a
+            # belt-and-suspenders narrowing (also satisfies mypy) rather than an
+            # `assert` (which -O would strip): if a future refactor ever broke
+            # that invariant, skip the timer instead of crashing the whole build.
+            if info is None or not info.calendar:
+                continue
+            # First calendar expression is the one systemd-analyze projects from.
+            # base_epoch is win_start so projecting from the PAST yields the exact
+            # scheduled slots compute_gaps needs (a missed slot is a scheduled
+            # instant with no run nearby), per spec §4.3.
+            expr = info.calendar[0]
+            proj_id = f"calproj:{scope}:{timer.unit}"
+            self._cal_pending.add(proj_id)
+            # Record the unit so the response branch recovers it WITHOUT parsing
+            # the id (":" is legal in unit names — class docstring convention).
+            self._cal_proj_unit_by_id[proj_id] = timer.unit
+            _ = self.client.fetch_cal_projection(
+                scope, timer.unit, expr, win_start, iterations
+            )
+
+        # A window with no eligible timers still has the journal query pending;
+        # if even that was somehow empty (no scope), finalize immediately so the
+        # page shows an empty (not stale) calendar.
+        if not self._cal_pending:
+            self._finalize_calendar()
+
+    def _finalize_calendar(self) -> None:
+        """Compute gaps and push the assembled events into the calendar view.
+
+        Called once the build's fan-in (_cal_pending) empties. Gaps are computed
+        HERE (not per-response) because a gap needs BOTH a timer's scheduled
+        slots (from its projection) AND its actual runs (from the one journal
+        query) — only when both have landed can a missed slot be identified. The
+        clamp [win_start, now] keeps 'no run' outside journal coverage rendering
+        as 'no data', never a false gap (spec §4.3).
+        """
+        win_start, win_end = self._cal_window
+        now = self._cal_now
+        events = list(self._cal_events)
+        # Runs are already in _cal_events (kind="ran"); split them out per timer
+        # to pair against that timer's projected slots for gap detection.
+        runs_by_unit: dict[str, list[CalendarEvent]] = {}
+        for ev in events:
+            if ev.kind == "ran":
+                runs_by_unit.setdefault(ev.unit, []).append(ev)
+        for unit, slots in self._cal_slots.items():
+            gaps = compute_gaps(
+                slots,
+                runs_by_unit.get(unit, []),
+                unit,
+                coverage_start=win_start,
+                now=now,
+                tolerance_usec=GAP_TOLERANCE_USEC,
+            )
+            events.extend(gaps)
+        self.calendar_view.set_events(
+            events, self._cal_units, win_start, win_end, now
+        )
+
+    def _on_cal_journal(self, request_id: str, stdout: str) -> None:
+        """Fan-in handler for the single journal run-outcome query.
+
+        Parses the JSON-lines into 'ran' events (bucketed back to their timers
+        by the service→timer map this build captured), accumulates them, and
+        finalizes if this was the last outstanding fetch. A response whose id is
+        not in _cal_pending is dropped — that set is reset per build, so a slow
+        read landing after the user navigated to a new window is ignored.
+        """
+        if request_id not in self._cal_pending:
+            return  # not part of the current build's fan-in (stale or unexpected)
+        self._cal_pending.discard(request_id)
+        self._cal_events.extend(
+            parse_run_journal(stdout, self._cal_service_to_timer)
+        )
+        if not self._cal_pending:
+            self._finalize_calendar()
+
+    def _on_cal_projection(self, request_id: str, stdout: str) -> None:
+        """Fan-in handler for one timer's future-slot projection.
+
+        The parsed instants serve TWO purposes: those after `now` are future
+        `projected` events drawn on the calendar; ALL of them (including past
+        ones, from the win_start base-time) are the scheduled slots gap
+        detection needs — so we keep the full list in _cal_slots for
+        _finalize_calendar and emit only the future ones as events now.
+        """
+        if request_id not in self._cal_pending:
+            return  # stale/unexpected — not in this build's fan-in
+        unit = self._cal_proj_unit_by_id.pop(request_id, None)
+        self._cal_pending.discard(request_id)
+        if unit is not None:
+            slots = parse_projection(stdout)
+            # Full slot list (past + future) drives gap detection in finalize.
+            self._cal_slots[unit] = slots
+            # Only slots strictly after `now` are genuine future projections;
+            # a slot at/before now is either a past run's scheduled time (its
+            # outcome is a 'ran' event from the journal) or a missed slot (a
+            # 'gap', computed in finalize) — drawing it as `projected` too would
+            # double up. The half-open (now, ∞) split mirrors spec §4.2.
+            self._cal_events.extend(
+                CalendarEvent(unit=unit, when=s, kind="projected")
+                for s in slots
+                if s > self._cal_now
+            )
+        if not self._cal_pending:
+            self._finalize_calendar()
+
+    def _on_calendar_selected(self, unit: str) -> None:
+        """Adapter: a calendar-row click loads the same detail tabs the table
+        selection uses, for `unit` (always a timer on the calendar).
+
+        Reuses the existing detail-fetch flow verbatim (log/details/cat plus the
+        timer's schedtab) so the calendar and table share one detail pane — the
+        whole point of the QStackedWidget design (a click anywhere shows the same
+        per-unit detail). _expected_tab_ids is reset to exactly these ids so a
+        response for a unit the user has since clicked away from is dropped, the
+        same freshness contract the table selection enforces.
+
+        Gated on _auto_refresh like _on_selection: with it off (tests) this
+        fires zero subprocesses. _last_detail_unit is set so a repeat click on
+        the same unit doesn't re-flash "loading…".
+        """
+        if not self._auto_refresh:
+            return
+        if unit == self._last_detail_unit:
+            return  # already loaded — don't re-flash loading… / refetch
+        self._last_detail_unit = unit
+        self._expected_tab_ids = {
+            f"log:{self.scope}:{unit}",
+            f"details:{self.scope}:{unit}",
+            f"cat:{self.scope}:{unit}",
+            f"schedtab:{self.scope}:{unit}",
+        }
+        for view in self._kind_to_tab.values():
+            view.setPlainText("loading…")
+        ok_log = self.client.fetch_log(self.scope, unit)
+        ok_details = self.client.fetch_details(self.scope, unit)
+        ok_cat = self.client.fetch_cat(self.scope, unit)
+        ok_sched = self.client.fetch_tab_schedule(self.scope, unit)
+        if not (ok_log and ok_details and ok_cat and ok_sched):
+            # Same RACE-B guard as _on_selection: a single-flight rejection means
+            # a stale in-flight fetch for this id could fill the tab as fresh;
+            # leaving the dedup unset makes the next interaction retry.
+            self._last_detail_unit = None
 
     def _render_rows(self) -> None:
         """Render cached data into the model; restore selection and scroll.
@@ -511,6 +825,18 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # stays loud; ⟳ and the next clean cycle self-heal.
             self._pending_enrich.discard(kind)
             self._maybe_render()
+            return
+        if kind in ("caljournal", "calproj") and request_id in self._cal_pending:
+            # Release the calendar fan-in barrier on a failed build fetch so the
+            # page renders with whatever DID land (partial layer) instead of
+            # hanging at a blank calendar forever — the same freeze-prevention as
+            # the table's enrichment path. The error stays loud on the status
+            # bar; the next nav/tick rebuilds. The proj-unit map entry frees too,
+            # so a late success echo for the same id can't match.
+            self._cal_proj_unit_by_id.pop(request_id, None)
+            self._cal_pending.discard(request_id)
+            if not self._cal_pending:
+                self._finalize_calendar()
             return
         if kind == "calendar" and request_id in self._expected_tab_ids:
             # The chained elapse preview failed AFTER schedtab already rendered

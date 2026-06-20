@@ -10,6 +10,10 @@ last ran, whether it worked, and its logs. Built with PySide6/Qt Widgets.
 
 - **At a glance:** status, cadence (daily / weekly / 2×/day / boot+12h …), next
   run, last run, and last result for every timer and service.
+- **Calendar view:** a third View showing timer schedules on a time axis —
+  journal-mined past runs (success/failure), projected future runs, and exact
+  missed-run gaps. Click a row to load that timer's detail tabs. (Day layout
+  today; Week / Month in progress.)
 - **User instance:** full view plus run-now / enable / disable / stop.
 - **System instance:** read-only view — by design, the app never asks for root.
 - **Per-unit detail:** journal log, `systemctl show` properties, effective
