@@ -152,6 +152,127 @@ def test_run_within_tolerance_is_not_a_gap():
     assert compute_gaps(slots, runs, "d.timer", base, base + DAY, GAP_TOLERANCE_USEC) == []
 
 
+# -- F6: now-boundary ownership ----------------------------------------------
+#
+# A slot landing EXACTLY at `now` must be owned by the future side (silent),
+# matching how _on_cal_projection splits projected events with the strict
+# `s > now` test. Before F6 the gap walk used `slot > now` (so slot == now was
+# JUDGED as a possible gap), while the projection split used `s > now` (so the
+# same instant was NOT drawn as projected) — the instant fell through both,
+# which is the off-by-one the QA disposition flagged. After F6 the gap walk
+# skips on `slot >= now`, so slot == now is future-owned on both sides.
+
+
+def test_slot_exactly_at_now_is_not_a_gap():
+    base = 1_781_000_000_000_000
+    # Three slots; the MIDDLE one ran (so it splits the region), and `now` lands
+    # EXACTLY on the THIRD slot. The boundary slot must be future-owned (silent),
+    # so the only gap is the first slot. The ran middle slot guarantees the third
+    # slot can't merge into the first's region — making this discriminating:
+    # before F6 (slot > now) the third slot was JUDGED and, having no run, became
+    # a SECOND standalone gap at base+2*DAY; after F6 (slot >= now) it is skipped.
+    slots = [base, base + DAY, base + 2*DAY]
+    runs = [run(base + DAY)]                       # middle ran → splits regions
+    gaps = compute_gaps(slots, runs, "d.timer", coverage_start=base,
+                        now=base + 2*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    assert [g.when for g in gaps] == [base]        # boundary slot is NOT a gap
+
+
+# -- F5: _collapse robustness (duplicate slots + split case) ------------------
+#
+# WATCH-1 (formerly "unreachable") is now LIVE: F4's multi-trigger union and DST
+# fall-back both produce DUPLICATE µs instants in one slot list, and second-
+# flooring (int(timestamp())) can coincide two near-identical instants. The old
+# _collapse keyed adjacency by slot VALUE, so a duplicate `when` degenerated the
+# region merge. F5 dedups with sorted(set(slots)) before walking, so duplicates
+# collapse to one instant and the index-based adjacency stays correct.
+
+
+def test_collapse_split_case_ran_slot_between_two_missed():
+    # The split case the QA disposition calls out: a RAN slot sitting between two
+    # MISSED slots must break the region — the misses are NOT adjacent in the
+    # schedule (a kept slot separates them), so they must surface as TWO separate
+    # gap events, not one collapsed region.
+    base = 1_781_000_000_000_000
+    slots = [base, base + DAY, base + 2*DAY]
+    runs = [run(base + DAY)]                       # middle slot ran; ends ran
+    gaps = compute_gaps(slots, runs, "d.timer", coverage_start=base,
+                        now=base + 3*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    # Two distinct single-miss regions, one each side of the ran slot.
+    assert [(g.when, g.count) for g in gaps] == [(base, 1), (base + 2*DAY, 1)]
+
+
+def test_collapse_tolerates_duplicate_slots():
+    # Duplicate µs instants in the slot list (F4 union / DST fall-back) must not
+    # break the merge. Before F5 the value-keyed idx map collapsed the duplicate
+    # to a single index, so a contiguous miss run could mis-count or raise. After
+    # F5 sorted(set(...)) folds the duplicate first → ONE region of count 2.
+    base = 1_781_000_000_000_000
+    slots = [base, base, base + DAY]              # base appears twice (a duplicate)
+    gaps = compute_gaps(slots, [], "d.timer", coverage_start=base,
+                        now=base + 2*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    # Deduped to {base, base+DAY}; both missed and schedule-adjacent → one region.
+    assert len(gaps) == 1
+    assert gaps[0].when == base and gaps[0].count == 2
+
+
+def test_dst_fall_back_duplicate_instants_do_not_break_collapse():
+    # A DST fall-back makes systemd-analyze emit the SAME wall-clock hour twice;
+    # projected to UTC the two instants are distinct, but a timer whose accuracy
+    # floors to the second can yield two slots at the same µs. parse_projection
+    # here returns a list with a literal duplicate (the realistic shape), and
+    # compute_gaps must dedup-then-collapse without raising. This is the model
+    # half of the F7 "DST projection-parse case".
+    base = 1_781_000_000_000_000
+    dst_dup = [base, base, base + DAY, base + DAY]  # two pairs of duplicates
+    gaps = compute_gaps(dst_dup, [], "d.timer", coverage_start=base,
+                        now=base + 2*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    assert len(gaps) == 1                          # {base, base+DAY} adjacent
+    assert gaps[0].count == 2
+
+
+def test_parse_projection_dst_fall_back_block_parses_all_lines():
+    # A real DST fall-back `systemd-analyze` block: 01:30 occurs twice (PDT then
+    # PST). Both "(in UTC):" lines are an hour apart in UTC and BOTH must parse —
+    # the parser reads UTC lines only, so it is immune to the repeated wall-clock
+    # hour. Pins that parse_projection handles the DST shape (F7 DST case).
+    dst_block = (
+        "  Original form: *-*-* 01:30:00\n"
+        "    Next elapse: Sun 2026-11-01 01:30:00 PDT\n"
+        "       (in UTC): Sun 2026-11-01 08:30:00 UTC\n"
+        "   Iteration #2: Sun 2026-11-01 01:30:00 PST\n"
+        "       (in UTC): Sun 2026-11-01 09:30:00 UTC\n"
+    )
+    out = parse_projection(dst_block)
+    # 08:30 and 09:30 UTC are exactly one hour apart — both kept, sorted.
+    assert len(out) == 2
+    assert out[1] - out[0] == 3_600_000_000
+
+
+# -- F2 (model half): parse_projection skips a malformed (in UTC) line --------
+#
+# The fan-in hang's root cause: parse_projection built datetime() straight from
+# the regex, which admits an out-of-range date (2026-13-45) → ValueError → the
+# whole fetch raises → the calendar barrier never releases. F2 wraps the
+# datetime() construction in try/except ValueError + continue, exactly like
+# parse_run_journal already does for a bad line, so one poison line is skipped
+# and the rest of the block still parses.
+
+
+def test_parse_projection_skips_malformed_utc_line():
+    # Month 13 / day 45 matches the _UTC_TS regex shape but is not a real date —
+    # datetime() would raise ValueError. The malformed line must be SKIPPED (not
+    # raise), and the surrounding valid lines must still parse.
+    text = (
+        "       (in UTC): Mon 2026-06-22 13:00:00 UTC\n"
+        "       (in UTC): Bad 2026-13-45 99:00:00 UTC\n"   # impossible date/time
+        "       (in UTC): Tue 2026-06-23 13:00:00 UTC\n"
+    )
+    out = parse_projection(text)
+    # The two valid instants survive; the malformed one is dropped silently.
+    assert out == [1782133200_000000, 1782219600_000000]
+
+
 # -- Task 4: cadence interval, projection-N cap, cell bucketing ---------------
 #
 # These three pure helpers size and aggregate the projection fan-out. The view
@@ -277,3 +398,37 @@ def test_summarize_empty_is_all_zero_no_issues():
     # all-zero, no-issues health — the strip then reads as "nothing wrong".
     h = summarize([])
     assert h == Health(ok=0, failed=0, gaps=0, upcoming=0, issues=[])
+
+
+# -- F7: model purity (mechanically enforced) --------------------------------
+#
+# calendar_model is the headless, testable core: the Phase-2 plasmoid reuses it,
+# so it must NOT import Qt widgets or spawn subprocesses. The module docstring
+# and CLAUDE.md both promise this, but nothing enforced it — a future edit could
+# reach for a QWidget or subprocess and the promise would rot silently. This
+# scans the module's SOURCE for forbidden imports so the purity contract fails
+# loudly at test time, not at plasmoid-reuse time.
+
+
+def test_calendar_model_imports_no_qt_or_subprocess():
+    import ast
+    import pathlib
+
+    import taskdeck.calendar_model as cm
+
+    source = pathlib.Path(cm.__file__).read_text()
+    tree = ast.parse(source)
+    # Collect every imported top-level module name (both `import X` and
+    # `from X import …`), walking the AST rather than regex so a commented-out or
+    # string-literal "import subprocess" never false-positives.
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    # Subprocess I/O lives ONLY in systemd_client; widgets ONLY in the view.
+    forbidden = {"subprocess", "PySide6", "PyQt5", "PyQt6"}
+    leaked = imported & forbidden
+    assert not leaked, f"calendar_model must stay pure; leaked imports: {leaked}"

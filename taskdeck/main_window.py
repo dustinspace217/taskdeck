@@ -6,6 +6,7 @@ spawn subprocesses); all action policy lives in actions.py.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 from PySide6.QtCore import QItemSelectionModel, QSortFilterProxyModel, Qt, QTimer
@@ -122,29 +123,55 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._last_detail_unit: str | None = None
 
         # -- Calendar-page build state (page 1 of the central stack) ----------
-        # The calendar fans MANY fetches in per build (one journal query + one
-        # projection per eligible timer) and renders only when they ALL land —
-        # a separate fan-in barrier from the table's _pending_enrich, because the
-        # two pages are independent and a calendar build must never stall (or be
-        # stalled by) a table refresh cycle. _cal_pending holds the calproj/
-        # caljournal ids still outstanding for the CURRENT build; it is reset
-        # wholesale at the start of each build, so a response whose id is not in
-        # the (new) set — a leftover from a navigated-away window — is dropped.
-        # _cal_events accumulates parsed events across those responses.
+        # The calendar fans MANY fetches in per build (a coverage probe, one
+        # journal query, and one projection per eligible timer×expression) and
+        # renders only when they ALL land — a separate fan-in barrier from the
+        # table's _pending_enrich, because the two pages are independent and a
+        # calendar build must never stall (or be stalled by) a table refresh
+        # cycle. _cal_pending holds the calcover/calproj/caljournal ids still
+        # outstanding for the CURRENT build.
         self._cal_pending: set[str] = set()
         self._cal_events: list[CalendarEvent] = []
         self._cal_units: list[str] = []
         self._cal_window: tuple[int, int] = (0, 0)
         self._cal_now: int = 0
+        # Per-build GENERATION counter (F3). The same timers exist across rapid
+        # rebuilds, so an unstamped request id (caljournal:user, calproj:user:X)
+        # would REPEAT build-to-build — and the client's single-flight registry
+        # keys by id, so Build A's in-flight response could satisfy Build B's
+        # barrier with Build A's (stale-window) slots. Bumping the generation and
+        # embedding it in every fan-in id (@gen / #i@gen) makes each build's ids
+        # UNIQUE; a superseded build's response then carries an id that is no
+        # longer in the new build's _cal_pending, so the existing not-in-pending
+        # guard drops it for free. (The earlier draft threaded an explicit
+        # generation arg via a per-id map — deleted: the map was overwritten by
+        # the repeating ids, so it never actually fixed the bug. Stamping the id
+        # is the real fix.)
+        self._cal_gen: int = 0
+        # The journal-coverage floor for THIS build (F1), set by _on_cal_coverage
+        # once the coverage probe lands and read by _finalize_calendar as
+        # compute_gaps' coverage_start. A gap before this floor is "no data", not
+        # a miss. Reset to 0 at build start; the coverage probe is what fills it,
+        # and the projections are gated behind it so the floor is always known
+        # before any slot is judged.
+        self._cal_coverage_start: int = 0
+        # The projection PLAN for THIS build: one (unit, expr_idx, expr,
+        # iterations) entry per eligible timer×OnCalendar-expression (F4 projects
+        # EVERY expression, not just calendar[0]). Computed at build start but
+        # NOT fired until the coverage probe lands (F1 gating) — held here in the
+        # meantime. Bounded by eligible-timers × expressions-per-timer.
+        self._cal_proj_plan: list[tuple[str, int, str, int]] = []
         # Per-timer slots accumulated from projection responses in THIS build,
         # held until the journal lands so gaps can be computed (a gap needs both
-        # the scheduled slots AND the actual runs). Keyed by timer unit name.
+        # the scheduled slots AND the actual runs). Keyed by timer unit name;
+        # F4 UNIONS each expression's slots into the unit's list.
         self._cal_slots: dict[str, list[int]] = {}
         # calproj request id → its timer unit name, recorded at fire time. The
         # unit is NOT recovered by splitting the id (":" is legal inside unit
-        # names — see the class docstring's request-id convention); it is looked
-        # up here exactly as _result_units_by_id recovers a results fetch's unit
-        # list. Bounded by the number of eligible timers in one build.
+        # names — see the class docstring's request-id convention, and the id now
+        # also carries a #exprIdx@gen tag); it is looked up here exactly as
+        # _result_units_by_id recovers a results fetch's unit list. Bounded by
+        # the number of eligible timer×expression projections in one build.
         self._cal_proj_unit_by_id: dict[str, str] = {}
         # service-name → timer-name map for THIS build, so the pure journal
         # parser can bucket run records back to their timer (runs/projections/
@@ -417,6 +444,20 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 self._pending_enrich.discard(kind)
                 self._maybe_render()
                 return
+            if kind in ("calcover", "caljournal", "calproj") and request_id in self._cal_pending:
+                # F2 belt-and-suspenders: a parse error inside a calendar fan-in
+                # handler (e.g. a future parser that raises on a malformed line)
+                # must NOT wedge the barrier. The model parse-skip fixes mean
+                # this rarely fires, but a poison response must never leave
+                # _cal_pending non-empty forever — release the id and
+                # finalize-partial so the page renders whatever DID land. Mirrors
+                # the _on_failed calendar branch; the error stays loud, the next
+                # nav/tick rebuilds.
+                self._cal_proj_unit_by_id.pop(request_id, None)
+                self._cal_pending.discard(request_id)
+                if not self._cal_pending:
+                    self._finalize_calendar()
+                return
             tab = self._kind_to_tab.get(kind)
             if tab is not None and request_id in self._expected_tab_ids:
                 # A tab frozen at "loading…" would hide the failure. The
@@ -485,6 +526,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 return  # stale response for a unit/scope no longer selected
             self._fill_tab(kind, stdout)
             return
+        elif kind == "calcover":
+            self._on_cal_coverage(request_id, stdout)
+            return
         elif kind == "caljournal":
             self._on_cal_journal(request_id, stdout)
             return
@@ -532,12 +576,26 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
     def _build_calendar(self, win_start: int, win_end: int) -> None:
         """Fan out the fetches for a calendar window [win_start, win_end] (µs).
 
-        Fires ONE journal query for all timer-run outcomes in the window, plus
-        ONE projection per ELIGIBLE calendar timer (spec §9 eligibility below).
-        The responses fan IN via _dispatch_finished's calproj/caljournal
-        branches and _finalize_calendar renders when they all land — a separate
-        counter from the table's render barrier so the two pages never block
-        each other.
+        Two-stage fan-out (F1 gating):
+        1. Fire the coverage probe + the run-outcome journal query NOW, and
+           compute (but do NOT yet fire) the projection PLAN — one entry per
+           eligible timer×OnCalendar-expression (F4 projects every expression).
+        2. When the coverage probe lands (_on_cal_coverage), the journal-coverage
+           floor is known, so the planned projections fire then. Gating the
+           projections on coverage means every projected slot is judged against a
+           floor that's already settled, never a window edge that would bloom
+           false gaps on a short-retention journal (the F1 P0).
+
+        All responses fan IN via _dispatch_finished's calcover/calproj/caljournal
+        branches; _finalize_calendar renders when _cal_pending empties — a
+        separate barrier from the table's render barrier so the two pages never
+        block each other.
+
+        Each fan-in id is STAMPED with this build's generation (F3): the same
+        timers exist across rapid rebuilds, so an unstamped id would repeat and
+        the client's single-flight registry would let a superseded build's
+        response satisfy this build's barrier. The generation makes every id
+        unique, so a stale response is dropped by the not-in-_cal_pending guard.
 
         Timer eligibility (spec §9):
         - DISABLED timer (next is None): contributes past runs + gaps but NO
@@ -557,13 +615,20 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         """
         scope = self.scope
         now_usec = int(datetime.now(UTC).timestamp() * 1_000_000)
-        # Reset the per-build accumulators FIRST. Replacing _cal_pending wholesale
-        # is what drops a late response from a superseded window — its id is no
-        # longer in the set, so the dispatch branch ignores it.
+        # Bump the generation FIRST so every id stamped below belongs to THIS
+        # build (F3). A response stamped with a prior generation is no longer in
+        # _cal_pending after the next bump, so the dispatch guard drops it.
+        self._cal_gen += 1
+        gen = self._cal_gen
+        # Reset the per-build accumulators. Replacing _cal_pending wholesale (plus
+        # the unique generation stamp) is what drops a late response from a
+        # superseded window — its id is no longer in the set.
         self._cal_pending = set()
         self._cal_events = []
         self._cal_slots = {}
         self._cal_proj_unit_by_id = {}
+        self._cal_proj_plan = []
+        self._cal_coverage_start = 0  # filled when the coverage probe lands
         self._cal_window = (win_start, win_end)
         self._cal_now = now_usec
         # Row order + the service→timer map are derived from the live timers.
@@ -574,17 +639,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             t.activates: t.unit for t in self._timers if t.activates
         }
 
-        # ONE journal query for the whole window, clamped to the past. Recorded
-        # in the fan-in set BEFORE firing so a synchronous test-client response
-        # finds its id already expected.
-        journal_until = min(now_usec, win_end)
-        cal_journal_id = f"caljournal:{scope}"
-        self._cal_pending.add(cal_journal_id)
-        # Return ignored: a single-flight rejection means an identical query is
-        # already in flight for this scope; its response will still satisfy the
-        # fan-in (same id), so re-firing is unnecessary (Power of Ten r7).
-        _ = self.client.fetch_cal_journal(scope, win_start, journal_until)
-
+        # Compute the projection plan (F4: every OnCalendar expr of every
+        # eligible timer). NOT fired here — _on_cal_coverage fires it once the
+        # coverage floor is known (F1 gating).
         span = max(1, win_end - win_start)
         for timer in self._timers:
             if timer.next_usec is None:
@@ -604,25 +661,111 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # that invariant, skip the timer instead of crashing the whole build.
             if info is None or not info.calendar:
                 continue
-            # First calendar expression is the one systemd-analyze projects from.
+            # F4: plan a projection for EACH OnCalendar expression, not just
+            # calendar[0]. A multi-trigger timer's secondary-trigger miss is only
+            # a slot (and thus only a gap) if that expression is projected; the
+            # old calendar[0]-only path made secondary misses invisible. Each
+            # expression gets the SAME iteration count (sized from the smallest
+            # cadence, which never under-counts) and projects from win_start so
+            # the past slots compute_gaps needs are produced.
+            for expr_idx, expr in enumerate(info.calendar):
+                self._cal_proj_plan.append((timer.unit, expr_idx, expr, iterations))
+
+        # Fire the coverage probe + the journal query NOW (both stamped with the
+        # generation). Recorded in the fan-in set BEFORE firing so a synchronous
+        # test-client response finds its id already expected.
+        tag = f"@{gen}"
+        cal_cover_id = f"calcover:{scope}{tag}"
+        self._cal_pending.add(cal_cover_id)
+        # Return ignored throughout: a single-flight rejection means an identical
+        # (same-id) query is already in flight; its response still satisfies the
+        # fan-in, so re-firing is unnecessary (Power of Ten r7).
+        _ = self.client.fetch_cal_coverage(scope, win_start, tag)
+
+        journal_until = min(now_usec, win_end)
+        cal_journal_id = f"caljournal:{scope}{tag}"
+        self._cal_pending.add(cal_journal_id)
+        _ = self.client.fetch_cal_journal(scope, win_start, journal_until, tag)
+
+        # The projection plan stays UNFIRED until coverage lands. _cal_pending is
+        # non-empty here (the two queries above), so no early finalize is needed.
+
+    def _on_cal_coverage(self, request_id: str, stdout: str) -> None:
+        """Fan-in handler for the journal-coverage probe (F1).
+
+        Parses the FIRST JSON line's __REALTIME_TIMESTAMP — the oldest journal
+        entry in the window — to set the coverage floor, THEN fires the planned
+        projections (which were held until this floor was known). A response not
+        in _cal_pending is a stale-build leftover and dropped.
+
+        Coverage floor rule:
+        - A usable oldest timestamp → coverage_start = max(win_start, oldest):
+          gaps before the journal's reach are "no data", never misses.
+        - NO usable record (empty/blank/unparseable) → coverage_start = now,
+          which suppresses ALL gaps. An empty result cannot distinguish "nothing
+          ran" from "everything rotated out", so we never invent a miss we can't
+          prove — the safe direction.
+        """
+        if request_id not in self._cal_pending:
+            return  # stale/unexpected — not in this build's fan-in
+        self._cal_pending.discard(request_id)
+        win_start, _win_end = self._cal_window
+        oldest = self._first_journal_timestamp(stdout)
+        if oldest is None:
+            # Can't prove any miss — suppress all gaps by clamping coverage to now.
+            self._cal_coverage_start = self._cal_now
+        else:
+            self._cal_coverage_start = max(win_start, oldest)
+        # Coverage floor is settled → fire the planned projections (F1 gating).
+        # Each id is stamped #exprIdx@gen so it is unique to this build (F3); the
+        # unit is recorded per id for the response branch to recover (":" is legal
+        # in unit names, so it is never split out of the id).
+        scope = self.scope
+        gen = self._cal_gen
+        for unit, expr_idx, expr, iterations in self._cal_proj_plan:
+            proj_tag = f"#{expr_idx}@{gen}"
+            proj_id = f"calproj:{scope}:{unit}{proj_tag}"
+            self._cal_pending.add(proj_id)
+            self._cal_proj_unit_by_id[proj_id] = unit
             # base_epoch is win_start so projecting from the PAST yields the exact
             # scheduled slots compute_gaps needs (a missed slot is a scheduled
-            # instant with no run nearby), per spec §4.3.
-            expr = info.calendar[0]
-            proj_id = f"calproj:{scope}:{timer.unit}"
-            self._cal_pending.add(proj_id)
-            # Record the unit so the response branch recovers it WITHOUT parsing
-            # the id (":" is legal in unit names — class docstring convention).
-            self._cal_proj_unit_by_id[proj_id] = timer.unit
+            # instant with no run nearby), per spec §4.3. compute_gaps' own
+            # coverage_start clamp (set above) does the pre-coverage suppression.
             _ = self.client.fetch_cal_projection(
-                scope, timer.unit, expr, win_start, iterations
+                scope, unit, expr, win_start, iterations, proj_tag
             )
-
-        # A window with no eligible timers still has the journal query pending;
-        # if even that was somehow empty (no scope), finalize immediately so the
-        # page shows an empty (not stale) calendar.
+        # If the coverage probe was the last outstanding fetch AND there are no
+        # projections to fire (e.g. a window with no eligible timers, the journal
+        # already landed), finalize now so the page shows an empty (not stale)
+        # calendar instead of hanging.
         if not self._cal_pending:
             self._finalize_calendar()
+
+    @staticmethod
+    def _first_journal_timestamp(stdout: str) -> int | None:
+        """Read __REALTIME_TIMESTAMP (µs epoch) off the FIRST usable JSON line.
+
+        The coverage probe streams chronologically, so the first line is the
+        oldest entry — exactly the coverage floor (see fetch_cal_coverage). We
+        stop at the first line that parses to a usable timestamp; blank lines and
+        a leading non-JSON banner are skipped, and an entirely empty/unparseable
+        stream returns None (the caller reads that as "no coverage"). Bounded by
+        a small banner count, not journal size — we return on the first hit.
+        """
+        for raw in stdout.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue  # banner / non-JSON line — keep scanning
+            ts = obj.get("__REALTIME_TIMESTAMP")
+            try:
+                return int(ts)
+            except (TypeError, ValueError):
+                continue  # field absent or non-numeric on this record
+        return None
 
     def _finalize_calendar(self) -> None:
         """Compute gaps and push the assembled events into the calendar view.
@@ -630,9 +773,15 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         Called once the build's fan-in (_cal_pending) empties. Gaps are computed
         HERE (not per-response) because a gap needs BOTH a timer's scheduled
         slots (from its projection) AND its actual runs (from the one journal
-        query) — only when both have landed can a missed slot be identified. The
-        clamp [win_start, now] keeps 'no run' outside journal coverage rendering
-        as 'no data', never a false gap (spec §4.3).
+        query) — only when both have landed can a missed slot be identified.
+
+        The clamp is [coverage_start, now], where coverage_start is the
+        journal-coverage floor the coverage probe established (_on_cal_coverage),
+        NOT win_start. This is the F1 fix: on a short-retention journal the
+        window can start before any journal data exists, and clamping to
+        win_start would bloom false amber gaps across the pre-coverage region.
+        Clamping to the actual journal floor keeps 'no run' before coverage
+        rendering as 'no data', never a miss (spec §4.3).
         """
         win_start, win_end = self._cal_window
         now = self._cal_now
@@ -648,7 +797,7 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 slots,
                 runs_by_unit.get(unit, []),
                 unit,
-                coverage_start=win_start,
+                coverage_start=self._cal_coverage_start,
                 now=now,
                 tolerance_usec=GAP_TOLERANCE_USEC,
             )
@@ -675,15 +824,33 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         if not self._cal_pending:
             self._finalize_calendar()
 
-    def _on_cal_projection(self, request_id: str, stdout: str) -> None:
-        """Fan-in handler for one timer's future-slot projection.
+    def _on_cal_projection(
+        self, request_id: str, stdout: str, generation: int | None = None
+    ) -> None:
+        """Fan-in handler for one timer×expression future-slot projection.
 
         The parsed instants serve TWO purposes: those after `now` are future
         `projected` events drawn on the calendar; ALL of them (including past
         ones, from the win_start base-time) are the scheduled slots gap
         detection needs — so we keep the full list in _cal_slots for
         _finalize_calendar and emit only the future ones as events now.
+
+        F4 (multi-trigger): a timer fires one projection per OnCalendar
+        expression, so this EXTENDS the unit's slot list rather than overwriting
+        it — a second trigger's missed slot must be able to become a gap, which
+        it can't if the first trigger's response clobbered it. The duplicate µs
+        instants this union can create are folded by compute_gaps' sorted(set())
+        dedup (F5).
+
+        F3 (generation): the primary staleness guard is `request_id not in
+        _cal_pending` — a superseded build's stamped id is no longer pending, so
+        a late echo is dropped. `generation` is an optional secondary guard: when
+        supplied and not matching the current build, drop regardless. It is
+        belt-and-suspenders against any future caller that delivers an id which
+        coincidentally re-enters the pending set; the stamped id is the real fix.
         """
+        if generation is not None and generation != self._cal_gen:
+            return  # explicitly stamped as a prior build's response — drop
         if request_id not in self._cal_pending:
             return  # stale/unexpected — not in this build's fan-in
         unit = self._cal_proj_unit_by_id.pop(request_id, None)
@@ -691,7 +858,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         if unit is not None:
             slots = parse_projection(stdout)
             # Full slot list (past + future) drives gap detection in finalize.
-            self._cal_slots[unit] = slots
+            # setdefault + extend UNIONS this expression's slots with any already
+            # accumulated for the unit from a sibling OnCalendar expression (F4).
+            self._cal_slots.setdefault(unit, []).extend(slots)
             # Only slots strictly after `now` are genuine future projections;
             # a slot at/before now is either a past run's scheduled time (its
             # outcome is a 'ran' event from the journal) or a missed slot (a
@@ -826,13 +995,18 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             self._pending_enrich.discard(kind)
             self._maybe_render()
             return
-        if kind in ("caljournal", "calproj") and request_id in self._cal_pending:
+        if kind in ("calcover", "caljournal", "calproj") and request_id in self._cal_pending:
             # Release the calendar fan-in barrier on a failed build fetch so the
             # page renders with whatever DID land (partial layer) instead of
             # hanging at a blank calendar forever — the same freeze-prevention as
-            # the table's enrichment path. The error stays loud on the status
-            # bar; the next nav/tick rebuilds. The proj-unit map entry frees too,
-            # so a late success echo for the same id can't match.
+            # the table's enrichment path. calcover is included (F2): a failed
+            # coverage probe must not wedge the build — _on_cal_coverage is what
+            # fires the projections, so without releasing here a coverage failure
+            # would leave the journal query alone in the barrier and the planned
+            # projections never fired; finalize-partial renders the past runs that
+            # DID land. The error stays loud on the status bar; the next nav/tick
+            # rebuilds. The proj-unit map entry frees too, so a late success echo
+            # for the same id can't match.
             self._cal_proj_unit_by_id.pop(request_id, None)
             self._cal_pending.discard(request_id)
             if not self._cal_pending:

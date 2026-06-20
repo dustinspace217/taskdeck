@@ -613,7 +613,13 @@ class SystemdClient(QObject):  # type: ignore[misc]
         )
 
     def fetch_cal_projection(
-        self, scope: str, unit: str, expr: str, base_epoch: int, iterations: int
+        self,
+        scope: str,
+        unit: str,
+        expr: str,
+        base_epoch: int,
+        iterations: int,
+        tag: str = "",
     ) -> bool:
         """Future-run projection for ONE calendar timer, from a chosen base time.
 
@@ -625,12 +631,19 @@ class SystemdClient(QObject):  # type: ignore[misc]
         NEVER "calendar:", because _dispatch_finished routes on the kind before
         the first ':' and "calendar" is already owned by fetch_calendar.
 
+        `tag` is appended verbatim to the request id so the host can make the id
+        UNIQUE PER BUILD (it passes `f"#{exprIdx}@{gen}"`): the same timers exist
+        across rapid rebuilds, so an unstamped id would repeat and a superseded
+        build's stale response could satisfy the new build's single-flight id.
+        The kind is still everything before the FIRST ':' regardless of the tag,
+        so dispatch routing is unaffected (class docstring's id convention).
+
         expr is a NORMALIZED OnCalendar form from `systemctl show`, so it is
         well-formed; "--" stops flag parsing regardless (mirrors fetch_calendar's
         belt-and-suspenders, harmless and survives an unnormalized future caller).
         """
         return self.request(
-            f"calproj:{scope}:{unit}",
+            f"calproj:{scope}:{unit}{tag}",
             [
                 self._analyze, "calendar",
                 f"--base-time=@{base_epoch}", f"--iterations={iterations}",
@@ -638,7 +651,9 @@ class SystemdClient(QObject):  # type: ignore[misc]
             ],
         )
 
-    def fetch_cal_journal(self, scope: str, since_epoch: int, until_epoch: int) -> bool:
+    def fetch_cal_journal(
+        self, scope: str, since_epoch: int, until_epoch: int, tag: str = ""
+    ) -> bool:
         """ONE journal query for all timer-run outcomes in [since, until].
 
         A single subprocess feeds run-outcome events for EVERY unit in the
@@ -648,16 +663,70 @@ class SystemdClient(QObject):  # type: ignore[misc]
         failed=failure); the since/until are @-prefixed epochs matching the
         calendar window the user is viewing.
 
+        `tag` is appended to the request id (host passes `f"@{gen}"`) so the id is
+        unique per build — same reasoning as fetch_cal_projection's tag: the id
+        repeats across rebuilds otherwise, and the single-flight registry would
+        let a stale build's response satisfy a newer build's barrier. The kind
+        ("caljournal") is still the text before the first ':'.
+
         15s timeout, like fetch_log: a reverse-seek across a multi-GB rotated
         journal routinely exceeds the 5s default, and killing it mid-build would
         blank the calendar's past-runs layer (QA AT-F10, same rationale).
         """
         return self.request(
-            f"caljournal:{scope}",
+            f"caljournal:{scope}{tag}",
             [
                 self._journalctl, *self._scope_args(scope),
                 "-o", "json", f"--since=@{since_epoch}", f"--until=@{until_epoch}",
                 "JOB_RESULT=done", "JOB_RESULT=failed", "--no-pager",
+            ],
+            timeout_ms=15_000,
+        )
+
+    def fetch_cal_coverage(self, scope: str, since_epoch: int, tag: str = "") -> bool:
+        """Probe the OLDEST journal entry at/after `since_epoch` — the calendar's
+        journal-coverage floor (F1).
+
+        Why this probe exists: the run-outcome query (fetch_cal_journal) filters
+        to JOB_RESULT records, so an empty result there cannot distinguish "no
+        runs happened" from "the journal doesn't reach back this far". Without
+        that distinction, a window starting before the journal's retention floor
+        would bloom false gaps across the pre-coverage region (F1, the P0). This
+        query is therefore UNFILTERED — it asks what the EARLIEST record of ANY
+        kind in the window is, which is exactly how far back coverage reaches.
+
+        How the oldest entry is obtained: journalctl prints in chronological
+        (oldest-first) order by default, and `--since=@since_epoch` makes the
+        stream START at the window's left edge. So the FIRST line of stdout is
+        the oldest entry at/after since_epoch — precisely the coverage floor. We
+        deliberately do NOT use `-n1`: that flag counts from the END and would
+        return the NEWEST line, the opposite of what we need. The handler reads
+        only the first line of the stream, so the volume after it is irrelevant.
+        `--output-fields=__REALTIME_TIMESTAMP` narrows each line to the field the
+        handler reads (journald still force-includes its own trusted `__`-prefixed
+        address fields — verified live 2026-06-20 — but the user-payload fields,
+        which are the bulky ones, are dropped).
+
+        Caller contract (host _on_cal_coverage): a hit → coverage_start =
+        max(win_start, that timestamp); a ZERO/empty/unparseable result → the
+        window predates the journal entirely, so coverage_start = now and ALL
+        gaps are suppressed (we cannot prove a miss against data that does not
+        exist — the safe direction).
+
+        `tag` is appended to the id (host passes `f"@{gen}"`) for per-build
+        uniqueness, identical to the other two calendar fetches. The kind
+        ("calcover") is the text before the first ':'.
+
+        15s timeout like fetch_cal_journal: an unfiltered reverse-seek across a
+        rotated multi-GB journal can exceed the 5s default; killing it mid-build
+        would blank the coverage floor (same rationale as AT-F10).
+        """
+        return self.request(
+            f"calcover:{scope}{tag}",
+            [
+                self._journalctl, *self._scope_args(scope),
+                "-o", "json", f"--since=@{since_epoch}",
+                "--output-fields=__REALTIME_TIMESTAMP", "--no-pager",
             ],
             timeout_ms=15_000,
         )

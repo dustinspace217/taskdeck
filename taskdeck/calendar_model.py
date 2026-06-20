@@ -55,7 +55,18 @@ def parse_projection(text: str) -> list[int]:
         if ts is None:
             continue  # unexpected shape — skip this line, never guess a time
         y, mo, d, h, mi, s = (int(g) for g in ts.groups())
-        dt = datetime(y, mo, d, h, mi, s, tzinfo=UTC)
+        # The regex admits digit groups that are NOT a valid date/time — e.g. a
+        # corrupt `systemd-analyze` line with month 13 or hour 99 — so datetime()
+        # can raise ValueError. Skip that one line and keep going, exactly as
+        # parse_run_journal does for a bad JSON line: one poison line must never
+        # sink the whole projection. Letting it raise here was the root of the
+        # fan-in hang (the calendar barrier never released — QA F2): one malformed
+        # date wedged the entire build. We only swallow ValueError (the
+        # out-of-range-field signal); anything else still propagates.
+        try:
+            dt = datetime(y, mo, d, h, mi, s, tzinfo=UTC)
+        except ValueError:
+            continue  # impossible date/time on this line — skip, never guess
         out.append(int(dt.timestamp()) * 1_000_000)
     return sorted(out)
 
@@ -141,17 +152,35 @@ def compute_gaps(
     # Pre-sort the run times once so _has_run_near scans a known order; runs
     # arrive unsorted (one per journal record, in log order).
     run_times = sorted(r.when for r in runs)
+    # Dedup the slot list BEFORE walking (F5). Duplicate µs instants are now
+    # reachable: F4's multi-trigger union concatenates several expressions' slots
+    # into one list, and a DST fall-back makes systemd-analyze emit the same
+    # wall-clock instant twice (second-flooring can coincide two near-identical
+    # instants too). _collapse keys schedule-adjacency by a slot→index map, so a
+    # duplicate `when` would overwrite an index and degenerate the region merge.
+    # sorted(set(...)) folds duplicates to one instant first, which keeps the
+    # index map total and the merge correct. (Was WATCH-1, "unreachable"; F4 made
+    # it live, so the dedup is now load-bearing, not defensive.)
+    unique_slots = sorted(set(slots))
     missed: list[int] = []
-    for slot in sorted(slots):
-        if slot < coverage_start or slot > now:
-            continue  # unjudgeable (before coverage = no data) or still future
+    for slot in unique_slots:
+        # `slot >= now` (not `> now`) so a slot landing EXACTLY at now is
+        # future-owned and silent — matching the strict `s > now` split in
+        # _on_cal_projection that draws projected events. Owning the boundary on
+        # exactly one side prevents the now-instant slot from being BOTH judged
+        # here (a possible gap) AND skipped as a projection (drawn nowhere) — the
+        # off-by-one F6 fixes.
+        if slot < coverage_start or slot >= now:
+            continue  # unjudgeable (before coverage = no data) or at/after now
         if not _has_run_near(run_times, slot, tolerance_usec):
             missed.append(slot)
     # Collapse runs of missed slots that were ADJACENT in the schedule into one
-    # gap region. Adjacency is decided by position in the sorted slot list (see
-    # _collapse), not by arithmetic on the timestamps — that stays correct for
-    # irregular cadences (e.g. weekday-only) where a fixed interval wouldn't.
-    return _collapse(missed, sorted(slots), unit)
+    # gap region. Adjacency is decided by position in the deduped sorted slot
+    # list (see _collapse), not by arithmetic on the timestamps — that stays
+    # correct for irregular cadences (e.g. weekday-only) where a fixed interval
+    # wouldn't. _collapse is handed the SAME deduped list so its index map agrees
+    # with the missed instants picked above.
+    return _collapse(missed, unique_slots, unit)
 
 
 def _has_run_near(run_times: list[int], slot: int, tol: int) -> bool:
@@ -172,10 +201,16 @@ def _collapse(missed: list[int], all_slots: list[int], unit: str) -> list[Calend
     previous one when their indices in `all_slots` differ by exactly 1 — i.e.
     no kept (ran) slot sits between them. Using slot-position rather than a time
     delta keeps the merge correct for non-uniform cadences.
+
+    `all_slots` MUST be deduplicated before it reaches here (compute_gaps does it
+    with sorted(set(...))) — the idx map below keys by slot value, so a duplicate
+    `when` would overwrite an index and corrupt the adjacency walk. The dedup at
+    the call site is the single guard, so this stays a simple positional walk.
     """
     if not missed:
         return []
-    # Position of each slot in the schedule, so adjacency is an index check.
+    # Position of each slot in the (deduplicated) schedule, so adjacency is an
+    # index check. Safe to key by value because the caller guarantees no dupes.
     idx = {s: i for i, s in enumerate(all_slots)}
     out: list[CalendarEvent] = []
     start = prev = missed[0]
