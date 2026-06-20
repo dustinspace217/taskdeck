@@ -7,6 +7,7 @@ ALL thresholds and time math live here, never in calendar_view.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -53,3 +54,54 @@ def parse_projection(text: str) -> list[int]:
         dt = datetime(y, mo, d, h, mi, s, tzinfo=UTC)
         out.append(int(dt.timestamp()) * 1_000_000)
     return sorted(out)
+
+
+def parse_run_journal(text: str, service_to_timer: dict[str, str]) -> list[CalendarEvent]:
+    """Parse `journalctl … JOB_RESULT=done JOB_RESULT=failed` JSON-lines into
+    'ran' events, keyed back to the TIMER unit (so they align with projections
+    and gaps, which are keyed by timer — not the activated service).
+
+    `service_to_timer` maps an activated-service name → its timer unit name; the
+    caller builds it from the live TimerRows. Records for services not in that
+    map are dropped — one subprocess feeds this for ALL units (spec §2.3), so we
+    bucket here, in pure code, rather than running one query per timer.
+
+    Robustness contract (each guard maps to a real journal shape, not theory):
+    - A single unparseable line never sinks the batch — journald can interleave
+      a non-JSON banner line; we skip it and keep going.
+    - The unit field has three spellings across journal versions/scopes
+      (USER_UNIT, _SYSTEMD_USER_UNIT, UNIT) — we try them in that order.
+    - MESSAGE may be a byte ARRAY (a JSON list) for non-UTF-8 log lines, not a
+      string. We never touch MESSAGE here, so that shape is harmless — the test
+      pins that it doesn't crash, guarding any future code that reaches for it.
+    - __REALTIME_TIMESTAMP is a µs-epoch STRING in journal JSON; a missing or
+      non-numeric value means we can't place the run, so we drop it.
+    """
+    out: list[CalendarEvent] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue  # a single bad line never sinks the batch
+        svc = o.get("USER_UNIT") or o.get("_SYSTEMD_USER_UNIT") or o.get("UNIT")
+        # .get("") keeps the lookup total even when svc is None (no unit field).
+        timer = service_to_timer.get(svc or "")
+        if timer is None:
+            continue  # not a timer-activated service we're tracking
+        jr = o.get("JOB_RESULT")
+        # JOB_RESULT, not _SYSTEMD_INVOCATION_ID: the completion record carries
+        # the outcome here ('done'/'failed'); the invocation id is absent from
+        # these records (spec / Global Constraints).
+        result = "success" if jr == "done" else "failure" if jr == "failed" else ""
+        if not result:
+            continue  # not an outcome record (e.g. 'skipped', or no JOB_RESULT)
+        ts = o.get("__REALTIME_TIMESTAMP")
+        try:
+            when = int(ts)
+        except (TypeError, ValueError):
+            continue  # no usable timestamp → can't place it on the calendar
+        out.append(CalendarEvent(unit=timer, when=when, kind="ran", result=result))
+    return out
