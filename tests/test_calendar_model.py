@@ -14,12 +14,14 @@ from taskdeck.calendar_model import (
     CELL_DRAW_MAX_PER_WINDOW,
     GAP_TOLERANCE_USEC,
     CalendarEvent,
+    Health,
     bucket_cell,
     cadence_interval_usec,
     compute_gaps,
     parse_projection,
     parse_run_journal,
     projection_iterations,
+    summarize,
 )
 from taskdeck.systemd_client import ScheduleInfo
 
@@ -211,3 +213,67 @@ def test_bucket_cell_counts_and_flags_failure():
         CalendarEvent("t", 2, "projected", "failure"),
     ]
     assert bucket_cell(non_runs) == (2, 0)
+
+
+# -- HEALTH summary (Task 11) ------------------------------------------------
+#
+# summarize() rolls a flat event list into the top-strip readout the view draws
+# and the Phase-2 plasmoid reuses. It lives in the MODEL (not the view) so both
+# consumers count outcomes the same way — counts per kind plus a human issues
+# list (one "unit @ date" string per failure and per gap region). Pure, so it
+# is pinned DIRECTLY here, no Qt needed.
+
+# A real µs epoch with a known UTC date, so the issue-string date is assertable.
+# 1781787600 s == 2026-06-18 13:00:00 UTC (verified with datetime — note the
+# Task-1 fixture COMMENT calls this 2026-06-22, which is a 4-day-off typo: the
+# numeric value parses to the 18th, and the parse test only asserts the integer,
+# so the typo was latent. We anchor to the real date here.)
+JUN18_USEC = 1781787600_000000
+
+
+def test_summarize_counts_each_kind():
+    # ok = successful runs, failed = failed runs, upcoming = projected/approx,
+    # gaps = MISSED SLOTS (sum of each gap event's count, so a collapsed region
+    # of 3 misses counts as 3 — a gap event with count>1 stands for that many
+    # missed runs, and the health number must reflect reality, not the region
+    # count). Mixed list exercises every branch.
+    events = [
+        CalendarEvent("a.timer", JUN18_USEC, "ran", "success"),
+        CalendarEvent("a.timer", JUN18_USEC + 1, "ran", "success"),
+        CalendarEvent("a.timer", JUN18_USEC + 2, "ran", "failure"),
+        CalendarEvent("b.timer", JUN18_USEC + 3, "gap", count=3),  # 3 missed slots
+        CalendarEvent("c.timer", JUN18_USEC + 4, "projected"),
+        CalendarEvent("c.timer", JUN18_USEC + 5, "approx"),
+    ]
+    h = summarize(events)
+    assert isinstance(h, Health)
+    assert h.ok == 2
+    assert h.failed == 1
+    assert h.gaps == 3          # 1 gap region of count=3 → 3 missed slots
+    assert h.upcoming == 2      # projected + approx both count as upcoming
+
+
+def test_summarize_lists_issues_with_unit_and_date():
+    # Each failure and each gap REGION yields one human issue string carrying the
+    # unit and the UTC date of the event, so the strip can list "what went wrong
+    # and when" without the view re-deriving it. Successes/upcoming are not issues.
+    events = [
+        CalendarEvent("ok.timer", JUN18_USEC, "ran", "success"),
+        CalendarEvent("fail.timer", JUN18_USEC, "ran", "failure"),
+        CalendarEvent("gap.timer", JUN18_USEC, "gap", count=2),
+        CalendarEvent("soon.timer", JUN18_USEC, "projected"),
+    ]
+    h = summarize(events)
+    assert len(h.issues) == 2  # one per failure + one per gap region; not ok/proj
+    joined = " ".join(h.issues)
+    assert "fail.timer" in joined and "gap.timer" in joined
+    assert "ok.timer" not in joined and "soon.timer" not in joined
+    # The UTC date of the events is embedded so the issue is time-anchored.
+    assert "2026-06-18" in joined
+
+
+def test_summarize_empty_is_all_zero_no_issues():
+    # An empty window (no events fetched yet, or a fully clean scope) is the
+    # all-zero, no-issues health — the strip then reads as "nothing wrong".
+    h = summarize([])
+    assert h == Health(ok=0, failed=0, gaps=0, upcoming=0, issues=[])

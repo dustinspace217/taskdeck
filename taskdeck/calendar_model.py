@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from taskdeck.models import _classify_calendar
@@ -319,3 +319,81 @@ def bucket_cell(events: list[CalendarEvent]) -> tuple[int, int]:
     count = len(events)
     failures = sum(1 for e in events if e.kind == "ran" and e.result == "failure")
     return (count, failures)
+
+
+# -- HEALTH summary ----------------------------------------------------------
+#
+# summarize() rolls the whole visible window into one health readout: how many
+# runs succeeded / failed, how many scheduled slots were missed, how many runs
+# are still upcoming, plus a human list of the things that went wrong. The view
+# draws this as the top strip and the Phase-2 plasmoid reuses it, so — like
+# every other count and threshold — it lives in the MODEL, never the view. A
+# single source of truth means the strip and the plasmoid can never disagree
+# about what "1 failed" means.
+
+
+@dataclass(frozen=True)
+class Health:
+    """The summary the top strip shows for the visible window.
+
+    `ok`/`failed` are successful/failed run counts; `upcoming` is projected +
+    approx (runs that haven't happened yet); `gaps` is the number of MISSED
+    SLOTS — the sum of each gap event's `count`, so a collapsed region of 3
+    misses contributes 3, because the user cares how many runs were skipped, not
+    how many contiguous regions they formed. `issues` is one human "unit @ date"
+    string per failure and per gap region, the strip's at-a-glance "what's wrong".
+
+    Frozen (immutable) like CalendarEvent: a Health is a computed snapshot, never
+    mutated after summarize() returns it; the view caches and re-reads it. The
+    `issues` list uses field(default_factory=list) — a bare `[]` default would be
+    SHARED across all instances (Python's classic mutable-default trap), so the
+    factory gives each Health its own list.
+    """
+    ok: int = 0
+    failed: int = 0
+    gaps: int = 0
+    upcoming: int = 0
+    issues: list[str] = field(default_factory=list)
+
+
+def summarize(events: list[CalendarEvent]) -> Health:
+    """Roll a flat event list into a Health summary (counts + issue strings).
+
+    `events` is the same flat list the view paints (from parse_run_journal,
+    compute_gaps, and projections combined). One pass classifies each event by
+    kind — Power of Ten rule 2: bounded by the event count, itself bounded by the
+    projection cap. Failures and gaps also append a "unit @ YYYY-MM-DD" issue so
+    the strip can list what went wrong without re-deriving it. Gaps add their
+    `count` to the missed-slot total (a count>1 region stands for that many
+    skipped runs) but contribute ONE issue line for the region — the user reads
+    "this timer had an outage starting <date>", not three identical lines.
+    """
+    ok = failed = gaps = upcoming = 0
+    issues: list[str] = []
+    for ev in events:
+        if ev.kind == "ran":
+            if ev.result == "failure":
+                failed += 1
+                issues.append(_issue_line(ev))
+            else:
+                ok += 1
+        elif ev.kind == "gap":
+            gaps += ev.count  # a collapsed region of N misses counts as N
+            issues.append(_issue_line(ev))
+        elif ev.kind in ("projected", "approx"):
+            upcoming += 1
+        # Any unrecognized kind is silently ignored — it is neither a known
+        # outcome nor an upcoming run, so it can't honestly land in any bucket.
+    return Health(ok=ok, failed=failed, gaps=gaps, upcoming=upcoming, issues=issues)
+
+
+def _issue_line(event: CalendarEvent) -> str:
+    """Format one failure/gap as a human "unit @ YYYY-MM-DD" string.
+
+    The date is the event's UTC calendar date (matching the µs-epoch convention
+    everywhere else in this module), so an issue is anchored in time. Kept tiny
+    and separate so summarize() reads as pure bucketing and the date format has
+    one place to change in the visual pass.
+    """
+    day = datetime.fromtimestamp(event.when / 1_000_000, UTC).date()
+    return f"{event.unit} @ {day.isoformat()}"

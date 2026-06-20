@@ -35,7 +35,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from taskdeck.calendar_model import CELL_DRAW_MAX, CalendarEvent, bucket_cell
+from taskdeck.calendar_model import (
+    CELL_DRAW_MAX,
+    CalendarEvent,
+    Health,
+    bucket_cell,
+    summarize,
+)
 
 # The span (µs) the nav arrows shift by, per mode. Day/Week are exact; Month is
 # a NOMINAL 30 days — the exact month boundary is the host's job when it sizes
@@ -167,6 +173,17 @@ class CalendarView(QWidget):  # type: ignore[misc]
         self._now = 0
         self._events: list[CalendarEvent] = []
         self._units: list[str] = []
+        # Cached Health for the visible window (model's summarize over _events),
+        # recomputed each set_events. The strip reads it; tests read it as the
+        # outward state. Defaults to the all-zero Health so the strip is valid
+        # before the first set_events.
+        self._health = Health()
+        # Active Month-grid filter, one of None / "fail" / "gap" / "upcoming".
+        # None = show everything; a kind dims the non-matching cells so the user
+        # can isolate (e.g.) just the failures. Owned here (Month-grid-only state)
+        # and cleared when leaving the Month grid so it never silently dims a
+        # later return. See set_filter / set_mode.
+        self._filter: str | None = None
         # Week-row indices (0-based, top of the visible month down) that contain
         # at least one gap or failed run. Recomputed each Month paint and read by
         # tests as the testable seam for the heavy-border draw — it lets a test
@@ -246,6 +263,71 @@ class CalendarView(QWidget):  # type: ignore[misc]
         row.addStretch(1)
         outer.addLayout(row)
 
+        # Two strips sit between the nav row and the canvas: the always-on HEALTH
+        # summary, then the Month-grid-only filter toggles. They're built as
+        # container QWidgets (not bare sub-layouts) so the filter strip can be
+        # hidden with setVisible(False) and the QVBoxLayout collapses its height
+        # to zero — which keeps _canvas_top (and thus every hit-test) honest:
+        # the canvas always starts directly below whatever chrome is showing.
+        self._build_health_strip(outer)
+        self._build_filter_strip(outer)
+
+    def _build_health_strip(self, outer: QVBoxLayout) -> None:
+        """Build the always-visible HEALTH summary strip above the canvas.
+
+        A single QLabel inside a container widget. set_events fills its text from
+        the model's summarize() — the view never counts outcomes itself, so the
+        strip and the Phase-2 plasmoid read the same numbers. A container (not a
+        bare label added to the layout) keeps the strip's geometry a single
+        layout item _canvas_top can measure, matching the filter strip's shape.
+        """
+        self._health_strip = QWidget()
+        strip_layout = QHBoxLayout(self._health_strip)
+        strip_layout.setContentsMargins(8, 2, 8, 2)
+        self._health_label = QLabel("")
+        strip_layout.addWidget(self._health_label)
+        strip_layout.addStretch(1)
+        outer.addWidget(self._health_strip)
+
+    def _build_filter_strip(self, outer: QVBoxLayout) -> None:
+        """Build the Month-grid filter toggles (All / Failures / Gaps / Upcoming).
+
+        Checkable, auto-exclusive buttons (one radio group without a QButtonGroup,
+        mirroring the mode toggle). Each calls set_filter with its kind — "All"
+        passes None (show everything). The whole strip is a container widget so it
+        can be hidden outside the Month grid (see _sync_filter_strip): the filter
+        DIMS Month-grid cells, which is meaningless in Day/Week/matrix, so showing
+        it there would be a dead control. Hidden by default (Day is the start mode).
+        """
+        self._filter_strip = QWidget()
+        strip_layout = QHBoxLayout(self._filter_strip)
+        strip_layout.setContentsMargins(8, 2, 8, 2)
+        strip_layout.addWidget(QLabel("Show:"))
+
+        # (button label, filter kind). None = "All" (no dimming). The kinds match
+        # set_filter's accepted values exactly so a button can never request an
+        # unknown filter.
+        self._filter_buttons: dict[str | None, QPushButton] = {}
+        for label, kind in (
+            ("All", None),
+            ("Failures", "fail"),
+            ("Gaps", "gap"),
+            ("Upcoming", "upcoming"),
+        ):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)  # one-of-N without a QButtonGroup
+            # Default-arg binds `kind` per-iteration (avoid the late-bind closure
+            # capturing the LAST kind for every button).
+            btn.clicked.connect(lambda _checked=False, k=kind: self.set_filter(k))
+            self._filter_buttons[kind] = btn
+            strip_layout.addWidget(btn)
+        self._filter_buttons[None].setChecked(True)  # default: All (no filter)
+
+        strip_layout.addStretch(1)
+        self._filter_strip.setVisible(False)  # Day is the default mode → hidden
+        outer.addWidget(self._filter_strip)
+
     # -- read-only props ------------------------------------------------------
     #
     # Exposed as properties (not bare attrs) so the host reads them without being
@@ -283,7 +365,15 @@ class CalendarView(QWidget):  # type: ignore[misc]
         btn = self._mode_buttons.get("month" if mode == "matrix" else mode)
         if btn is not None and not btn.isChecked():
             btn.setChecked(True)
+        # The filter is a Month-GRID-only state (it dims grid cells). Leaving the
+        # grid — to Day/Week/matrix — clears it so a later return to Month never
+        # inherits a stale dim, and the strip's "All" button resets visually.
+        # Reset BEFORE _sync_filter_strip so the strip reflects the cleared state.
+        if mode != "month" and self._filter is not None:
+            self._filter = None
+            self._filter_buttons[None].setChecked(True)
         self._sync_matrix_toggle()
+        self._sync_filter_strip()
         self.update()
 
     def _sync_matrix_toggle(self) -> None:
@@ -304,6 +394,18 @@ class CalendarView(QWidget):  # type: ignore[misc]
             self._matrix_toggle.setChecked(want_checked)
             self._matrix_toggle.blockSignals(False)
 
+    def _sync_filter_strip(self) -> None:
+        """Show the filter strip only in the Month GRID, hide it everywhere else.
+
+        Visible for mode == "month" alone — NOT matrix (the matrix has no per-cell
+        dim; its diagnostic is per-timer rows) and not Day/Week. Hiding the
+        container collapses its layout height to zero, which is exactly why
+        _canvas_top stays correct: the canvas reclaims the space the moment the
+        strip hides. No checked-state sync here — set_mode already resets the "All"
+        button when it clears the filter on leaving the grid.
+        """
+        self._filter_strip.setVisible(self._mode == "month")
+
     def _on_matrix_toggled(self, checked: bool) -> None:
         """Switch between the Month grid and the by-timer matrix on toggle.
 
@@ -314,6 +416,33 @@ class CalendarView(QWidget):  # type: ignore[misc]
         button is already in the wanted state.
         """
         self.set_mode("matrix" if checked else "month")
+
+    # Accepted filter kinds. None ("All") shows everything; each other value dims
+    # Month-grid cells whose worst event isn't that kind. Defined as a module-ish
+    # set so set_filter validates against ONE list and a button can't request an
+    # unknown kind. "fail"/"gap"/"upcoming" map to event kinds in _cell_matches_filter.
+    _FILTER_KINDS = (None, "fail", "gap", "upcoming")
+
+    def set_filter(self, kind: str | None) -> None:
+        """Set the Month-grid filter (None/"fail"/"gap"/"upcoming") and repaint.
+
+        `kind` selects which cells stay bright in the Month grid: "fail" keeps
+        days with a failed run, "gap" days with a missed slot, "upcoming" days
+        with a projected/approx run; None (All) dims nothing. An unrecognized kind
+        is IGNORED (keep the current filter, no raise) — same tolerance as
+        set_mode's unknown-mode guard, so a typo'd caller can't wedge the paint.
+        Only the repaint changes; the filter dims inside _paint_month, it never
+        drops events or refetches.
+        """
+        if kind not in self._FILTER_KINDS:
+            return  # unrecognized — keep the current filter, never raise
+        self._filter = kind
+        # Keep the strip button in sync for a programmatic set_filter (a click
+        # already checked its own button). .get() is safe: kind is a valid key.
+        btn = self._filter_buttons.get(kind)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+        self.update()
 
     def set_events(
         self,
@@ -337,6 +466,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
         self._window_start = window_start
         self._window_end = window_end
         self._now = now
+        # Roll the window's events into a Health summary via the MODEL (not local
+        # counting) so the strip and the plasmoid agree on the numbers, then push
+        # it to the strip text. Caching it (self._health) lets tests read the
+        # outward state and avoids re-summarizing on every repaint.
+        self._health = summarize(self._events)
+        self._update_health_strip()
         self._update_range_label()
         self.update()
 
@@ -412,25 +547,69 @@ class CalendarView(QWidget):  # type: ignore[misc]
         end = datetime.fromtimestamp(self._window_end / 1_000_000, UTC)
         self._range_label.setText(f"{start:%b %d} – {end:%b %d}")
 
+    def _update_health_strip(self) -> None:
+        """Render the cached Health into the strip's label text.
+
+        Reads self._health (set by set_events from the model's summarize). The
+        format is intentionally terse — glyph counts so a problem window is
+        scannable — and minimal on purpose: the rich styling (colour per count,
+        the issues popover) is the post-build visual pass. The glyphs reuse the
+        module's visual grammar (✔ ok, ✘ failed, ⛌ gap, ⏲ upcoming) so the strip
+        speaks the same language as the cells. A fully clean window reads "all
+        clear" rather than a row of zeros, so healthy is restful, not noisy — the
+        de-noising the spec asks for, applied to the summary too.
+        """
+        h = self._health
+        if h.failed == 0 and h.gaps == 0:
+            # No failures and no missed slots → the restful state. We still note
+            # ok/upcoming counts so the strip isn't blank, but lead with "all
+            # clear" so a healthy window doesn't shout numbers.
+            self._health_label.setText(
+                f"All clear · {h.ok}✔ · {h.upcoming}⏲"
+            )
+            return
+        self._health_label.setText(
+            f"{h.failed}✘ · {h.gaps}⛌ · {h.ok}✔ · {h.upcoming}⏲"
+        )
+
     # -- painting -------------------------------------------------------------
 
     def _canvas_top(self) -> int:
-        """Y of the painted canvas's top edge = below the chrome row.
+        """Y of the painted canvas's top edge = below the LOWEST chrome strip.
 
-        The chrome is laid out by the QVBoxLayout; its height is the first layout
-        item's geometry. Reading it (rather than a magic constant) keeps the
-        canvas directly under the chrome whatever the platform font height —
-        important because row_hit_point and the paint both build on this.
+        The chrome is the nav row plus the HEALTH strip plus the (sometimes
+        hidden) filter strip, all laid out by the QVBoxLayout above the final
+        stretch. We take the maximum bottom across every non-stretch item so the
+        canvas always starts directly under whatever chrome is currently showing
+        — when the filter strip is hidden the layout collapses it to zero height
+        and it drops out of the max, so Day/Week/matrix canvases sit higher than
+        the Month grid's. Measuring (not a magic constant) keeps row_hit_point and
+        every paint sharing one coordinate space whatever the platform font height
+        — a click can't desync from what's drawn even as strips appear/disappear.
+
+        Why max-over-items rather than reading item 0: with three strips a fixed
+        index would silently ignore the others, putting the canvas UNDER the
+        chrome and corrupting every hit-test. The stretch item carries no widget,
+        so we skip items whose geometry is the leftover stretch (it has no
+        sensible bottom for the canvas).
         """
         layout = self.layout()
         if layout is None or layout.count() == 0:
             return 0
-        item = layout.itemAt(0)
-        if item is None:
-            return 0
-        # int() pins the type: PySide6's stubs type QRect.bottom() as Any, which
-        # mypy --strict rejects; the value is always an int pixel coordinate.
-        return int(item.geometry().bottom())
+        bottom = 0
+        # Bounded by layout.count() (a handful of items) — Power of Ten rule 2.
+        for i in range(layout.count()):
+            item = layout.itemAt(i)
+            if item is None:
+                continue
+            # The final addStretch item has no widget and no layout; skip it so
+            # the stretch's full-height geometry never pushes the canvas down.
+            if item.widget() is None and item.layout() is None:
+                continue
+            # int() pins the type: PySide6's stubs type QRect.bottom() as Any,
+            # which mypy --strict rejects; it is always an int pixel coordinate.
+            bottom = max(bottom, int(item.geometry().bottom()))
+        return bottom
 
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt naming)
         """Dispatch to the active sub-view's painter.
@@ -935,6 +1114,30 @@ class CalendarView(QWidget):  # type: ignore[misc]
                 label,
             )
 
+    def _cell_matches_filter(self, worst: CalendarEvent | None) -> bool:
+        """Does this cell's worst event match the active Month-grid filter?
+
+        Returns True (don't dim) when no filter is active (`_filter` is None) so
+        the unfiltered grid is unchanged. With a filter set, the cell matches when
+        its worst event's kind maps to the filter: "fail" → a failed run, "gap" →
+        a gap, "upcoming" → a projected/approx run. An empty cell (worst is None)
+        never matches a kind filter — there is nothing of that kind there, so it
+        dims. Reading off the WORST event mirrors the cell's own glyph, so what
+        the filter keeps bright is exactly what the cell draws (no surprise where
+        a cell stays bright but shows a non-matching glyph).
+        """
+        if self._filter is None:
+            return True  # All → nothing dimmed
+        if worst is None:
+            return False  # empty day can't match a kind filter → dim it
+        if self._filter == "fail":
+            return worst.kind == "ran" and worst.result == "failure"
+        if self._filter == "gap":
+            return worst.kind == "gap"
+        if self._filter == "upcoming":
+            return worst.kind in ("projected", "approx")
+        return True  # unreachable (set_filter validates), but never over-dim
+
     def _paint_month_cell(
         self,
         painter: QPainter,
@@ -950,10 +1153,13 @@ class CalendarView(QWidget):  # type: ignore[misc]
 
         Days outside the visible month (grid padding) and future days are dimmed
         so the eye stays on the current month's past — a future or adjacent-month
-        cell can't carry an outcome, so muting it is honest, not decorative. A
-        problem day's worst glyph is drawn in its outcome colour; a clean day
-        shows only its faint day number (no glyph), which is the de-noising the
-        spec asks for.
+        cell can't carry an outcome, so muting it is honest, not decorative. When
+        a Month-grid filter is active, cells whose worst event doesn't match the
+        filter are ALSO dimmed (and their glyph drawn muted) so only the kind the
+        user asked for stays bright — the filter never drops a cell, it just
+        recedes the rest, keeping the month's shape intact. A problem day's worst
+        glyph is drawn in its outcome colour; a clean day shows only its faint day
+        number (no glyph), which is the de-noising the spec asks for.
         """
         rect = self._month_cell_rect(week, weekday)
         # Cell outline — faint; the heavy problem-week border is drawn separately
@@ -961,8 +1167,14 @@ class CalendarView(QWidget):  # type: ignore[misc]
         painter.setPen(QColor(70, 70, 70))
         painter.drawRect(rect)
 
-        # Day number, top-left. Dimmed for out-of-month/future cells.
-        dim = (not in_month) or is_future
+        # A cell dims when it's out-of-month, future, OR (filter active) its worst
+        # event doesn't match the chosen kind. Folding the filter into the same
+        # `dim` flag means one code path mutes both the day number and the glyph,
+        # so a filtered-out cell recedes uniformly rather than half-bright.
+        filtered_out = not self._cell_matches_filter(worst)
+        dim = (not in_month) or is_future or filtered_out
+
+        # Day number, top-left. Dimmed per the flag above.
         num_color = QColor(90, 90, 90) if dim else QColor(170, 170, 170)
         painter.setPen(num_color)
         painter.drawText(
@@ -978,7 +1190,9 @@ class CalendarView(QWidget):  # type: ignore[misc]
         if worst is None or not in_month:
             return
         _glyph, color = _glyph_color(worst)
-        painter.setPen(color)
+        # A filtered-out glyph draws in the muted grey (not its outcome colour) so
+        # the un-asked-for kinds recede; the matching kind keeps its full colour.
+        painter.setPen(QColor(95, 95, 95) if filtered_out else color)
         painter.drawText(
             QRect(rect.x() + 3, rect.y() + 18, rect.width() - 6, rect.height() - 20),
             Qt.AlignmentFlag.AlignCenter,

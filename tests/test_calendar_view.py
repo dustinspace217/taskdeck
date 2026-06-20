@@ -222,6 +222,9 @@ def test_week_view_click_still_emits_selected_unit(qtbot):
     assert seen == ["a.timer"]
 
 
+# (HEALTH-strip + filter-strip tests for Task 11 are at the END of this file.)
+
+
 # -- Month grid view (Task 9) ------------------------------------------------
 #
 # The Month paint lays the visible calendar month as a weeks-x-weekdays grid
@@ -527,3 +530,114 @@ def test_matrix_click_emits_row_unit(qtbot):
     w.selected.connect(seen.append)
     qtbot.mouseClick(w, Qt.MouseButton.LeftButton, pos=w.row_hit_point(0))
     assert seen == ["a.timer"]
+
+
+# -- HEALTH strip + Month filter strip (Task 11) -----------------------------
+#
+# The HEALTH strip is a top readout summarising the visible window (counts +
+# issues) computed by the model's summarize(); it appears above the canvas in
+# every mode. The Month filter strip is a Month-grid-only set of toggles that set
+# `_filter` (None/"fail"/"gap"/"upcoming") so the paint DIMS non-matching cells,
+# letting the user isolate "show me only the failures". Like the other view
+# tests these pin BEHAVIOR — the strip text reflects summarize, setting a filter
+# updates `_filter`, and a filtered Month paint runs without raising — not the
+# pixel layout (iterated by eye post-build per Dustin).
+
+
+def test_health_strip_reflects_summarize(qtbot):
+    # set_events must roll the events through the model's summarize() and surface
+    # the counts in the strip — a failure and a gap in the window mean the strip
+    # reads non-clean. We assert on the strip's text (its outward state) and the
+    # cached Health, not pixels: a failed run and a gap region both register.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("day")
+    base = 1_781_000_000_000_000
+    w.set_events(
+        [
+            CalendarEvent("a.timer", base, "ran", "success"),
+            CalendarEvent("a.timer", base + 3_600_000_000, "ran", "failure"),
+            CalendarEvent("b.timer", base + 7_200_000_000, "gap"),
+        ],
+        units=["a.timer", "b.timer"],
+        window_start=base,
+        window_end=base + DAY_USEC,
+        now=base + DAY_USEC,
+    )
+    text = w._health_label.text()
+    # The strip shows the failed + gap counts so a problem window is readable at a
+    # glance; exact formatting is the visual pass, the counts are the contract.
+    assert "1" in text          # the failure count surfaces in the strip text
+    assert w._health.failed == 1 and w._health.gaps == 1
+
+
+def test_month_filter_sets_filter_and_paints(qtbot):
+    # Selecting a Month filter must set `_filter` to the chosen kind and trigger a
+    # filtered paint that DOESN'T raise (dimming non-matching cells is a colour
+    # change inside paintEvent, so the smoke is "still rasterizes"). We drive the
+    # public set_filter API the strip buttons call, across each filter value.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    w.set_events(
+        [
+            CalendarEvent("a.timer", FEB10_USEC, "ran", "failure"),
+            CalendarEvent("b.timer", FEB28_USEC, "gap"),
+            CalendarEvent("c.timer", FEB1_USEC, "projected"),
+        ],
+        units=["a.timer", "b.timer", "c.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=FEB10_USEC,
+    )
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    for kind in ("fail", "gap", "upcoming", None):
+        w.set_filter(kind)
+        assert w._filter == kind
+        assert w.grab().width() > 0  # filtered month paint rasterizes, no raise
+
+
+def test_filter_strip_is_month_only(qtbot):
+    # The filter strip is a Month-GRID affordance (it dims Month grid cells); it
+    # makes no sense in Day/Week/matrix and must hide there so the chrome stays
+    # clean — the same Month-only discipline as the grid<->matrix sub-toggle.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    w.set_mode("day")
+    assert not w._filter_strip.isVisible()   # hidden outside Month grid
+    w.set_mode("month")
+    assert w._filter_strip.isVisible()       # visible in the Month grid
+    w.set_mode("matrix")
+    assert not w._filter_strip.isVisible()   # the matrix has no per-cell dim
+    w.set_mode("week")
+    assert not w._filter_strip.isVisible()
+
+
+def test_set_filter_ignores_unknown_value(qtbot):
+    # A bad filter string must be ignored (keep the current filter), never raise —
+    # mirrors set_mode's tolerance of unknown modes. Guards a future caller from
+    # wedging the paint with a typo'd kind.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    w.set_filter("fail")
+    w.set_filter("bogus")          # unrecognized → no change
+    assert w._filter == "fail"
+
+
+def test_set_mode_away_from_month_clears_filter(qtbot):
+    # Leaving the Month grid clears any active filter so it can't silently dim a
+    # later return to Month (the filter is a Month-grid-only state). Switching to
+    # Day after filtering by "fail" must reset `_filter` to None.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    w.set_filter("fail")
+    assert w._filter == "fail"
+    w.set_mode("day")
+    assert w._filter is None
