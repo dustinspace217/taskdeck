@@ -1,12 +1,17 @@
 # Calendar View — Design Spec (Task Deck)
 
-## Status (2026-06-20, hardened after adversarial review)
-Phase: Design — approved in brainstorming; spec written; **stress-tested by a
-4-critic adversarial pass (systemd-correctness re-probed live, scope/YAGNI,
-architecture-feasibility; the silent-failure/completeness critic was rate-limited
-and its lens was covered by the author).** All P0/P1 findings folded in below.
-Awaiting Dustin's review → writing-plans. NOT yet implemented. Probed live on
-systemd **259** / Fedora 44.
+## Status (2026-06-20, IMPLEMENTED v1 on branch `calendar-view`)
+Phase: BUILT. Design was hardened by a 4-critic adversarial pass (P0/P1 folded in
+below), then all 12 plan tasks were executed via phased workflows (TDD impl +
+independent adversarial verify per task). Day / Week / Month / by-timer-matrix all
+render correctly; 211 hermetic + 5 realsystemd tests; ruff + mypy clean. One real
+layout bug found by the by-eye visual pass (a hidden filter strip's stale geometry
+stranded the Week/Matrix grids) and fixed (630da67) — invisible to the headless
+verifiers. REMAINING before "done": (1) the three-phase QA Review (workspace
+Post-Coding Process — posts to GitHub Discussions, keeps Dustin in the synthesis
+loop); (2) a visual de-noise pass to Dustin's taste (contrast/whitespace — the
+views are functional + correctly laid out, polish pending); (3) merge
+`calendar-view` → main + push (Dustin's go). Probed live on systemd 259 / Fedora 44.
 
 **Goal:** A third top-level **Calendar** view in Task Deck that visualizes systemd
 **timer** schedules — past actual runs (mined from the journal, with success/
