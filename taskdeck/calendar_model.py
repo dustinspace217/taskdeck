@@ -143,14 +143,36 @@ def compute_gaps(
 
     `slots` are the exact scheduled µs instants for this timer (from
     parse_projection over a PAST --base-time); `runs` are that timer's 'ran'
-    events. Only slots in [coverage_start, now] are judged — outside the
+    events. Only slots in [coverage_start, now] are judged — the interval is
+    CLOSED on BOTH ends: a slot at exactly coverage_start is judged (skip is
+    `slot < coverage_start`), and a slot at exactly `now` is judged too (the
+    ±tolerance band absorbs a run that just fired or is about to). Outside the
     journal's coverage there is no run data, so 'no run' means 'no data', NOT a
-    gap (spec §4.3); the view renders those as '—'. Future slots (> now) are
-    likewise silent — a run can't have happened yet. Contiguous misses collapse
-    into one event carrying a count so a long outage reads as one region.
+    gap (spec §4.3); the view renders those as '—'. Future slots (strictly > now)
+    are silent — they belong to the projection path (_finalize_calendar emits
+    `projected` events for `s > now`), so the boundary is partitioned as: this
+    function owns (-∞, now] via NOT(slot > now); projection owns (now, ∞) via
+    s > now. Exactly one owner, no hole, no double-draw — a slot at exactly now
+    is gap-judged only, the next slot at now+interval is projection-only (they
+    are different instants). Contiguous misses collapse into one event carrying a
+    count so a long outage reads as one region.
+
+    Run consumption (R2-2): each run satisfies at MOST ONE slot — the slot it is
+    NEAREST to. A stateless "any run within tolerance" test let one run silence
+    EVERY slot within ±tolerance, so on a multi-trigger timer whose two
+    OnCalendar expressions fire less than GAP_TOLERANCE apart, a single run could
+    mask a genuine miss of the other trigger. Assignment is RUN-CENTRIC: each run
+    claims the nearest still-unclaimed slot in range, so a run lands on the slot
+    it actually matches and the other slot stays unsatisfied → a gap. Run-centric
+    (vs. walking slots and letting each grab its nearest run) is what prevents the
+    mis-assignment the QA flagged: if slots grabbed runs left-to-right, an earlier
+    slot could claim a run that sits closer to a LATER slot, then false-gap that
+    later slot. Sending the run to ITS nearest slot is the assignment that can't
+    false-gap the wrong one.
     """
-    # Pre-sort the run times once so _has_run_near scans a known order; runs
-    # arrive unsorted (one per journal record, in log order).
+    # Pre-sort the run times once (runs arrive unsorted — one per journal record,
+    # in log order). Time order makes the assignment deterministic; correctness
+    # comes from each run picking its NEAREST slot, not from the order.
     run_times = sorted(r.when for r in runs)
     # Dedup the slot list BEFORE walking (F5). Duplicate µs instants are now
     # reachable: F4's multi-trigger union concatenates several expressions' slots
@@ -162,18 +184,25 @@ def compute_gaps(
     # index map total and the merge correct. (Was WATCH-1, "unreachable"; F4 made
     # it live, so the dedup is now load-bearing, not defensive.)
     unique_slots = sorted(set(slots))
-    missed: list[int] = []
-    for slot in unique_slots:
-        # `slot >= now` (not `> now`) so a slot landing EXACTLY at now is
-        # future-owned and silent — matching the strict `s > now` split in
-        # _on_cal_projection that draws projected events. Owning the boundary on
-        # exactly one side prevents the now-instant slot from being BOTH judged
-        # here (a possible gap) AND skipped as a projection (drawn nowhere) — the
-        # off-by-one F6 fixes.
-        if slot < coverage_start or slot >= now:
-            continue  # unjudgeable (before coverage = no data) or at/after now
-        if not _has_run_near(run_times, slot, tolerance_usec):
-            missed.append(slot)
+    # Judgeable slots only: partition the now-boundary so each instant has exactly
+    # one owner. Keep slots in [coverage_start, now] — closed on both ends. A slot
+    # < coverage_start is "no data" (before the journal's reach); a slot STRICTLY
+    # > now is future and belongs to the projection path (_finalize_calendar draws
+    # `projected` for s > now). A slot exactly AT now IS judged here — the
+    # ±tolerance band covers a run that just fired / is about to. (The prior code
+    # skipped `slot >= now`, double-excluding the now-instant from BOTH the gap
+    # walk and projection → drawn nowhere; the R2-1 boundary fix closes the now
+    # end.) Only these slots can be claimed by a run or become a gap.
+    judgeable = [s for s in unique_slots if coverage_start <= s <= now]
+    # Run-centric nearest assignment (R2-2): each run claims the nearest unclaimed
+    # judgeable slot within tolerance; a claimed slot ran on time. Slots left
+    # unclaimed after every run is placed are the misses.
+    claimed: set[int] = set()
+    for t in run_times:
+        nearest = _nearest_unclaimed_slot(judgeable, claimed, t, tolerance_usec)
+        if nearest is not None:
+            claimed.add(nearest)
+    missed = [s for s in judgeable if s not in claimed]
     # Collapse runs of missed slots that were ADJACENT in the schedule into one
     # gap region. Adjacency is decided by position in the deduped sorted slot
     # list (see _collapse), not by arithmetic on the timestamps — that stays
@@ -183,14 +212,34 @@ def compute_gaps(
     return _collapse(missed, unique_slots, unit)
 
 
-def _has_run_near(run_times: list[int], slot: int, tol: int) -> bool:
-    """True if any run in `run_times` falls within ±`tol` of `slot`.
+def _nearest_unclaimed_slot(
+    slots: list[int], claimed: set[int], run_time: int, tol: int
+) -> int | None:
+    """The unclaimed slot in `slots` nearest to `run_time` within ±`tol`, or
+    None if every in-tolerance slot is already claimed (or none is in range).
 
-    Linear scan is deliberate: a timer has at most tens of runs in a visible
-    window, so a bisect would add complexity for no measurable gain. `run_times`
-    is pre-sorted by the caller, but order is irrelevant to this `any()` check.
+    `slots` is the sorted list of judgeable slots; `claimed` holds the slot
+    instants already matched by an earlier run, so a run never double-claims one
+    another run already satisfied (R2-2: each run satisfies at most one slot, and
+    each slot is satisfied by at most one run). Among unclaimed slots within
+    tolerance we return the one with the SMALLEST |slot - run_time| — sending the
+    run to the slot it actually matches, which is what prevents false-gapping a
+    slot a different run was the real match for.
+
+    Linear scan is deliberate: a timer has at most tens of runs/slots in a
+    visible window, so the overall O(runs × slots) is trivially bounded (Power of
+    Ten rule 2) and a bisect would add complexity for no measurable gain.
     """
-    return any(abs(t - slot) <= tol for t in run_times)
+    best: int | None = None
+    best_dist = tol + 1  # any in-tolerance slot beats this sentinel
+    for s in slots:
+        if s in claimed:
+            continue  # already matched by an earlier (nearer-or-equal) run
+        dist = abs(s - run_time)
+        if dist <= tol and dist < best_dist:
+            best_dist = dist
+            best = s
+    return best
 
 
 def _collapse(missed: list[int], all_slots: list[int], unit: str) -> list[CalendarEvent]:

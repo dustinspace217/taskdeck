@@ -110,4 +110,97 @@ No finding was contradicted in cross-exam; one was upgraded (WATCH-1 → live).
 never reaches `fetch_cal_projection` (build skips it at `iterations<=0`); sub-second
 truncation (benign, all systemd timestamps are whole-µs).
 
-Fix batch F1–F7 implemented next (workflow), then merge `calendar-view` → main.
+Fix batch F1–F7 implemented in commit 140d856 (workflow), all gates green.
+
+---
+
+# Round 2 — QA of the F1–F7 fix batch (commit 140d856, 2026-06-20)
+
+A second, fully-independent three-phase QA, run on the fix batch itself per the
+workspace Post-Coding Process (a workflow's internal verify does NOT satisfy this).
+Same four Opus reviewers (code-reviewer [CR], test-analyzer [TA], silent-failure-
+hunter [SF], adversarial-tester [AT]), blind Phase A, then Phase-B cross-examination,
+Phase-C synthesis here.
+
+**Headline:** the batch's *barrier and failure-routing plumbing is genuinely solid* —
+SF and AT both went hunting for an F3 stale-acceptance or a fan-in wedge (the class
+the first QA called "sharpest") and both came back unable to break it; AT explicitly
+withdrew its initial wedge after exhaustive tracing. All residual findings are in the
+**gap-detection arithmetic** and **degradation signalling**, independent of the fan-in
+machinery. One P1, three P2s, no P0.
+
+## Phase A — findings (by lens)
+- **CR:** SHIP, no P0/P1 regressions. CR-P2 (P2) F4's multi-trigger union has no dedup
+  on the *projected-event* path (only the gap path got F5) → duplicate `projected`
+  events (double glyph + `summarize().upcoming` overcount). CR-P3a/b (P3) two docstrings
+  say `[coverage_start, now]` but the code is half-open. (CR also initially cleared F6.)
+- **TA:** tests solid/non-vacuous, the `pending_id()` helper closes the F3 hardcoded-id
+  vacuity trap. TA-P1 (P1-test) out-of-order fan-in (journal before coverage) untested;
+  TA-P2a (P3) the F3 stale-drop test delivers via a `generation=` kwarg production never
+  passes; TA-P2b/c (P2-test) coverage-fails and empty-scope branches untested; TA-P3
+  (P2-test) the F4-union→F5-dedup seam never exercised end-to-end.
+- **SF:** sound; SF-P1 (P1) finalize-partial renders a *degraded* calendar identically
+  to a complete one — a coverage failure suppresses gaps → "all clear" on a window with
+  real misses; only signal is the ephemeral status bar. SF-P2/P3 (P2/P3, defer) probe
+  unparseable-vs-empty + skip-counter observability.
+- **AT:** F3 barrier integrity SOLID. AT-P2a (P2→P3) a no-run slot exactly at `now` is
+  excluded by *both* projection (`s > now`) and gap (`slot >= now`-skip) → drawn nowhere;
+  AT-P2b (P2) `_has_run_near` is a stateless membership test, so one run satisfies *two*
+  slots within `GAP_TOLERANCE` → a genuine miss on a sub-15-min multi-trigger timer is
+  invisible; AT-P3a (P3) the `_cal_coverage_start = 0` sentinel is a latent epoch-floor
+  trap; AT-P3b (P3, defer) F4 multiplies the DEF-CAL-01/02 blast radius per expression.
+
+## Phase B — convergence (cross-examined)
+- **F6 now-boundary (CR vs AT-P2a) — resolved unanimously for AT.** CR retracted on
+  re-trace; SF and TA confirmed from their lenses. TA gave the clinching evidence: the
+  only existing boundary test (`test_slot_exactly_at_now_is_not_a_gap`) is a `compute_gaps`
+  unit test with no `projected` output, so it passes identically under both readings and
+  is structurally blind to the drop — that is why F6 shipped the bug, and its inline
+  comment "describes the bug as the fix." Correct partition: gap judges `slot <= now`
+  (skip `slot > now`), projection keeps `s > now` — exactly one owner, tolerance handles
+  the just-ran/about-to-run fuzz. AT itself revised severity to **P3** (test-blindness,
+  not live data-loss: live `now` has sub-second precision), but the fix is one operator,
+  so fix it.
+- **The F4-union family (CR-P2 + AT-P2b + TA-P3) — the batch's real soft spot.** Three
+  reviewers hit one seam from three angles (duplicate projected glyph / hidden miss /
+  untested). CR's proposed `parse_projection → sorted(set())` is **necessary but not
+  sufficient** (TA + AT): it dedups within one expression's response, not *across* the
+  two per-expression fetches whose union creates the duplicate. AT's convergent fix:
+  emit `projected` events in `_finalize_calendar` from the already-deduped `_cal_slots`
+  (the same source the gap path reads), not per-fetch — which *also* collapses the
+  AT-P2a boundary into a single site.
+- **SF-P1 + AT-P3a — two halves of one fix.** Suppressing gaps on an unset floor (AT-P3a,
+  the data-safety half) without flagging it is silent (SF's complaint); flagging without
+  suppressing risks `coverage_start=0` blooming gaps to epoch (AT's complaint). Implement
+  together. TA's non-vacuity guard: the locking test must assert `degraded is False` on
+  the happy path, or a hardcoded `degraded=True` passes the positive test and trains the
+  user to ignore the warning.
+- **AT-P2b fix refinement (TA + SF):** run-consumption must be **nearest-unclaimed**, not
+  first-within-tolerance, or it can mis-assign a run and false-gap the wrong slot.
+
+No finding was contradicted in cross-exam except the F6 disagreement, which resolved
+cleanly on the test-existence evidence.
+
+## Phase C — disposition (head-agent synthesis)
+
+**FIX before merge (Round-2 batch):**
+| # | Finding(s) | Sev | Fix |
+|---|---|---|---|
+| R2-1 | CR-P2 dup projected events + AT-P2a now-boundary drop | P2 | Emit `projected` events in `_finalize_calendar` from `sorted(set(_cal_slots[unit]))` (drop the per-fetch emission in `_on_cal_projection`), so projected + gap share one deduped source; `compute_gaps` judges `slot <= now` (skip `slot > now`); rewrite the inverted F6 comment; the two CR-P3a/b docstrings become correct-as-written once the interval is closed. |
+| R2-2 | AT-P2b one run hides a second nearby miss | P2 | In `compute_gaps`, consume runs — each run satisfies at most one slot, **nearest-unclaimed** within tolerance. |
+| R2-3 | SF-P1 degraded render + AT-P3a unset-floor sentinel | P1 | `_cal_coverage_start` sentinel → `None`; `_finalize_calendar` suppresses gaps when the floor is unset AND sets `degraded=True`; the flag flows to `set_events` → health strip shows "⚠ partial — some data failed to load (⟳ to retry)". Boolean only (per-layer qualifier → DEF-CAL-08). |
+| R2-4 | TA-P1/P2a/P2b/P2c/P3 test gaps | — | Out-of-order fan-in (journal before coverage); F3 stale-drop via the production `_on_finished` path (no `generation` kwarg); coverage-fails → `degraded` True AND happy-path `degraded` False; empty-scope build; F4 coincident-slot end-to-end (one gap + one projected + upcoming once); replace `test_slot_exactly_at_now_is_not_a_gap` with a now-instant-IS-judged test. |
+
+**DEFER (real, lower-priority — register + file):**
+- DEF-CAL-05 (P2, SF-P2): coverage probe can't distinguish an unparseable stream from a
+  genuinely-empty journal (both → suppress, the safe direction). Twin of DEF-CAL-03; add
+  a "got output, parsed nothing" tripwire when DEF-CAL-03's observability counter lands.
+- DEF-CAL-06 (P3, SF-P3): `parse_projection`'s malformed-line skip has no diagnostic counter.
+- DEF-CAL-07 (P3, AT-P3b): F4's per-expression fan-out multiplies DEF-CAL-01's cap blind
+  spot and DEF-CAL-02's subprocess count by exprs-per-timer — annotate both existing issues.
+- DEF-CAL-08 (P3, CR/AT): the `degraded` flag could name *which* layer failed (coverage →
+  under-report / journal → phantom gaps / one projection → scoped under-report); v1 ships
+  the boolean.
+
+R2 implemented next (workflow: impl → adversarial verify → bounded fix), then a slim
+stabilization pass (code-reviewer + test-analyzer), then merge `calendar-view` → main.

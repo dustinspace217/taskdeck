@@ -151,10 +151,23 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # The journal-coverage floor for THIS build (F1), set by _on_cal_coverage
         # once the coverage probe lands and read by _finalize_calendar as
         # compute_gaps' coverage_start. A gap before this floor is "no data", not
-        # a miss. Reset to 0 at build start; the coverage probe is what fills it,
-        # and the projections are gated behind it so the floor is always known
-        # before any slot is judged.
-        self._cal_coverage_start: int = 0
+        # a miss. Reset to None at build start (R2-3): None means the floor never
+        # landed (the coverage probe failed before _on_cal_coverage could set it),
+        # which _finalize_calendar reads as "suppress gaps entirely" rather than
+        # judging against a 0/epoch floor that would bloom gaps back to the dawn
+        # of time. The probe (or its failure path) is what fills it; projections
+        # are gated behind a SUCCESSFUL probe so the floor is always known (and
+        # non-None) before any slot is judged on the happy path.
+        self._cal_coverage_start: int | None = None
+        # Whether THIS build's render is DEGRADED (R2-3): any calendar fetch
+        # (coverage probe, journal, or a projection) failed or poisoned, so the
+        # render is partial. Reset False at _build_calendar; set True in the
+        # _on_failed and _on_finished-except calendar barrier-release paths.
+        # Passed to set_events so the calendar's own HEALTH strip can surface the
+        # degradation ("⚠ partial — some data failed to load") — not just the
+        # ephemeral status bar, which a 10s refresh line can overwrite. Boolean
+        # only; naming WHICH layer failed is deferred (DEF-CAL-08).
+        self._cal_degraded: bool = False
         # The projection PLAN for THIS build: one (unit, expr_idx, expr,
         # iterations) entry per eligible timer×OnCalendar-expression (F4 projects
         # EVERY expression, not just calendar[0]). Computed at build start but
@@ -452,7 +465,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 # _cal_pending non-empty forever — release the id and
                 # finalize-partial so the page renders whatever DID land. Mirrors
                 # the _on_failed calendar branch; the error stays loud, the next
-                # nav/tick rebuilds.
+                # nav/tick rebuilds. The poisoned fetch makes the render partial,
+                # so mark it degraded (R2-3) — the HEALTH strip surfaces it.
+                self._cal_degraded = True
                 self._cal_proj_unit_by_id.pop(request_id, None)
                 self._cal_pending.discard(request_id)
                 if not self._cal_pending:
@@ -628,7 +643,11 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._cal_slots = {}
         self._cal_proj_unit_by_id = {}
         self._cal_proj_plan = []
-        self._cal_coverage_start = 0  # filled when the coverage probe lands
+        # None = floor not yet established (R2-3). A SUCCESSFUL coverage probe
+        # fills it in _on_cal_coverage; if the probe fails, it stays None and
+        # _finalize_calendar suppresses gaps rather than judging against epoch.
+        self._cal_coverage_start = None
+        self._cal_degraded = False  # set True if any fetch fails this build (R2-3)
         self._cal_window = (win_start, win_end)
         self._cal_now = now_usec
         # Row order + the service→timer map are derived from the live timers.
@@ -768,12 +787,21 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         return None
 
     def _finalize_calendar(self) -> None:
-        """Compute gaps and push the assembled events into the calendar view.
+        """Compute gaps, emit projected events, and push everything to the view.
 
-        Called once the build's fan-in (_cal_pending) empties. Gaps are computed
-        HERE (not per-response) because a gap needs BOTH a timer's scheduled
-        slots (from its projection) AND its actual runs (from the one journal
-        query) — only when both have landed can a missed slot be identified.
+        Called once the build's fan-in (_cal_pending) empties. BOTH the
+        `projected` future events AND the gaps are emitted HERE (not per
+        response) so they share ONE deduped slot source per unit —
+        sorted(set(self._cal_slots[unit])) — the R2-1 fix. Per-fetch projected
+        emission (the old _on_cal_projection path) drew a slot twice when two
+        OnCalendar expressions projected it, and disagreed with the gap walk on
+        the now-instant slot. Deriving both from the same deduped set gives each
+        instant exactly one owner: projection owns s > now, the gap walk owns
+        s <= now (compute_gaps' closed [coverage_start, now]).
+
+        Gaps need BOTH a timer's scheduled slots (its projection) AND its actual
+        runs (the one journal query) — only when both have landed is a missed
+        slot identifiable.
 
         The clamp is [coverage_start, now], where coverage_start is the
         journal-coverage floor the coverage probe established (_on_cal_coverage),
@@ -782,28 +810,54 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         win_start would bloom false amber gaps across the pre-coverage region.
         Clamping to the actual journal floor keeps 'no run' before coverage
         rendering as 'no data', never a miss (spec §4.3).
+
+        Unset-floor suppression (R2-3): if coverage_start is None the probe never
+        landed (a degraded build where the coverage fetch failed), so we SKIP gap
+        computation entirely — judging against a 0/epoch floor would bloom gaps
+        back to the dawn of time. Past runs and projections still render; the
+        degraded flag (passed to set_events) tells the user the render is partial.
         """
         win_start, win_end = self._cal_window
         now = self._cal_now
         events = list(self._cal_events)
+        # Emit `projected` events from the SAME deduped slot source the gap walk
+        # reads (R2-1). Per unit: dedup with sorted(set(...)) — collapsing the F4
+        # cross-expression union and any DST-duplicate instants — then draw only
+        # the slots strictly after now (s > now). A slot at/before now is a past
+        # run's scheduled time (its outcome is a 'ran' event) or a missed slot (a
+        # gap, below), so drawing it as `projected` too would double up. This is
+        # the (now, ∞) half of the boundary partition compute_gaps owns the other
+        # side of.
+        for unit, slots in self._cal_slots.items():
+            for s in sorted(set(slots)):
+                if s > now:
+                    events.append(
+                        CalendarEvent(unit=unit, when=s, kind="projected")
+                    )
         # Runs are already in _cal_events (kind="ran"); split them out per timer
         # to pair against that timer's projected slots for gap detection.
         runs_by_unit: dict[str, list[CalendarEvent]] = {}
         for ev in events:
             if ev.kind == "ran":
                 runs_by_unit.setdefault(ev.unit, []).append(ev)
-        for unit, slots in self._cal_slots.items():
-            gaps = compute_gaps(
-                slots,
-                runs_by_unit.get(unit, []),
-                unit,
-                coverage_start=self._cal_coverage_start,
-                now=now,
-                tolerance_usec=GAP_TOLERANCE_USEC,
-            )
-            events.extend(gaps)
+        # Gaps only when the coverage floor is known. None ⇒ the probe failed
+        # (a degraded build) ⇒ suppress all gaps (R2-3) rather than judge against
+        # epoch; past runs + projections (appended above) still render.
+        coverage_start = self._cal_coverage_start
+        if coverage_start is not None:
+            for unit, slots in self._cal_slots.items():
+                gaps = compute_gaps(
+                    slots,
+                    runs_by_unit.get(unit, []),
+                    unit,
+                    coverage_start=coverage_start,
+                    now=now,
+                    tolerance_usec=GAP_TOLERANCE_USEC,
+                )
+                events.extend(gaps)
         self.calendar_view.set_events(
-            events, self._cal_units, win_start, win_end, now
+            events, self._cal_units, win_start, win_end, now,
+            degraded=self._cal_degraded,
         )
 
     def _on_cal_journal(self, request_id: str, stdout: str) -> None:
@@ -829,18 +883,25 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
     ) -> None:
         """Fan-in handler for one timer×expression future-slot projection.
 
-        The parsed instants serve TWO purposes: those after `now` are future
-        `projected` events drawn on the calendar; ALL of them (including past
-        ones, from the win_start base-time) are the scheduled slots gap
-        detection needs — so we keep the full list in _cal_slots for
-        _finalize_calendar and emit only the future ones as events now.
+        The parsed instants are ACCUMULATED into _cal_slots only — this handler
+        no longer emits any `projected` events. ALL of them (past ones, from the
+        win_start base-time, and future ones) are the scheduled slots gap
+        detection needs; the future ones become `projected` events later, in
+        _finalize_calendar, from the SAME deduped slot source the gap path reads
+        (R2-1). Emitting them here per-fetch was the root of two bugs: the
+        per-expression union meant a slot projected by two OnCalendar
+        expressions was drawn TWICE (a duplicate glyph and a double `upcoming`
+        count), and the per-fetch `s > now` split disagreed with the gap walk's
+        boundary on the now-instant slot. Deferring emission to finalize — over
+        sorted(set(_cal_slots[unit])) — collapses both: one deduped source, one
+        boundary, one owner per instant.
 
         F4 (multi-trigger): a timer fires one projection per OnCalendar
         expression, so this EXTENDS the unit's slot list rather than overwriting
         it — a second trigger's missed slot must be able to become a gap, which
         it can't if the first trigger's response clobbered it. The duplicate µs
-        instants this union can create are folded by compute_gaps' sorted(set())
-        dedup (F5).
+        instants this union can create are folded by sorted(set(...)) at finalize
+        (for both the gap walk and the projected-event emission).
 
         F3 (generation): the primary staleness guard is `request_id not in
         _cal_pending` — a superseded build's stamped id is no longer pending, so
@@ -857,20 +918,12 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._cal_pending.discard(request_id)
         if unit is not None:
             slots = parse_projection(stdout)
-            # Full slot list (past + future) drives gap detection in finalize.
-            # setdefault + extend UNIONS this expression's slots with any already
-            # accumulated for the unit from a sibling OnCalendar expression (F4).
+            # Full slot list (past + future) drives gap detection AND projected-
+            # event emission in finalize. setdefault + extend UNIONS this
+            # expression's slots with any already accumulated for the unit from a
+            # sibling OnCalendar expression (F4). No `projected` events are built
+            # here — finalize owns that, from the deduped union (R2-1).
             self._cal_slots.setdefault(unit, []).extend(slots)
-            # Only slots strictly after `now` are genuine future projections;
-            # a slot at/before now is either a past run's scheduled time (its
-            # outcome is a 'ran' event from the journal) or a missed slot (a
-            # 'gap', computed in finalize) — drawing it as `projected` too would
-            # double up. The half-open (now, ∞) split mirrors spec §4.2.
-            self._cal_events.extend(
-                CalendarEvent(unit=unit, when=s, kind="projected")
-                for s in slots
-                if s > self._cal_now
-            )
         if not self._cal_pending:
             self._finalize_calendar()
 
@@ -1006,7 +1059,13 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # projections never fired; finalize-partial renders the past runs that
             # DID land. The error stays loud on the status bar; the next nav/tick
             # rebuilds. The proj-unit map entry frees too, so a late success echo
-            # for the same id can't match.
+            # for the same id can't match. The failed fetch makes the render
+            # partial, so mark it degraded (R2-3): the HEALTH strip surfaces it in
+            # the calendar's own surface, not just the ephemeral status bar. A
+            # failed coverage probe additionally leaves _cal_coverage_start None,
+            # so _finalize_calendar also suppresses gaps (can't judge a floor it
+            # never learned).
+            self._cal_degraded = True
             self._cal_proj_unit_by_id.pop(request_id, None)
             self._cal_pending.discard(request_id)
             if not self._cal_pending:

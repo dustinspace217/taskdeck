@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 
 from PySide6.QtCore import QObject, Signal
 
+from taskdeck.calendar_model import summarize
 from taskdeck.main_window import MainWindow
 from taskdeck.systemd_client import ScheduleInfo, TimerRow
 
@@ -281,12 +282,13 @@ def test_calendar_fan_in_assembles_runs_and_gaps_into_set_events(qtbot):
 
 
 def _coverage_line(oldest_usec):
-    """Build a journalctl `-n1` JSON line carrying the oldest entry's timestamp.
+    """Build the first JSON line of F1's coverage probe, carrying the oldest ts.
 
-    F1's coverage probe runs an UNFILTERED `journalctl -o json -n1 --since=@…`
-    and reads __REALTIME_TIMESTAMP off the single record to learn how far back
-    the journal actually reaches. The handler reads only that field, so a minimal
-    one-field line is enough."""
+    F1's probe runs an UNFILTERED `journalctl -o json --since=@… --output-fields=
+    __REALTIME_TIMESTAMP` (deliberately NOT `-n1` — that counts from the END and
+    returns the newest line; see fetch_cal_coverage). The stream is chronological,
+    so its FIRST line is the oldest entry at/after the window start, and the handler
+    reads __REALTIME_TIMESTAMP off only that line — a minimal one-field line suffices."""
     return f'{{"__REALTIME_TIMESTAMP":"{oldest_usec}"}}\n'
 
 
@@ -440,16 +442,19 @@ def test_stale_generation_response_is_dropped(qtbot):
     assert proj_id_a not in window._cal_pending, "A's stamped id is not in B's barrier"
 
     # A's late projection echo arrives — it must be dropped (stale generation),
-    # NOT applied to B's barrier or slots. Delivered by A's REAL stamped id; the
-    # generation kwarg is the secondary guard, but the primary drop is that A's
-    # id is no longer in B's pending set.
+    # NOT applied to B's barrier or slots. Delivered through the PRODUCTION
+    # dispatch entry `_on_finished(proj_id_a, ...)` with NO generation kwarg
+    # (production never passes one — the host only ever calls _on_cal_projection
+    # via _dispatch_finished, which forwards just request_id + stdout). This
+    # proves the real not-in-pending guard drops the stale echo, not the optional
+    # belt-and-suspenders generation arg the previous version exercised (TA-P2a).
     before = len(handed)
-    window._on_cal_projection(
+    window._on_finished(
         proj_id_a,
         f"       (in UTC): {_utc(_usec(2026, 6, 15, 6))} UTC\n",
-        generation=gen_a,
     )
     assert len(handed) == before, "stale-generation projection did not finalize B"
+    assert proj_id_a not in window._cal_pending, "A's stale id never re-enters B's barrier"
     assert "new.timer" not in window._cal_slots, "stale slots not merged into B"
 
 
@@ -510,3 +515,237 @@ def test_multi_trigger_projects_each_expression(qtbot):
     gap_whens = {e.when for e in events if e.kind == "gap"}
     assert slot_b in gap_whens, "second-trigger miss surfaces as a gap (slots unioned)"
     assert slot_a not in gap_whens, "first trigger ran → not a gap"
+
+
+# -- R2-1: the now-instant slot is drawn SOMEWHERE (never nowhere) ------------
+
+
+def test_now_instant_slot_is_drawn_somewhere(qtbot):
+    # R2-1 (AT-P2a end-to-end): a no-run slot at EXACTLY `now` must appear in the
+    # assembled events — as a gap (the closed gap boundary owns it) — never fall
+    # through both projection (s > now) and the gap walk and be drawn nowhere.
+    # Whole-second window so the slot lands exactly on `now` (µs-floored epochs).
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("new.timer", "new.service", 999, 0)]
+    window._last_schedules = {"new.timer": ScheduleInfo(("*-*-* 06:00:00",), ())}
+
+    win_start = _usec(2026, 6, 14, 0)
+    now = win_end = _usec(2026, 6, 16, 6)   # `now` lands exactly on the 06:00 slot
+    now_slot = _usec(2026, 6, 16, 6)
+
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append(a)  # type: ignore[method-assign]
+
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+    window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
+    # One projection slot, exactly at now; no runs at all.
+    proj = f"       (in UTC): {_utc(now_slot)} UTC\n"
+    window._on_finished(pending_id(window, "calproj:"), proj)
+    window._on_finished(pending_id(window, "caljournal:"), "")
+
+    assert len(handed) == 1
+    events = handed[0][0]
+    drawn = [e for e in events if e.when == now_slot and e.kind in ("gap", "projected")]
+    assert drawn, "the now-instant slot must be drawn as a gap or projected, never nowhere"
+    # With no run it is specifically a GAP (the closed boundary judges it).
+    assert any(e.kind == "gap" for e in drawn), "no-run now-instant slot is a gap"
+
+
+# -- R2-1: cross-fetch dedup of a coincident projected slot -------------------
+
+
+def test_multi_trigger_coincident_slot(qtbot):
+    # R2-1 (CR-P2): two OnCalendar expressions that project the SAME future
+    # instant must yield exactly ONE `projected` event (not one per fetch) and
+    # summarize().upcoming must count it ONCE. The old per-fetch emission in
+    # _on_cal_projection drew it twice (the F4 union concatenates both fetches);
+    # emitting from sorted(set(_cal_slots[unit])) in finalize collapses them.
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("multi.timer", "multi.service", 999, 0)]
+    # Two expressions that both fire at the SAME wall-clock instant (06:00) — a
+    # contrived-but-legal multi-trigger whose slots coincide.
+    window._last_schedules = {
+        "multi.timer": ScheduleInfo(("*-*-* 06:00:00", "*-*-* 06:00:00"), ())
+    }
+
+    win_start = _usec(2026, 6, 14, 0)
+    now = win_end = _usec(2026, 6, 15, 0)
+    future_slot = _usec(2026, 6, 16, 6)     # strictly after now → a projection
+
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append(a)  # type: ignore[method-assign]
+
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+    window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
+
+    # Both expressions fire a projection; deliver the SAME future slot to each id.
+    proj_ids = sorted(i for i in window._cal_pending if i.startswith("calproj:"))
+    assert len(proj_ids) == 2, "one projection id per expression"
+    same_proj = f"       (in UTC): {_utc(future_slot)} UTC\n"
+    window._on_finished(proj_ids[0], same_proj)
+    window._on_finished(proj_ids[1], same_proj)
+    window._on_finished(pending_id(window, "caljournal:"), "")
+
+    assert len(handed) == 1
+    events = handed[0][0]
+    projected = [e for e in events if e.kind == "projected" and e.when == future_slot]
+    assert len(projected) == 1, "coincident slot projected by two exprs → ONE event"
+    # summarize() must agree: the coincident slot counts once toward upcoming.
+    assert summarize(events).upcoming == 1, "upcoming counts the coincident slot once"
+
+
+# -- R2-3: degraded render on a coverage-probe failure ------------------------
+
+
+def test_coverage_failure_marks_render_degraded(qtbot):
+    # R2-3 (SF-P1 + AT-P3a): a FAILED coverage probe must (a) leave the floor
+    # unset → no gaps blooming to epoch, and (b) mark the render degraded so the
+    # view's HEALTH strip warns the user the data is partial. We fail calcover via
+    # _on_failed, then deliver the journal; the build finalizes degraded with no
+    # false gaps. (Projections were gated on a SUCCESSFUL probe, so a failed probe
+    # fires none — only the journal remains in the barrier.)
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("new.timer", "new.service", 999, 0)]
+    window._last_schedules = {"new.timer": ScheduleInfo(("*-*-* 06:00:00",), ())}
+
+    win_start = _usec(2026, 6, 10, 0)
+    now = win_end = _usec(2026, 6, 17, 0)
+
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append((a, k))  # type: ignore[method-assign]
+
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+
+    # Fail the coverage probe by its ACTUAL stamped id. No projections fire (they
+    # were gated on a successful probe); the journal alone remains in the barrier.
+    window._on_failed(pending_id(window, "calcover:"), "journalctl: boom")
+    # Seed a past, in-window, NO-RUN slot so the unset-floor suppression is the
+    # ONLY thing keeping it from blooming a false gap (AT-P3a). Without the None
+    # floor, finalize would judge this slot against a 0/epoch floor and report it
+    # as a gap; the suppression is what this assertion actually locks. (Slots
+    # would normally come from a projection, which a failed probe never fires —
+    # this mimics the poison-projection-then-coverage-fail path where slots DID
+    # land but the floor never did.)
+    orphan_slot = _usec(2026, 6, 14, 6)
+    window._cal_slots["new.timer"] = [orphan_slot]
+    # The journal lands (a run, but NOT near the orphan slot), releasing the last
+    # barrier slot → finalize.
+    journal = (
+        '{"USER_UNIT":"new.service","JOB_RESULT":"done",'
+        f'"__REALTIME_TIMESTAMP":"{_usec(2026, 6, 15, 6)}"}}\n'
+    )
+    window._on_finished(pending_id(window, "caljournal:"), journal)
+
+    assert len(handed) == 1, "build finalizes once after the journal releases the barrier"
+    args, kwargs = handed[0]
+    assert kwargs.get("degraded") is True, "a failed coverage probe → degraded render"
+    events = args[0]
+    # The seeded orphan slot has no run nearby and sits before `now`; only the
+    # unset-floor suppression keeps it from being a false gap.
+    assert not any(e.kind == "gap" for e in events), "unset floor suppresses all gaps"
+
+
+def test_complete_build_is_not_degraded(qtbot):
+    # R2-3 non-vacuity guard (TA): the HAPPY fan-in path must pass degraded=False.
+    # Without this negative assertion a hardcoded degraded=True would pass the
+    # positive test above and train the user to ignore the warning. A clean build
+    # (coverage + projection + journal all land) is NOT degraded.
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("new.timer", "new.service", 999, 0)]
+    window._last_schedules = {"new.timer": ScheduleInfo(("*-*-* 06:00:00",), ())}
+
+    win_start = _usec(2026, 6, 14, 0)
+    now = win_end = _usec(2026, 6, 17, 0)
+
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append((a, k))  # type: ignore[method-assign]
+
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+    window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
+    proj = f"       (in UTC): {_utc(_usec(2026, 6, 15, 6))} UTC\n"
+    window._on_finished(pending_id(window, "calproj:"), proj)
+    window._on_finished(pending_id(window, "caljournal:"), "")
+
+    assert len(handed) == 1
+    _args, kwargs = handed[0]
+    assert kwargs.get("degraded") is False, "a complete fan-in is NOT degraded"
+
+
+# -- R2-4: out-of-order fan-in (journal before coverage) ----------------------
+
+
+def test_out_of_order_journal_before_coverage(qtbot):
+    # TA-P1 / AT-P3a: the journal can land BEFORE the coverage probe. Delivering
+    # caljournal first must NOT trigger an early finalize (projections are still
+    # outstanding once coverage fires them), and the final clamp must use the real
+    # coverage floor (not 0/epoch). We deliver journal → coverage → projection and
+    # assert exactly one finalize, with gaps clamped to the coverage floor.
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("new.timer", "new.service", 999, 0)]
+    window._last_schedules = {"new.timer": ScheduleInfo(("*-*-* 06:00:00",), ())}
+
+    win_start = _usec(2026, 6, 10, 0)
+    now = win_end = _usec(2026, 6, 17, 0)
+    oldest = _usec(2026, 6, 15, 0)          # coverage floor
+    pre_slot = _usec(2026, 6, 12, 6)        # before coverage → silent (no epoch bloom)
+    post_slot = _usec(2026, 6, 16, 6)       # after coverage, no run → a gap
+
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append(a)  # type: ignore[method-assign]
+
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+
+    # Journal lands FIRST (no runs). The coverage probe and the planned (not-yet-
+    # fired) projection are still outstanding, so NO finalize yet.
+    window._on_finished(pending_id(window, "caljournal:"), "")
+    assert handed == [], "journal-before-coverage must not finalize early"
+
+    # Coverage lands → floor known → projection fires.
+    window._on_finished(pending_id(window, "calcover:"), _coverage_line(oldest))
+    assert "new.timer" in _proj_ids(client), "projection fans out after coverage"
+    # Projection lands → last barrier slot → finalize.
+    proj = (
+        f"       (in UTC): {_utc(pre_slot)} UTC\n"
+        f"       (in UTC): {_utc(post_slot)} UTC\n"
+    )
+    window._on_finished(pending_id(window, "calproj:"), proj)
+
+    assert len(handed) == 1, "finalizes exactly once, after all three land"
+    gap_whens = {e.when for e in handed[0][0] if e.kind == "gap"}
+    assert pre_slot not in gap_whens, "pre-coverage slot silent → clamp used the floor, not epoch"
+    assert post_slot in gap_whens, "post-coverage missed slot is a real gap"
+
+
+# -- R2-4: empty-scope build finalizes an EMPTY calendar ----------------------
+
+
+def test_empty_scope_build_finalizes_empty(qtbot):
+    # TA-P2c: a build with no eligible timers must finalize an EMPTY (not stale)
+    # calendar via the early-finalize branch — the coverage probe + journal land,
+    # no projections fire, and set_events is handed an empty event list. Without
+    # the early finalize the page would hang on a blank calendar.
+    window, client = make_window(qtbot)
+    window._timers = []   # no timers → no projections, no runs to bucket
+    window._last_schedules = {}
+
+    win_start = _usec(2026, 6, 14, 0)
+    now = win_end = _usec(2026, 6, 17, 0)
+
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append((a, k))  # type: ignore[method-assign]
+
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+    # Coverage + journal land; no projection plan was built (no timers).
+    window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
+    window._on_finished(pending_id(window, "caljournal:"), "")
+
+    assert len(handed) == 1, "empty-scope build still finalizes (no hang)"
+    args, kwargs = handed[0]
+    assert args[0] == [], "an empty scope renders an empty (not stale) calendar"
+    assert kwargs.get("degraded") is False, "a clean empty build is not degraded"

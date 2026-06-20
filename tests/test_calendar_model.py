@@ -152,30 +152,93 @@ def test_run_within_tolerance_is_not_a_gap():
     assert compute_gaps(slots, runs, "d.timer", base, base + DAY, GAP_TOLERANCE_USEC) == []
 
 
-# -- F6: now-boundary ownership ----------------------------------------------
+# -- R2-1: now-boundary ownership (the corrected partition) -------------------
 #
-# A slot landing EXACTLY at `now` must be owned by the future side (silent),
-# matching how _on_cal_projection splits projected events with the strict
-# `s > now` test. Before F6 the gap walk used `slot > now` (so slot == now was
-# JUDGED as a possible gap), while the projection split used `s > now` (so the
-# same instant was NOT drawn as projected) — the instant fell through both,
-# which is the off-by-one the QA disposition flagged. After F6 the gap walk
-# skips on `slot >= now`, so slot == now is future-owned on both sides.
+# The R2-1 fix corrects the F6 boundary. The CLOSED partition is: the gap walk
+# owns (-∞, now] (it judges a slot at exactly `now`, skipping only slot > now),
+# and the projection path owns (now, ∞) (it draws `projected` for s > now). So a
+# no-run slot landing exactly at `now` IS a gap — the ±tolerance band absorbs a
+# run that just fired / is about to, so a genuinely-unrun now-instant is a real
+# miss, not a future slot. The PRIOR F6 code skipped `slot >= now`, which
+# EXCLUDED the now-instant from BOTH the gap walk AND projection → it was drawn
+# nowhere (the AT-P2a bug). This replaces the old test that locked that bug
+# (it asserted the now-instant is NOT a gap — the inverted assertion).
 
 
-def test_slot_exactly_at_now_is_not_a_gap():
+def test_no_run_slot_exactly_at_now_is_a_gap():
+    # The corrected boundary (R2-1): a no-run slot at exactly `now` IS judged and,
+    # having no run nearby, IS a gap. The MIDDLE slot ran (splitting the region),
+    # so the now-instant third slot can't merge into the first's region — both the
+    # first slot AND the now-instant slot surface as distinct single-miss gaps.
+    # Before R2-1 (`slot >= now` skip) the third slot was excluded and only the
+    # first gap appeared; now the gap walk owns the closed boundary, so it judges.
     base = 1_781_000_000_000_000
-    # Three slots; the MIDDLE one ran (so it splits the region), and `now` lands
-    # EXACTLY on the THIRD slot. The boundary slot must be future-owned (silent),
-    # so the only gap is the first slot. The ran middle slot guarantees the third
-    # slot can't merge into the first's region — making this discriminating:
-    # before F6 (slot > now) the third slot was JUDGED and, having no run, became
-    # a SECOND standalone gap at base+2*DAY; after F6 (slot >= now) it is skipped.
     slots = [base, base + DAY, base + 2*DAY]
     runs = [run(base + DAY)]                       # middle ran → splits regions
     gaps = compute_gaps(slots, runs, "d.timer", coverage_start=base,
                         now=base + 2*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
-    assert [g.when for g in gaps] == [base]        # boundary slot is NOT a gap
+    # The now-instant slot (base+2*DAY) is judged and, with no run, IS a gap.
+    assert [g.when for g in gaps] == [base, base + 2*DAY]
+
+
+def test_now_instant_slot_with_a_run_is_not_a_gap():
+    # Non-vacuity counterpart: a slot at exactly `now` that DID run (within
+    # tolerance) is NOT a gap — the closed boundary judges it, but the run
+    # satisfies it. Proves "slot==now is a gap" above is about the MISSING run,
+    # not about the boundary blindly flagging every now-instant.
+    base = 1_781_000_000_000_000
+    slots = [base, base + DAY]
+    runs = [run(base), run(base + DAY)]            # both ran, incl. the now-instant
+    gaps = compute_gaps(slots, runs, "d.timer", coverage_start=base,
+                        now=base + DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    assert gaps == []                              # now-instant ran → not a gap
+
+
+# -- R2-2: run consumption (one run can't satisfy two nearby slots) -----------
+#
+# _has_run_near was a stateless `any(abs(t-slot)<=tol)`, so ONE run satisfied
+# EVERY slot within tolerance. On a multi-trigger timer whose two OnCalendar
+# expressions fire less than GAP_TOLERANCE apart, a single run could mask a real
+# miss of the OTHER trigger. R2-2 consumes runs: each run satisfies at most one
+# slot, assigned nearest-unclaimed — so the unserved slot surfaces as a gap.
+
+
+def test_one_run_does_not_satisfy_two_nearby_slots():
+    # Two slots a few minutes apart (well within the 15-min tolerance) and ONE
+    # run sitting nearest the SECOND slot. The run is consumed by the second slot
+    # (nearest-unclaimed), so the FIRST slot has no run left → it IS a gap. Under
+    # the old stateless test BOTH slots would have been satisfied by the one run
+    # and no gap reported — this is the discriminating case R2-2 fixes.
+    base = 1_781_000_000_000_000
+    minute = 60 * 1_000_000
+    slot_a = base
+    slot_b = base + 5 * minute                     # 5 min apart (< 15-min tol)
+    the_run = run(base + 4 * minute)               # 4 min from a, 1 min from b → nearest b
+    gaps = compute_gaps([slot_a, slot_b], [the_run], "d.timer",
+                        coverage_start=base, now=base + DAY,
+                        tolerance_usec=GAP_TOLERANCE_USEC)
+    gap_whens = {g.when for g in gaps}
+    assert slot_a in gap_whens, "the un-served slot is a gap (run consumed by its nearest)"
+    assert slot_b not in gap_whens, "the slot the run is nearest is satisfied"
+
+
+def test_run_consumed_by_nearest_not_first_within_tolerance():
+    # Pins NEAREST-unclaimed over a naive first-within-tolerance greedy. The run
+    # sits closer to slot_b, with slot_a (earlier) ALSO within tolerance. A
+    # left-to-right greedy would let slot_a claim the run (false-gapping slot_b);
+    # nearest-unclaimed gives it to slot_b and gaps slot_a. The assertion below
+    # (slot_a is the gap, not slot_b) is exactly what distinguishes the two
+    # algorithms — a first-within-tolerance impl would FAIL it.
+    base = 1_781_000_000_000_000
+    minute = 60 * 1_000_000
+    slot_a = base                                  # earlier, also within tolerance
+    slot_b = base + 10 * minute
+    the_run = run(base + 9 * minute)               # 9 min from a, 1 min from b
+    gaps = compute_gaps([slot_a, slot_b], [the_run], "d.timer",
+                        coverage_start=base, now=base + DAY,
+                        tolerance_usec=GAP_TOLERANCE_USEC)
+    gap_whens = {g.when for g in gaps}
+    assert gap_whens == {slot_a}, "run goes to its NEAREST slot (b), so a is the gap"
 
 
 # -- F5: _collapse robustness (duplicate slots + split case) ------------------

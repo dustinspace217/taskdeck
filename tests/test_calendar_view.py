@@ -571,6 +571,49 @@ def test_health_strip_reflects_summarize(qtbot):
     assert w._health.failed == 1 and w._health.gaps == 1
 
 
+def test_health_strip_warns_when_degraded(qtbot):
+    # R2-3: set_events(degraded=True) must replace the normal summary with the
+    # "⚠ partial" warning so a partial build is visible in the calendar's own
+    # surface (not just the ephemeral status bar). The clean-looking counts must
+    # NOT win — a degraded build with zero gaps would otherwise read "all clear".
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("day")
+    base = 1_781_000_000_000_000
+    # An otherwise-clean event set: without the degraded flag this would read
+    # "All clear", which is exactly the false reassurance the warning prevents.
+    w.set_events(
+        [CalendarEvent("a.timer", base, "ran", "success")],
+        units=["a.timer"],
+        window_start=base,
+        window_end=base + DAY_USEC,
+        now=base + DAY_USEC,
+        degraded=True,
+    )
+    assert w._degraded is True
+    text = w._health_label.text()
+    assert "partial" in text, "degraded build warns 'partial' in the strip"
+    assert "All clear" not in text, "the warning replaces the reassuring summary"
+
+
+def test_health_strip_not_degraded_by_default(qtbot):
+    # Non-vacuity counterpart: the default (degraded omitted) path does NOT warn.
+    # Proves the warning is gated on the flag, not always present.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("day")
+    base = 1_781_000_000_000_000
+    w.set_events(
+        [CalendarEvent("a.timer", base, "ran", "success")],
+        units=["a.timer"],
+        window_start=base,
+        window_end=base + DAY_USEC,
+        now=base + DAY_USEC,
+    )
+    assert w._degraded is False
+    assert "partial" not in w._health_label.text()
+
+
 def test_month_filter_sets_filter_and_paints(qtbot):
     # Selecting a Month filter must set `_filter` to the chosen kind and trigger a
     # filtered paint that DOESN'T raise (dimming non-matching cells is a colour

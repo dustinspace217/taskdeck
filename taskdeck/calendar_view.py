@@ -178,6 +178,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
         # outward state. Defaults to the all-zero Health so the strip is valid
         # before the first set_events.
         self._health = Health()
+        # Whether the most recent set_events delivered a DEGRADED (partial) build
+        # — some calendar fetch failed host-side (R2-3). The host passes this; the
+        # HEALTH strip prefixes a "⚠ partial" warning when True so the degradation
+        # is visible in the calendar's own surface, not just the ephemeral status
+        # bar. False until the host says otherwise; tests read it as outward state.
+        self._degraded = False
         # Active Month-grid filter, one of None / "fail" / "gap" / "upcoming".
         # None = show everything; a kind dims the non-matching cells so the user
         # can isolate (e.g.) just the failures. Owned here (Month-grid-only state)
@@ -451,21 +457,26 @@ class CalendarView(QWidget):  # type: ignore[misc]
         window_start: int,
         window_end: int,
         now: int,
+        degraded: bool = False,
     ) -> None:
         """Inject the parsed events + the window they cover, then repaint.
 
         Called by the host AFTER it has fetched and parsed (via calendar_model);
         the widget does no I/O. `units` is the row order (timer unit names);
         `events` are placed against `[window_start, window_end]`; `now` positions
-        the ▲ now marker. Storing then update() defers the actual draw to
-        paintEvent — Qt coalesces repaints, so a burst of set_events (10s tick +
-        nav) costs one paint.
+        the ▲ now marker. `degraded` (R2-3) is True when the host's build was
+        partial — some calendar fetch failed — so the HEALTH strip can warn the
+        user the data is incomplete (defaults False so existing callers and the
+        happy path are unaffected). Storing then update() defers the actual draw
+        to paintEvent — Qt coalesces repaints, so a burst of set_events (10s tick
+        + nav) costs one paint.
         """
         self._events = list(events)
         self._units = list(units)
         self._window_start = window_start
         self._window_end = window_end
         self._now = now
+        self._degraded = degraded
         # Roll the window's events into a Health summary via the MODEL (not local
         # counting) so the strip and the plasmoid agree on the numbers, then push
         # it to the strip text. Caching it (self._health) lets tests read the
@@ -558,7 +569,20 @@ class CalendarView(QWidget):  # type: ignore[misc]
         speaks the same language as the cells. A fully clean window reads "all
         clear" rather than a row of zeros, so healthy is restful, not noisy — the
         de-noising the spec asks for, applied to the summary too.
+
+        Degraded (R2-3): when the host's build was partial (some fetch failed) we
+        REPLACE the normal summary with a "⚠ partial" warning. A degraded build
+        suppresses gaps and may be missing runs/projections, so its counts would
+        read falsely reassuring ("all clear" on a window we couldn't fully
+        measure) — the warning is the honest signal, surfaced in the calendar's
+        own strip rather than only the ephemeral status bar that a 10s refresh
+        line can overwrite. Boolean only; naming which layer failed is DEF-CAL-08.
         """
+        if self._degraded:
+            self._health_label.setText(
+                "⚠ partial — some data failed to load (⟳ to retry)"
+            )
+            return
         h = self._health
         if h.failed == 0 and h.gaps == 0:
             # No failures and no missed slots → the restful state. We still note
