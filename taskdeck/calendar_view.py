@@ -85,12 +85,40 @@ def _glyph_color(event: CalendarEvent) -> tuple[str, QColor]:
     return _UNKNOWN
 
 
+# Severity rank for picking the WORST event in a day-cell (Week/Month collapse
+# several events into one glyph). Higher = worse, so a failed run dominates a
+# success in the same day — the de-noising the spec asks for (✘ must never hide
+# behind a tidy ✔). Order: failure > gap (missed slot) > success > upcoming
+# (projected/approx). Anything unrecognized ranks lowest so it never masks a real
+# outcome. Lives next to _glyph_color because both encode the same visual grammar
+# (which signal wins the eye), and Week/Month/matrix all reuse this one ranking.
+_SEVERITY: dict[tuple[str, str], int] = {
+    ("ran", "failure"): 4,
+    ("gap", ""): 3,
+    ("ran", "success"): 2,
+    ("projected", ""): 1,
+    ("approx", ""): 1,
+}
+
+
+def _event_severity(event: CalendarEvent) -> int:
+    """Severity rank of one event for worst-outcome selection (higher = worse).
+
+    Keyed on (kind, result) so a failed run outranks a success. `gap` and the
+    upcoming kinds ('projected'/'approx') carry no result, so they look up under
+    the empty-string result. Unknown shapes fall through to 0 — never let an
+    unrecognized event outrank or mask a real failure.
+    """
+    return _SEVERITY.get((event.kind, event.result), 0)
+
+
 # Layout constants for the painted canvas. These are STARTING values for the
 # visual-iteration pass, not load-bearing contract — the tests pin behavior, not
 # these numbers. Named so the iteration pass has one place to tune.
 _GUTTER_W = 160      # left column width for the timer-unit label
 _ROW_H = 28          # height of one timer row in the canvas
 _TOP_PAD = 24        # space above row 0 for the hour axis / header
+_HEALTH_COL_W = 64   # right-edge column showing one row's worst-of-week summary
 
 
 class CalendarView(QWidget):  # type: ignore[misc]
@@ -343,17 +371,19 @@ class CalendarView(QWidget):  # type: ignore[misc]
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt naming)
         """Dispatch to the active sub-view's painter.
 
-        Only the Day paint exists in this task (Week/Month/matrix come later); an
-        unimplemented mode falls back to Day so the widget always draws something
-        rather than a blank page. A QPainter that escapes paintEvent un-ended can
-        wedge Qt, so each _paint_* opens and ends its own painter.
+        Day and Week are implemented; Month/matrix come in later tasks and fall
+        back to Day so the widget always draws something rather than a blank page.
+        A QPainter that escapes paintEvent un-ended can wedge Qt, so each _paint_*
+        opens and ends its own painter.
         """
-        if self._mode == "day":
+        if self._mode == "week":
+            self._paint_week()
+        elif self._mode == "day":
             self._paint_day()
         else:
-            # Week/Month/matrix not yet implemented — draw the Day grid so the
-            # page is never blank during the staged rollout (Tasks 8-10 replace
-            # this branch with the real paints).
+            # Month/matrix not yet implemented — draw the Day grid so the page is
+            # never blank during the staged rollout (Tasks 9-10 replace this
+            # branch with the real paints).
             self._paint_day()
 
     def _paint_day(self) -> None:
@@ -478,6 +508,191 @@ class CalendarView(QWidget):  # type: ignore[misc]
         painter.setPen(QColor(230, 230, 120))
         painter.drawText(
             QRect(x - 8, top, 16, _TOP_PAD), Qt.AlignmentFlag.AlignCenter, "▲"
+        )
+
+    # -- week paint -----------------------------------------------------------
+    #
+    # The Week view is the same timer-rows-down-the-gutter layout as Day, but the
+    # axis is divided into 7 fixed day-COLUMNS (Day used a continuous time→x
+    # scale). Each (row, day) cell collapses that day's events for the timer into
+    # one "HH glyph" readout — the worst event's hour-of-day plus its glyph —
+    # plus a trailing per-row health column. Over-full cells aggregate via the
+    # model's bucket_cell, exactly like Day, so a busy day never glyph-storms.
+
+    def _day_cell_worst(self, events: list[CalendarEvent]) -> CalendarEvent | None:
+        """Pick the worst-outcome event from one day-cell, or None if empty.
+
+        `events` are a single timer's events that fall on one day-column. The
+        Week cell shows ONE glyph, so a failed run must win over a same-day
+        success (de-noising — the eye should land on ✘, not ✔). Ranking is
+        _event_severity (failure > gap > success > upcoming); ties keep the
+        earliest by list order, which is harmless since the glyph is identical.
+        Returns None for an empty day so the painter draws nothing there (a clean
+        day stays quiet), rather than a placeholder that adds visual noise.
+        """
+        if not events:
+            return None
+        # max() with a key is the smallest correct expression here; events is a
+        # handful of items per cell, so the linear scan is trivially bounded.
+        return max(events, key=_event_severity)
+
+    def _paint_week(self) -> None:
+        """Paint the Week view: timer rows × 7 day-columns + a per-row health col.
+
+        Each cell shows the day's worst event as "HH glyph" (the worst event's
+        UTC hour-of-day, then its glyph) so a single readout captures both WHEN in
+        the day it happened and the WORST thing that happened. A cell whose event
+        count exceeds CELL_DRAW_MAX collapses to an aggregate band via the model's
+        bucket_cell (same rule as Day) instead of a misleading single glyph. The
+        trailing health column shows the row's worst-of-week glyph so a problem
+        timer is spottable without scanning all 7 columns.
+
+        Geometry shares _canvas_top/_TOP_PAD/_ROW_H/_GUTTER_W with row_hit_point
+        and mousePressEvent, so clicks land on the painted rows in Week mode just
+        as in Day. Exact spacing/labels are the post-build visual pass; this proves
+        the data renders across 7 columns and never raises.
+        """
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            top = self._canvas_top()
+            width = self.width()
+            grid_left = _GUTTER_W
+            # Reserve the health column at the right edge; the 7 day-columns fill
+            # the space between the gutter and that column.
+            grid_right = max(grid_left + 1, width - _HEALTH_COL_W - 8)
+            col_w = max(1, (grid_right - grid_left) // 7)
+
+            self._paint_week_header(painter, top, grid_left, col_w)
+
+            for i, unit in enumerate(self._units):
+                row_y = top + _TOP_PAD + i * _ROW_H
+                self._paint_unit_label(painter, unit, row_y)
+                row_events = [e for e in self._events if e.unit == unit]
+                self._paint_week_row(
+                    painter, row_events, row_y, grid_left, col_w, grid_right
+                )
+        finally:
+            # End the painter even if a draw raised — an un-ended QPainter on a
+            # widget can corrupt the backing store on the next paint.
+            painter.end()
+
+    def _paint_week_header(
+        self, painter: QPainter, top: int, grid_left: int, col_w: int
+    ) -> None:
+        """Draw the 7 day-column dividers and date labels across the top.
+
+        Labels come from window_start + N days (UTC, matching the event epochs);
+        kept minimal (a thin tick + "MMM DD") — richer formatting is the visual
+        pass. Drawing the dividers is what makes the 7-column structure legible.
+        """
+        painter.setPen(QColor(90, 90, 90))
+        baseline = top + _TOP_PAD - 4
+        for day in range(7):
+            x = grid_left + day * col_w
+            painter.drawLine(x, top + 2, x, baseline)
+            # Label each column with its date so the week is anchored in time.
+            day_start = datetime.fromtimestamp(
+                (self._window_start + day * _DAY_USEC) / 1_000_000, UTC
+            )
+            painter.setPen(QColor(150, 150, 150))
+            painter.drawText(
+                QRect(x + 2, top, col_w - 4, _TOP_PAD - 4),
+                Qt.AlignmentFlag.AlignVCenter,
+                f"{day_start:%b %d}",
+            )
+            painter.setPen(QColor(90, 90, 90))
+
+    def _paint_week_row(
+        self,
+        painter: QPainter,
+        row_events: list[CalendarEvent],
+        row_y: int,
+        grid_left: int,
+        col_w: int,
+        grid_right: int,
+    ) -> None:
+        """Paint one timer's 7 day-cells plus its trailing health summary.
+
+        Events are bucketed into day-columns by their offset from window_start
+        (integer-divided by one day). Each non-empty cell draws either an "HH
+        glyph" worst-outcome readout or — above CELL_DRAW_MAX events — an
+        aggregate band, the same over-full rule the Day view uses (the count and
+        failure flag both come from the model's bucket_cell). The health column
+        at the right shows the worst event across the whole week for this row.
+        """
+        # Bucket the row's events into 7 day-columns. A day index outside [0, 6]
+        # (an event just outside the window from a prefetch) is dropped here — it
+        # has no column to land in; the health summary still considers all events.
+        columns: list[list[CalendarEvent]] = [[] for _ in range(7)]
+        for ev in row_events:
+            day = (ev.when - self._window_start) // _DAY_USEC
+            if 0 <= day < 7:
+                columns[day].append(ev)
+
+        glyph_font = QFont(self.font())
+        painter.setFont(glyph_font)
+        for day, cell in enumerate(columns):
+            if not cell:
+                continue  # clean/empty day stays quiet — no placeholder noise
+            cell_x = grid_left + day * col_w
+            self._paint_week_cell(painter, cell, cell_x, row_y, col_w)
+
+        # Row-health summary column: the single worst event across the whole week
+        # so a failing timer is spottable at the right edge without reading all 7
+        # cells. Empty week → nothing drawn (the row is silent, which IS healthy).
+        worst = self._day_cell_worst(row_events)
+        if worst is not None:
+            glyph, color = _glyph_color(worst)
+            painter.setPen(color)
+            painter.drawText(
+                QRect(grid_right + 4, row_y, _HEALTH_COL_W - 6, _ROW_H),
+                Qt.AlignmentFlag.AlignVCenter,
+                glyph,
+            )
+
+    def _paint_week_cell(
+        self,
+        painter: QPainter,
+        cell: list[CalendarEvent],
+        cell_x: int,
+        row_y: int,
+        col_w: int,
+    ) -> None:
+        """Draw one (row, day) cell: an "HH glyph" worst readout, or a band.
+
+        Above CELL_DRAW_MAX events the cell collapses to an aggregate band (count
+        + red tint if any failed) via the model's bucket_cell — the view never
+        re-decides what "over-full" means. Otherwise it shows the day's worst
+        event as its UTC hour-of-day then its glyph, so one readout carries both
+        time-of-day and the worst outcome (spec §6's Week cell).
+        """
+        if len(cell) > CELL_DRAW_MAX:
+            count, failures = bucket_cell(cell)
+            band_color = _RAN_FAIL[1] if failures > 0 else QColor(110, 110, 120)
+            painter.fillRect(
+                QRect(cell_x + 1, row_y + 6, col_w - 3, _ROW_H - 12),
+                QColor(band_color.red(), band_color.green(), band_color.blue(), 60),
+            )
+            painter.setPen(band_color)
+            label = f"▦{count}" + (f" {failures}✘" if failures else "")
+            painter.drawText(
+                QRect(cell_x + 3, row_y, col_w - 5, _ROW_H),
+                Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
+            return
+
+        worst = self._day_cell_worst(cell)
+        if worst is None:
+            return
+        glyph, color = _glyph_color(worst)
+        hour = datetime.fromtimestamp(worst.when / 1_000_000, UTC).hour
+        painter.setPen(color)
+        painter.drawText(
+            QRect(cell_x + 3, row_y, col_w - 5, _ROW_H),
+            Qt.AlignmentFlag.AlignVCenter,
+            f"{hour:02d} {glyph}",
         )
 
     # -- interaction ----------------------------------------------------------
