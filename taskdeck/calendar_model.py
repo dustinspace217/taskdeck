@@ -8,9 +8,13 @@ ALL thresholds and time math live here, never in calendar_view.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+
+from taskdeck.models import _classify_calendar
+from taskdeck.systemd_client import ScheduleInfo
 
 
 @dataclass(frozen=True)
@@ -186,3 +190,132 @@ def _collapse(missed: list[int], all_slots: list[int], unit: str) -> list[Calend
         prev = s
     out.append(CalendarEvent(unit=unit, when=start, kind="gap", count=count))
     return out
+
+
+# -- Cadence interval, projection sizing, cell aggregation -------------------
+#
+# These size the projection fan-out and collapse over-full cells. They live in
+# the model (not the view) so the Phase-2 plasmoid shares one set of thresholds
+# (spec / Global Constraints). The interval is derived from the SAME normalized
+# OnCalendar families classify_cadence recognizes — one classifier, two
+# consumers — so the human "daily/weekly/…" label and the numeric interval can
+# never disagree about which shapes are understood.
+
+_DAY_USEC = 86_400_000_000  # µs in a day; the anchor for every calendar interval
+
+# Map a classify_cadence WORD (the output of _classify_calendar) to the timer's
+# firing interval in µs. We reuse the existing classifier rather than re-parse
+# OnCalendar here: it already encodes every shape the app claims to understand,
+# with the raw-fallback contract for the rest. Variable-length cadences use a
+# nominal interval — what matters downstream is sizing --iterations to cover a
+# window, so "monthly" ≈ 30d and "yearly" ≈ 365d are deliberately approximate.
+_CADENCE_INTERVAL_USEC: dict[str, int] = {
+    "minutely": 60 * 1_000_000,
+    "hourly": 3_600 * 1_000_000,
+    "daily": _DAY_USEC,
+    "weekdays": _DAY_USEC,        # fires Mon–Fri; the SHORTEST gap between runs is 1 day
+    "monthly": 30 * _DAY_USEC,    # nominal (months vary) — only used to size projection N
+    "yearly": 365 * _DAY_USEC,    # nominal — same reason
+}
+
+# Per-timer-per-window projection cap. A minutely timer over a month would
+# otherwise demand ~43k --iterations (and emit that many `projected` events);
+# above this the model returns the cap and the view draws ONE aggregate band
+# (spec §4.4). 500 comfortably covers a daily/weekly timer across any view span
+# while bounding the worst case (Power of Ten rule 3: bound the fan-out).
+CELL_DRAW_MAX_PER_WINDOW = 500
+
+# Per-CELL draw threshold: above this many events in a single calendar cell the
+# view stops drawing individual glyphs and renders an aggregate band via
+# bucket_cell. Distinct from the projection cap above — that bounds how many
+# slots we ASK systemd for; this bounds how many we DRAW in one cell. Owned here
+# so the plasmoid uses the same threshold (spec line 122).
+CELL_DRAW_MAX = 12
+
+
+def cadence_interval_usec(info: ScheduleInfo | None) -> int | None:
+    """The timer's firing interval in µs, or None when there is no calendar
+    cadence to project from (monotonic-only, unclassifiable, or no info).
+
+    `info` is the timer's effective triggers (from `systemctl show`, via
+    ScheduleInfo). Calendar expressions are classified with the shared
+    _classify_calendar so the interval matches the human cadence label exactly;
+    monotonic triggers are ignored here — a monotonic timer's next run comes
+    from list-timers as a single `approx` event, never a projected series
+    (spec §4.2), so it has no calendar interval.
+
+    Multi-trigger timers return the SMALLEST interval among their calendar
+    expressions: that is the tightest cadence the window must be sized to cover,
+    so projecting at the smallest interval never under-counts the others.
+    """
+    if info is None:
+        return None
+    intervals: list[int] = []
+    for expr in info.calendar:
+        word = _classify_calendar(expr)
+        interval = _CADENCE_INTERVAL_USEC.get(word)
+        if interval is not None:
+            intervals.append(interval)
+            continue
+        # "N×/day" carries its own count in the word (e.g. "4×/day") — the gap
+        # between fires is one day divided by N. classify_cadence builds this
+        # from a comma hour-list, so the count is always a positive integer.
+        if word.endswith("×/day"):
+            n = int(word[: -len("×/day")])
+            intervals.append(_DAY_USEC // n)
+            continue
+        # "weekly (Mon)" / "weekly (Mon,Wed)": a weekday-qualified calendar. The
+        # nominal interval is one week — sizing the projection to a 7-day cadence
+        # covers any single weekday slot; the exact per-week slot times come from
+        # systemd's own expansion, not from this estimate.
+        if word.startswith("weekly"):
+            intervals.append(7 * _DAY_USEC)
+            continue
+        # Anything else is the raw-fallback case (_classify_calendar returned the
+        # expression unchanged because it didn't recognize the shape) — we have
+        # no honest interval, so it contributes nothing.
+    return min(intervals) if intervals else None
+
+
+def projection_iterations(
+    interval_usec: int | None,
+    span_usec: int,
+    cap: int = CELL_DRAW_MAX_PER_WINDOW,
+) -> int:
+    """How many `--iterations` to request to cover `span_usec` at `interval_usec`,
+    capped at `cap`.
+
+    Returns 0 when `interval_usec` is None — a monotonic-only timer has no
+    calendar cadence to project (its single next run is fetched separately as an
+    `approx` event), so it gets no projection fetch at all.
+
+    N = ceil(span / interval) + 1: the ceil reaches the far edge of the window
+    and the +1 covers the slot that may sit just past it (a partial cell still
+    needs its boundary run). The cap bounds a pathologically fast timer
+    (minutely over a month would want ~43k) so the fetch and the event list stay
+    bounded (Power of Ten rule 3); above the cap the view aggregates (spec §4.4).
+    """
+    if interval_usec is None:
+        return 0
+    # interval is derived from a recognized cadence, so it is always positive;
+    # guard anyway since a future caller could pass a hand-built value.
+    if interval_usec <= 0:
+        return 0
+    n = math.ceil(span_usec / interval_usec) + 1
+    return min(n, cap)
+
+
+def bucket_cell(events: list[CalendarEvent]) -> tuple[int, int]:
+    """Collapse one cell's events into `(count, failures)` for the aggregate
+    band the view draws when a cell exceeds CELL_DRAW_MAX.
+
+    `count` is the total number of events in the cell; `failures` is how many of
+    them are failed runs. The view tints the band red when failures > 0 — that
+    is the whole point of aggregating in the MODEL rather than the view: a
+    summarized cell must never hide a failure behind a tidy count (spec §4.4).
+    A 'ran' event with result 'failure' is the only failing kind; gaps and
+    projections are not run outcomes and so never count as failures here.
+    """
+    count = len(events)
+    failures = sum(1 for e in events if e.kind == "ran" and e.result == "failure")
+    return (count, failures)

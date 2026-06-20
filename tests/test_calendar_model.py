@@ -11,12 +11,17 @@ import json
 from pathlib import Path
 
 from taskdeck.calendar_model import (
+    CELL_DRAW_MAX_PER_WINDOW,
     GAP_TOLERANCE_USEC,
     CalendarEvent,
+    bucket_cell,
+    cadence_interval_usec,
     compute_gaps,
     parse_projection,
     parse_run_journal,
+    projection_iterations,
 )
+from taskdeck.systemd_client import ScheduleInfo
 
 # A real journalctl JOB_RESULT=done JOB_RESULT=failed dump (re-captured live).
 # parse_run_journal reads these JSON lines; tests below pick a service known to
@@ -143,3 +148,66 @@ def test_run_within_tolerance_is_not_a_gap():
     slots = [base]
     runs = [run(base + GAP_TOLERANCE_USEC - 1)]
     assert compute_gaps(slots, runs, "d.timer", base, base + DAY, GAP_TOLERANCE_USEC) == []
+
+
+# -- Task 4: cadence interval, projection-N cap, cell bucketing ---------------
+#
+# These three pure helpers size and aggregate the projection fan-out. The view
+# never owns thresholds (Phase-2 plasmoid reuses this module), so the interval
+# math, the iteration cap, and the cell collapse all live here. The interval is
+# derived from the SAME normalized OnCalendar families classify_cadence already
+# recognizes — one classifier, two consumers (the human label and the interval).
+
+
+def test_cadence_interval_common_shapes():
+    daily = ScheduleInfo(calendar=("*-*-* 00:00:00",), monotonic=())
+    weekly = ScheduleInfo(calendar=("Mon *-*-* 06:00:00",), monotonic=())
+    quarter = ScheduleInfo(calendar=("*-*-* 00,06,12,18:00:00",), monotonic=())
+    mono = ScheduleInfo(calendar=(), monotonic=("OnBootUSec=12h",))
+    assert cadence_interval_usec(daily) == 86_400_000_000
+    assert cadence_interval_usec(weekly) == 7 * 86_400_000_000
+    assert cadence_interval_usec(quarter) == 86_400_000_000 // 4
+    assert cadence_interval_usec(mono) is None      # monotonic → no calendar interval
+
+    # Multi-trigger timer: the docstring (calendar_model.py:247-249) promises the
+    # SMALLEST calendar interval, since projecting at the tightest cadence never
+    # under-counts the others. Daily (86.4e9 µs) + minutely (60e6 µs) → 60e6.
+    # Pins min() so a regression to max()/first-wins is caught.
+    multi = ScheduleInfo(calendar=("*-*-* 00:00:00", "*-*-* *:*:00"), monotonic=())
+    assert cadence_interval_usec(multi) == 60_000_000
+
+    # Raw-fallback: an OnCalendar expression _classify_calendar can't recognize
+    # (bare "HH:MM" comes back unchanged, not as a named cadence) contributes no
+    # honest interval, so a lone unclassifiable trigger yields None.
+    raw_only = ScheduleInfo(calendar=("13:17",), monotonic=())
+    assert cadence_interval_usec(raw_only) is None
+
+    # Empty ScheduleInfo (no triggers at all) → None, same no-cadence-to-project
+    # path as monotonic-only.
+    empty = ScheduleInfo(calendar=(), monotonic=())
+    assert cadence_interval_usec(empty) is None
+
+
+def test_projection_iterations_caps_high_frequency():
+    span = 30 * 86_400_000_000                       # a month
+    assert projection_iterations(86_400_000_000, span) in (31, 32)  # ~daily
+    assert projection_iterations(60_000_000, span) <= CELL_DRAW_MAX_PER_WINDOW  # minutely → capped
+    assert projection_iterations(None, span) == 0   # monotonic → no projection
+
+
+def test_bucket_cell_counts_and_flags_failure():
+    evs = [CalendarEvent("t", 1, "ran", "success"), CalendarEvent("t", 2, "ran", "failure")]
+    assert bucket_cell(evs) == (2, 1)
+    # Pin the load-bearing `kind == "ran"` guard (calendar_model.py:320): only a
+    # 'ran' event is a run outcome, so gaps/projections never count as failures.
+    # Without these, dropping the kind check from the predicate still passes the
+    # assertion above — verified the mutation slips through, so this is what
+    # makes the guard non-vacuous. The 'gap'/'projected' events carry
+    # result='failure' on purpose: the guard must reject them on KIND, not on a
+    # blank result, so a future predicate regression to `result == "failure"`
+    # fails here loudly.
+    non_runs = [
+        CalendarEvent("t", 1, "gap", "failure"),
+        CalendarEvent("t", 2, "projected", "failure"),
+    ]
+    assert bucket_cell(non_runs) == (2, 0)
