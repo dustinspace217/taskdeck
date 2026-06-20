@@ -99,9 +99,10 @@ class CalendarView(QWidget):  # type: ignore[misc]
     Outward contract (consumed by main_window in Task 7):
     - `selected = Signal(str)` — the timer unit a click landed on; the host wires
       it to the same detail-tab fetches the table selection uses.
-    - `rebuild = Signal(int, int)` — (window_start, window_end) after a nav move;
-      the host refetches journal+projection for the new window. Emitting the
-      window (not just "moved") lets the host fetch exactly what's visible.
+    - `rebuild = Signal(qlonglong, qlonglong)` — (window_start, window_end) after
+      a nav move; the host refetches journal+projection for the new window.
+      Emitting the window (not just "moved") lets the host fetch exactly what's
+      visible. qlonglong (not int): the µs epochs exceed Qt's 32-bit `int`.
     - read-only props `mode`, `window_start`, `window_end` — what the host reads
       to scope its fetches.
 

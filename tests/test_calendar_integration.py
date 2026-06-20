@@ -14,10 +14,16 @@ fetch methods. MainWindow is built with auto_refresh=False so construction fires
 zero subprocesses; tests that need the selection-fetch path flip the private
 _auto_refresh flag afterwards (the timer was never started).
 """
+from datetime import UTC, datetime
+
 from PySide6.QtCore import QObject, Signal
 
 from taskdeck.main_window import MainWindow
 from taskdeck.systemd_client import ScheduleInfo, TimerRow
+
+
+def _usec(y, mo, d, h, mi=0, s=0):
+    return int(datetime(y, mo, d, h, mi, s, tzinfo=UTC).timestamp()) * 1_000_000
 
 
 class FakeClient(QObject):
@@ -161,3 +167,56 @@ def test_build_skips_projection_for_disabled_timer(qtbot):
     assert not any(c[2] == "off.timer" for c in projs)   # disabled → no projection
     assert any(c[2] == "new.timer" for c in projs)        # enabled → projection
     assert len([c for c in client.calls if c[0] == "fetch_cal_journal"]) == 1
+
+
+# -- build fan-IN (responses → set_events) ------------------------------------
+
+
+def test_calendar_fan_in_assembles_runs_and_gaps_into_set_events(qtbot):
+    # The fan-IN half: once BOTH the single journal query and the per-timer
+    # projection land, _finalize_calendar must compute gaps and push the
+    # assembled events into the view. This pins the host wiring (journal→ran,
+    # projection→slots, finalize→gap+set_events) that the model unit tests can't
+    # reach — a regression in the dispatch routing or finalize would slip past
+    # the fan-OUT tests above. (Found as a coverage gap in Phase-2 review.)
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("new.timer", "new.service", 999, 0)]
+    window._last_schedules = {"new.timer": ScheduleInfo(("*-*-* 06:00:00",), ())}
+
+    slot1 = _usec(2026, 6, 15, 6)           # has a run → "ran"
+    slot2 = _usec(2026, 6, 16, 6)           # no run, in coverage → "gap"
+    win_start = _usec(2026, 6, 14, 0)
+    win_end = now = _usec(2026, 6, 17, 0)
+
+    # Capture what the view is ultimately handed.
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append((a, k))  # type: ignore[method-assign]
+
+    window._cal_now = now  # finalize clamps gaps to [win_start, _cal_now]
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now  # _build_calendar recomputes now from the clock; pin it
+
+    # Projection: parse_projection reads only the "(in UTC):" lines → two slots.
+    proj = (
+        "  Original form: *-*-* 06:00:00\n"
+        "    Next elapse: Mon 2026-06-15 06:00:00 PDT\n"
+        "       (in UTC): Mon 2026-06-15 06:00:00 UTC\n"
+        "   Iteration #2: Tue 2026-06-16 06:00:00 PDT\n"
+        "       (in UTC): Tue 2026-06-16 06:00:00 UTC\n"
+    )
+    # Journal: one FAILED run at slot1 for the activated service.
+    journal = (
+        '{"USER_UNIT":"new.service","JOB_RESULT":"failed",'
+        f'"__REALTIME_TIMESTAMP":"{slot1}"}}\n'
+    )
+    window._on_finished("calproj:user:new.timer", proj)
+    window._on_finished("caljournal:user", journal)
+
+    assert len(handed) == 1, "set_events fires exactly once, after BOTH land"
+    events = handed[0][0][0]
+    ran = [e for e in events if e.kind == "ran"]
+    gaps = [e for e in events if e.kind == "gap"]
+    assert any(e.unit == "new.timer" and e.result == "failure" and e.when == slot1
+               for e in ran), "journal failure parsed + bucketed to its timer"
+    assert any(e.unit == "new.timer" and e.when == slot2 for e in gaps), \
+        "slot2 had no run within coverage → a gap (projection→slots→finalize wired)"
