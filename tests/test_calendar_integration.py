@@ -675,6 +675,40 @@ def test_complete_build_is_not_degraded(qtbot):
     assert kwargs.get("degraded") is False, "a complete fan-in is NOT degraded"
 
 
+def test_parse_error_in_calendar_handler_marks_degraded_and_releases(qtbot, monkeypatch):
+    # R2-3 / stabilization TA-P3: the OTHER site that sets `_cal_degraded` is the
+    # `_on_finished` parse-error except branch (the belt-and-suspenders sibling of
+    # the tested `_on_failed` path). F2 hardened every real parser to skip bad
+    # lines, so this branch only fires if a FUTURE parser raises — which is exactly
+    # what its comment promises to handle. We simulate that future raise by patching
+    # parse_run_journal to raise, and pin the branch's two contractual effects:
+    # (a) the poisoned id leaves `_cal_pending` so the fan-in barrier can't wedge
+    # forever, and (b) the build is marked degraded so the HEALTH strip warns. A
+    # regression that dropped the `_cal_degraded = True` line in THIS branch (but
+    # not in `_on_failed`) would pass every other test; this is the guard.
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("new.timer", "new.service", 999, 0)]
+    window._last_schedules = {"new.timer": ScheduleInfo(("*-*-* 06:00:00",), ())}
+
+    win_start = _usec(2026, 6, 10, 0)
+    now = win_end = _usec(2026, 6, 17, 0)
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+
+    def boom(*_a, **_k):
+        raise ValueError("simulated future parser raise")
+
+    # parse_run_journal is a module-level import in main_window (called by
+    # _on_cal_journal), so patch it there, not at its definition site.
+    monkeypatch.setattr("taskdeck.main_window.parse_run_journal", boom)
+
+    journal_id = pending_id(window, "caljournal:")
+    window._on_finished(journal_id, '{"USER_UNIT":"new.service","JOB_RESULT":"done"}\n')
+
+    assert window._cal_degraded is True, "a parse error marks the build degraded"
+    assert journal_id not in window._cal_pending, "the poisoned id is released — no wedge"
+
+
 # -- R2-4: out-of-order fan-in (journal before coverage) ----------------------
 
 

@@ -871,10 +871,16 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         """
         if request_id not in self._cal_pending:
             return  # not part of the current build's fan-in (stale or unexpected)
-        self._cal_pending.discard(request_id)
+        # Parse BEFORE releasing the id: if parse_run_journal ever raises (a future
+        # parser — today it skips bad lines), the id must still be in _cal_pending
+        # so the _on_finished except branch can finalize-partial and mark the build
+        # degraded. Discarding first would leave that branch's `in _cal_pending`
+        # guard False, silently skipping the degrade + partial render (a dead
+        # defense caught in Round-2 stabilization). On success the order is moot.
         self._cal_events.extend(
             parse_run_journal(stdout, self._cal_service_to_timer)
         )
+        self._cal_pending.discard(request_id)
         if not self._cal_pending:
             self._finalize_calendar()
 
@@ -914,8 +920,13 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             return  # explicitly stamped as a prior build's response — drop
         if request_id not in self._cal_pending:
             return  # stale/unexpected — not in this build's fan-in
-        unit = self._cal_proj_unit_by_id.pop(request_id, None)
-        self._cal_pending.discard(request_id)
+        # Read (via get, not pop) and leave the id pending until the parse
+        # succeeds: if parse_projection ever raises (a future parser — today it
+        # skips bad lines), the id must still be in _cal_pending so the
+        # _on_finished except branch can finalize-partial and mark degraded.
+        # Removing the id/mapping first would make that branch unreachable (a dead
+        # defense caught in Round-2 stabilization). On success the order is moot.
+        unit = self._cal_proj_unit_by_id.get(request_id)
         if unit is not None:
             slots = parse_projection(stdout)
             # Full slot list (past + future) drives gap detection AND projected-
@@ -924,6 +935,8 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # sibling OnCalendar expression (F4). No `projected` events are built
             # here — finalize owns that, from the deduped union (R2-1).
             self._cal_slots.setdefault(unit, []).extend(slots)
+        self._cal_proj_unit_by_id.pop(request_id, None)
+        self._cal_pending.discard(request_id)
         if not self._cal_pending:
             self._finalize_calendar()
 

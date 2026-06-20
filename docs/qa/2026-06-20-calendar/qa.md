@@ -202,5 +202,34 @@ cleanly on the test-existence evidence.
   under-report / journal → phantom gaps / one projection → scoped under-report); v1 ships
   the boolean.
 
-R2 implemented next (workflow: impl → adversarial verify → bounded fix), then a slim
-stabilization pass (code-reviewer + test-analyzer), then merge `calendar-view` → main.
+R2 implemented in commit 52e06f4 (workflow: impl → adversarial verify), gates green.
+
+## Stabilization pass (commit 52e06f4) — code-reviewer + test-analyzer
+
+Per the follow-up-pass rule (slim to code-reviewer + test-analyzer), an independent
+Opus pair reviewed the R2 diff. **Both returned SHIP** — no P0/P1/P2 regressions; the
+projected-emission move, the run-consumption rewrite, the None-sentinel suppression,
+and the degraded flag all confirmed correct and the R2 tests confirmed non-vacuous
+(including the discriminator that rejects a first-within-tolerance greedy).
+
+One P3 finding from test-analyzer was acted on rather than deferred: the `_cal_degraded`
+assignment in the `_on_finished` **parse-error** except branch was unpinned (its sibling
+`_on_failed` path is tested). Writing that test (`test_parse_error_in_calendar_handler_
+marks_degraded_and_releases`) **revealed a real latent defect both the R2 verifier and
+both stabilization reviewers missed by reasoning rather than executing:** the journal and
+projection handlers discarded the id from `_cal_pending` *before* the parse, so a parse
+error left the except branch's `request_id in _cal_pending` guard False — the documented
+finalize-partial + degraded behavior was dead code (the branch's comment promised behavior
+the code couldn't deliver). The critical no-wedge property still held via the early
+discard, so the live impact was nil (P3 — and the parsers are hardened not to raise today),
+but the defense was a lie. **Fixed** (commit pending): both handlers now discard *after*
+the parse, so a parse error leaves the id pending and the except branch finalize-partials
++ marks degraded as documented. Gates green: 235 hermetic + 5 realsystemd, ruff, mypy.
+
+Remaining P3 observations (non-blocking, no action): the dead-in-production `generation`
+kwarg on `_on_cal_projection` (documented belt-and-suspenders; the F3 test exercises the
+real path without it); the by-design double-iteration of `_cal_slots` in `_finalize_calendar`.
+
+DEF register additions filed this round: DEF-CAL-05 (probe unparseable-vs-empty), DEF-CAL-06
+(parse-skip counter), DEF-CAL-07 (F4 multiplies DEF-CAL-01/02), DEF-CAL-08 (per-layer degraded
+qualifier). Merge `calendar-view` → main next.
