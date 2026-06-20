@@ -10,7 +10,13 @@ only fixture is a captured `journalctl -o json` dump.
 import json
 from pathlib import Path
 
-from taskdeck.calendar_model import CalendarEvent, parse_projection, parse_run_journal
+from taskdeck.calendar_model import (
+    GAP_TOLERANCE_USEC,
+    CalendarEvent,
+    compute_gaps,
+    parse_projection,
+    parse_run_journal,
+)
 
 # A real journalctl JOB_RESULT=done JOB_RESULT=failed dump (re-captured live).
 # parse_run_journal reads these JSON lines; tests below pick a service known to
@@ -77,3 +83,63 @@ def test_parse_run_journal_maps_failed_and_bytes_message():
     out = parse_run_journal(line, {"x.service": "x.timer"})
     assert out == [CalendarEvent(
         unit="x.timer", when=1781787600000000, kind="ran", result="failure")]
+
+
+# -- Task 3: compute_gaps ----------------------------------------------------
+#
+# A "gap" is a scheduled slot (from parse_projection over a PAST --base-time)
+# that has no actual run nearby. The contract is exact, not heuristic: only
+# slots inside the journal's coverage window [coverage_start, now] are judged —
+# outside it there is simply no run data, which the view renders as "—" (no
+# data), never as a miss. Contiguous misses collapse into one event carrying a
+# count so a long outage reads as one region, not N separate glyphs.
+
+DAY = 86_400_000_000  # µs in a day
+
+
+def run(t):
+    """Build a successful 'ran' event at µs-epoch `t` (test helper)."""
+    return CalendarEvent(unit="d.timer", when=t, kind="ran", result="success")
+
+
+def test_gap_when_a_scheduled_slot_has_no_run():
+    base = 1_781_000_000_000_000
+    slots = [base, base + DAY, base + 2*DAY]          # three daily slots
+    runs = [run(base), run(base + 2*DAY)]             # middle one missing
+    gaps = compute_gaps(slots, runs, "d.timer", coverage_start=base,
+                        now=base + 3*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    assert len(gaps) == 1
+    assert gaps[0].kind == "gap" and gaps[0].when == base + DAY and gaps[0].count == 1
+
+
+def test_contiguous_misses_collapse_to_one_region_with_count():
+    base = 1_781_000_000_000_000
+    slots = [base + k*DAY for k in range(5)]
+    runs = [run(base), run(base + 4*DAY)]             # 3 in a row missing
+    gaps = compute_gaps(slots, runs, "d.timer", coverage_start=base,
+                        now=base + 5*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    assert len(gaps) == 1 and gaps[0].count == 3 and gaps[0].when == base + DAY
+
+
+def test_no_gap_outside_journal_coverage():
+    # Slots before coverage_start are "no data", never a gap.
+    base = 1_781_000_000_000_000
+    slots = [base, base + DAY, base + 2*DAY]
+    gaps = compute_gaps(slots, [], "d.timer", coverage_start=base + DAY,
+                        now=base + 3*DAY, tolerance_usec=GAP_TOLERANCE_USEC)
+    assert all(g.when >= base + DAY for g in gaps)    # the pre-coverage slot is silent
+
+
+def test_no_gap_in_the_future():
+    base = 1_781_000_000_000_000
+    slots = [base, base + DAY]
+    gaps = compute_gaps(slots, [run(base)], "d.timer", coverage_start=base,
+                        now=base + DAY // 2, tolerance_usec=GAP_TOLERANCE_USEC)
+    assert gaps == []                                 # base+DAY is in the future
+
+
+def test_run_within_tolerance_is_not_a_gap():
+    base = 1_781_000_000_000_000
+    slots = [base]
+    runs = [run(base + GAP_TOLERANCE_USEC - 1)]
+    assert compute_gaps(slots, runs, "d.timer", base, base + DAY, GAP_TOLERANCE_USEC) == []

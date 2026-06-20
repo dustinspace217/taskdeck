@@ -105,3 +105,84 @@ def parse_run_journal(text: str, service_to_timer: dict[str, str]) -> list[Calen
             continue  # no usable timestamp → can't place it on the calendar
         out.append(CalendarEvent(unit=timer, when=when, kind="ran", result=result))
     return out
+
+
+# A scheduled run that lands within this of a slot counts as "ran on time".
+# Default covers normal timer jitter / AccuracySec (systemd defaults to 1min
+# accuracy and adds randomized delay); 15min is a generous band so a slightly
+# late real run is never mislabeled a miss. Lives in the model, not the view, so
+# the Phase-2 plasmoid shares the same threshold (spec / Global Constraints).
+GAP_TOLERANCE_USEC = 15 * 60 * 1_000_000  # 15 minutes
+
+
+def compute_gaps(
+    slots: list[int],
+    runs: list[CalendarEvent],
+    unit: str,
+    coverage_start: int,
+    now: int,
+    tolerance_usec: int,
+) -> list[CalendarEvent]:
+    """Exact gap detection: a scheduled slot with no actual run nearby is a
+    missed run.
+
+    `slots` are the exact scheduled µs instants for this timer (from
+    parse_projection over a PAST --base-time); `runs` are that timer's 'ran'
+    events. Only slots in [coverage_start, now] are judged — outside the
+    journal's coverage there is no run data, so 'no run' means 'no data', NOT a
+    gap (spec §4.3); the view renders those as '—'. Future slots (> now) are
+    likewise silent — a run can't have happened yet. Contiguous misses collapse
+    into one event carrying a count so a long outage reads as one region.
+    """
+    # Pre-sort the run times once so _has_run_near scans a known order; runs
+    # arrive unsorted (one per journal record, in log order).
+    run_times = sorted(r.when for r in runs)
+    missed: list[int] = []
+    for slot in sorted(slots):
+        if slot < coverage_start or slot > now:
+            continue  # unjudgeable (before coverage = no data) or still future
+        if not _has_run_near(run_times, slot, tolerance_usec):
+            missed.append(slot)
+    # Collapse runs of missed slots that were ADJACENT in the schedule into one
+    # gap region. Adjacency is decided by position in the sorted slot list (see
+    # _collapse), not by arithmetic on the timestamps — that stays correct for
+    # irregular cadences (e.g. weekday-only) where a fixed interval wouldn't.
+    return _collapse(missed, sorted(slots), unit)
+
+
+def _has_run_near(run_times: list[int], slot: int, tol: int) -> bool:
+    """True if any run in `run_times` falls within ±`tol` of `slot`.
+
+    Linear scan is deliberate: a timer has at most tens of runs in a visible
+    window, so a bisect would add complexity for no measurable gain. `run_times`
+    is pre-sorted by the caller, but order is irrelevant to this `any()` check.
+    """
+    return any(abs(t - slot) <= tol for t in run_times)
+
+
+def _collapse(missed: list[int], all_slots: list[int], unit: str) -> list[CalendarEvent]:
+    """Fold a sorted list of missed slot instants into 'gap' events, merging
+    schedule-adjacent misses into one region whose `count` is the run length.
+
+    `all_slots` is the full sorted schedule; a missed slot is "adjacent" to the
+    previous one when their indices in `all_slots` differ by exactly 1 — i.e.
+    no kept (ran) slot sits between them. Using slot-position rather than a time
+    delta keeps the merge correct for non-uniform cadences.
+    """
+    if not missed:
+        return []
+    # Position of each slot in the schedule, so adjacency is an index check.
+    idx = {s: i for i, s in enumerate(all_slots)}
+    out: list[CalendarEvent] = []
+    start = prev = missed[0]
+    count = 1
+    for s in missed[1:]:
+        if idx[s] == idx[prev] + 1:        # next slot in the schedule → same region
+            count += 1
+        else:
+            out.append(CalendarEvent(unit=unit, when=start, kind="gap", count=count))
+            start = s
+            count = 1
+        prev = s
+    out.append(CalendarEvent(unit=unit, when=start, kind="gap", count=count))
+    return out
