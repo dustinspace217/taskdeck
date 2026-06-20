@@ -579,19 +579,25 @@ class CalendarView(QWidget):  # type: ignore[misc]
 
         The chrome is the nav row plus the HEALTH strip plus the (sometimes
         hidden) filter strip, all laid out by the QVBoxLayout above the final
-        stretch. We take the maximum bottom across every non-stretch item so the
-        canvas always starts directly under whatever chrome is currently showing
-        — when the filter strip is hidden the layout collapses it to zero height
-        and it drops out of the max, so Day/Week/matrix canvases sit higher than
-        the Month grid's. Measuring (not a magic constant) keeps row_hit_point and
-        every paint sharing one coordinate space whatever the platform font height
-        — a click can't desync from what's drawn even as strips appear/disappear.
+        stretch. We take the maximum bottom across every VISIBLE non-stretch item
+        so the canvas starts directly under whatever chrome is currently showing —
+        on Day/Week/matrix the filter strip is hidden, so the canvas sits higher
+        than the Month grid's. Measuring (not a magic constant) keeps row_hit_point
+        and every paint sharing one coordinate space whatever the platform font
+        height — a click can't desync from what's drawn even as strips appear.
+
+        A HIDDEN widget must be SKIPPED by visibility, NOT trusted to collapse:
+        Qt keeps a hidden widget's last geometry, so the hidden filter strip
+        reports a stale large bottom (~479px, probed 2026-06-20) that — if counted
+        — pushed the Day/Week/matrix canvas hundreds of pixels down, leaving the
+        grid stranded near the bottom edge. The Month grid escaped only because it
+        derives its own bottom from self.height(); Week/matrix read this value
+        directly, so the stale-geometry bug stranded exactly those two views.
 
         Why max-over-items rather than reading item 0: with three strips a fixed
         index would silently ignore the others, putting the canvas UNDER the
         chrome and corrupting every hit-test. The stretch item carries no widget,
-        so we skip items whose geometry is the leftover stretch (it has no
-        sensible bottom for the canvas).
+        so we skip it too (no sensible bottom for the canvas).
         """
         layout = self.layout()
         if layout is None or layout.count() == 0:
@@ -602,9 +608,14 @@ class CalendarView(QWidget):  # type: ignore[misc]
             item = layout.itemAt(i)
             if item is None:
                 continue
+            widget = item.widget()
             # The final addStretch item has no widget and no layout; skip it so
             # the stretch's full-height geometry never pushes the canvas down.
-            if item.widget() is None and item.layout() is None:
+            if widget is None and item.layout() is None:
+                continue
+            # A hidden strip keeps a STALE geometry the layout does NOT collapse
+            # — skip by visibility, or the hidden filter strip strands the canvas.
+            if widget is not None and not widget.isVisible():
                 continue
             # int() pins the type: PySide6's stubs type QRect.bottom() as Any,
             # which mypy --strict rejects; it is always an int pixel coordinate.
