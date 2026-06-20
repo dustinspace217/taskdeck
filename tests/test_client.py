@@ -105,6 +105,36 @@ def test_fetch_calendar_emits_expected_id_and_flag_stop_argv(qtbot):
     assert argv_lines == ["calendar", "--iterations=5", "--", "*-*-* 03:50:00"]
 
 
+def test_fetch_cal_projection_id_and_argv(qtbot):
+    # Calendar view's future-run source: an exact-instant projection from a past
+    # base time. Pins the "calproj:{scope}:{unit}" id (NEVER "calendar:" — that
+    # kind is taken by the Schedule-tab elapse preview, and _dispatch_finished
+    # routes only on the kind before the first ':') AND the exact argv, including
+    # the "--" flag-stop before the expression. fake_echo_argv dumps the argv.
+    client = SystemdClient(analyze=str(FAKEBIN / "fake_echo_argv"))
+    with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
+        client.fetch_cal_projection("user", "a.timer", "*-*-* 06:00:00", 1781000000, 8)
+    rid, stdout = blocker.args
+    assert rid == "calproj:user:a.timer"
+    assert stdout.splitlines() == [
+        "calendar", "--base-time=@1781000000", "--iterations=8", "--", "*-*-* 06:00:00",
+    ]
+
+
+def test_fetch_cal_journal_id_and_argv(qtbot):
+    # Calendar view's past-runs source: ONE journalctl query covering all units
+    # in the window, filtered to completion outcomes. Pins the "caljournal:{scope}"
+    # id and that both JOB_RESULT filters + the since/until window land in argv.
+    client = SystemdClient(journalctl=str(FAKEBIN / "fake_echo_argv"))
+    with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
+        client.fetch_cal_journal("user", 1781000000, 1781086400)
+    rid, stdout = blocker.args
+    assert rid == "caljournal:user"
+    argv = stdout.splitlines()
+    assert "JOB_RESULT=done" in argv and "JOB_RESULT=failed" in argv
+    assert "--since=@1781000000" in argv and "--until=@1781086400" in argv
+
+
 def test_list_failed_services_emits_expected_id_and_argv(qtbot):
     # The monitor's poll (Task 2). --state=failed narrows server-side so the
     # diff sees only failures. Pins both the request id and the exact argv.

@@ -1,0 +1,16 @@
+Normalized form: *-*-* 06:00:00
+    Next elapse: Sat 2026-06-20 06:00:00 PDT
+       (in UTC): Sat 2026-06-20 13:00:00 UTC
+       From now: 2h 50min left
+   Iteration #2: Sun 2026-06-21 06:00:00 PDT
+       (in UTC): Sun 2026-06-21 13:00:00 UTC
+       From now: 1 day 2h left
+   Iteration #3: Mon 2026-06-22 06:00:00 PDT
+       (in UTC): Mon 2026-06-22 13:00:00 UTC
+       From now: 2 days left
+   Iteration #4: Tue 2026-06-23 06:00:00 PDT
+       (in UTC): Tue 2026-06-23 13:00:00 UTC
+       From now: 3 days left
+   Iteration #5: Wed 2026-06-24 06:00:00 PDT
+       (in UTC): Wed 2026-06-24 13:00:00 UTC
+       From now: 4 days left

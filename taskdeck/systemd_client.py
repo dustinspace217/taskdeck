@@ -612,5 +612,55 @@ class SystemdClient(QObject):  # type: ignore[misc]
             [self._analyze, "calendar", "--iterations=5", "--", expr],
         )
 
+    def fetch_cal_projection(
+        self, scope: str, unit: str, expr: str, base_epoch: int, iterations: int
+    ) -> bool:
+        """Future-run projection for ONE calendar timer, from a chosen base time.
+
+        Distinct from fetch_calendar (the Schedule-tab elapse preview): this
+        carries the timer unit in its id so the calendar build can fan-in many
+        timers' projections, and it pins the base time so projecting from a PAST
+        epoch yields the exact scheduled slots compute_gaps needs (a missed slot
+        is a scheduled instant with no run nearby). The id kind is "calproj" —
+        NEVER "calendar:", because _dispatch_finished routes on the kind before
+        the first ':' and "calendar" is already owned by fetch_calendar.
+
+        expr is a NORMALIZED OnCalendar form from `systemctl show`, so it is
+        well-formed; "--" stops flag parsing regardless (mirrors fetch_calendar's
+        belt-and-suspenders, harmless and survives an unnormalized future caller).
+        """
+        return self.request(
+            f"calproj:{scope}:{unit}",
+            [
+                self._analyze, "calendar",
+                f"--base-time=@{base_epoch}", f"--iterations={iterations}",
+                "--", expr,
+            ],
+        )
+
+    def fetch_cal_journal(self, scope: str, since_epoch: int, until_epoch: int) -> bool:
+        """ONE journal query for all timer-run outcomes in [since, until].
+
+        A single subprocess feeds run-outcome events for EVERY unit in the
+        window (parse_run_journal buckets them back to their timers in pure
+        code) — querying per-unit would spawn one process per timer. The two
+        JOB_RESULT filters keep only completed-job records (done=success,
+        failed=failure); the since/until are @-prefixed epochs matching the
+        calendar window the user is viewing.
+
+        15s timeout, like fetch_log: a reverse-seek across a multi-GB rotated
+        journal routinely exceeds the 5s default, and killing it mid-build would
+        blank the calendar's past-runs layer (QA AT-F10, same rationale).
+        """
+        return self.request(
+            f"caljournal:{scope}",
+            [
+                self._journalctl, *self._scope_args(scope),
+                "-o", "json", f"--since=@{since_epoch}", f"--until=@{until_epoch}",
+                "JOB_RESULT=done", "JOB_RESULT=failed", "--no-pager",
+            ],
+            timeout_ms=15_000,
+        )
+
     def run_action(self, argv: list[str], unit: str) -> bool:
         return self.request(f"action:{unit}", argv)
