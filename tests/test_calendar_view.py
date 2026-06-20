@@ -152,7 +152,7 @@ def test_week_view_renders_seven_days(qtbot):
     assert w.mode == "week"
 
 
-def test_week_cell_with_failure_and_gap_paints(qtbot):
+def test_week_cell_failure_wins_over_same_day_gap(qtbot):
     # One day-cell holding BOTH a failed run and a missed slot (gap) must paint —
     # the cell shows the WORST outcome, and the sibling gap on the same day must
     # not crash the per-cell summary. This is the de-noising case: a failure in a
@@ -641,3 +641,32 @@ def test_set_mode_away_from_month_clears_filter(qtbot):
     assert w._filter == "fail"
     w.set_mode("day")
     assert w._filter is None
+
+
+def test_cell_matches_filter_predicate(qtbot):
+    # Pins the Month filter's matching LOGIC (which cells stay bright per filter),
+    # which the paint-only tests don't reach — inverting any branch of
+    # _cell_matches_filter must fail here (Phase-3 review found the predicate
+    # untested: the dimming is pixel-level, but the match logic is real).
+    w = CalendarView()
+    qtbot.addWidget(w)
+    fail = CalendarEvent("t.timer", 1, "ran", "failure")
+    ok = CalendarEvent("t.timer", 1, "ran", "success")
+    gap = CalendarEvent("t.timer", 1, "gap")
+    proj = CalendarEvent("t.timer", 1, "projected")
+    approx = CalendarEvent("t.timer", 1, "approx")
+
+    w.set_filter(None)  # All → nothing dims, even an empty cell
+    assert all(w._cell_matches_filter(e) for e in (fail, ok, gap, proj, approx, None))
+
+    w.set_filter("fail")  # only the failed run stays bright
+    assert w._cell_matches_filter(fail)
+    assert not any(w._cell_matches_filter(e) for e in (ok, gap, proj, approx, None))
+
+    w.set_filter("gap")  # only the gap
+    assert w._cell_matches_filter(gap)
+    assert not any(w._cell_matches_filter(e) for e in (fail, ok, proj, approx, None))
+
+    w.set_filter("upcoming")  # projected OR approx
+    assert w._cell_matches_filter(proj) and w._cell_matches_filter(approx)
+    assert not any(w._cell_matches_filter(e) for e in (fail, ok, gap, None))
