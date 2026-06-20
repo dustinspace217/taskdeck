@@ -210,6 +210,21 @@ class CalendarView(QWidget):  # type: ignore[misc]
             row.addWidget(btn)
         self._mode_buttons["day"].setChecked(True)
 
+        # Grid⇄matrix sub-toggle — a MONTH-only affordance, NOT a fourth top-level
+        # mode button (spec §5: the matrix is reached only from within Month, so
+        # the host's view_box keeps just Day/Week/Month). Checkable: unchecked =
+        # the calendar grid (mode "month"), checked = the by-timer matrix (mode
+        # "matrix"); both share the same 30-day window so the toggle never
+        # refetches, it only swaps which _paint_* runs. Hidden in Day/Week via
+        # _sync_matrix_toggle, shown in the Month family. We keep a reference so
+        # set_mode can flip its checked state when the mode changes programmatically
+        # (e.g. clicking Month after being in matrix should land on the grid).
+        self._matrix_toggle = QPushButton("Matrix")
+        self._matrix_toggle.setCheckable(True)
+        self._matrix_toggle.setVisible(False)  # Day is the default mode → hidden
+        self._matrix_toggle.toggled.connect(self._on_matrix_toggled)
+        row.addWidget(self._matrix_toggle)
+
         row.addSpacing(16)
         self._prev_btn = QPushButton("◂")
         self._prev_btn.clicked.connect(self.nav_prev)
@@ -262,10 +277,43 @@ class CalendarView(QWidget):  # type: ignore[misc]
         if mode not in _MODE_SPAN_USEC:
             return  # unrecognized — keep the current mode, never raise
         self._mode = mode
-        btn = self._mode_buttons.get(mode)
+        # The top-level toggle only has Day/Week/Month buttons; "matrix" is a
+        # Month sub-mode, so it checks the MONTH button (the user is still "in
+        # Month", just viewing the matrix). .get() returns None for "matrix".
+        btn = self._mode_buttons.get("month" if mode == "matrix" else mode)
         if btn is not None and not btn.isChecked():
             btn.setChecked(True)
+        self._sync_matrix_toggle()
         self.update()
+
+    def _sync_matrix_toggle(self) -> None:
+        """Show/hide and check the grid⇄matrix sub-toggle to match the mode.
+
+        Visible only in the Month family (month or matrix) — a Day/Week mode hides
+        it so the sub-toggle never implies a fourth top-level view. Its CHECKED
+        state mirrors the mode (matrix→checked, month→unchecked) so a programmatic
+        set_mode keeps the button in sync with a click-driven one. We block its
+        signals while syncing: setChecked would otherwise re-enter set_mode via
+        _on_matrix_toggled and double-fire the repaint (harmless but wasteful).
+        """
+        in_month_family = self._mode in ("month", "matrix")
+        self._matrix_toggle.setVisible(in_month_family)
+        want_checked = self._mode == "matrix"
+        if self._matrix_toggle.isChecked() != want_checked:
+            self._matrix_toggle.blockSignals(True)
+            self._matrix_toggle.setChecked(want_checked)
+            self._matrix_toggle.blockSignals(False)
+
+    def _on_matrix_toggled(self, checked: bool) -> None:
+        """Switch between the Month grid and the by-timer matrix on toggle.
+
+        `checked` is the new button state (True=matrix, False=grid). Both are the
+        Month window, so this only swaps the mode (and thus which _paint_* runs) —
+        no nav, no rebuild. Routed through set_mode so visibility/checked stay in
+        one place; set_mode's own _sync_matrix_toggle is a no-op here since the
+        button is already in the wanted state.
+        """
+        self.set_mode("matrix" if checked else "month")
 
     def set_events(
         self,
@@ -387,10 +435,10 @@ class CalendarView(QWidget):  # type: ignore[misc]
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt naming)
         """Dispatch to the active sub-view's painter.
 
-        Day, Week and Month are implemented; matrix comes in Task 10 and falls
-        back to Day so the widget always draws something rather than a blank page.
-        A QPainter that escapes paintEvent un-ended can wedge Qt, so each _paint_*
-        opens and ends its own painter.
+        Day, Week, Month and the Month by-timer matrix are all implemented; any
+        other (future) mode falls back to Day so the widget always draws something
+        rather than a blank page. A QPainter that escapes paintEvent un-ended can
+        wedge Qt, so each _paint_* opens and ends its own painter.
         """
         if self._mode == "week":
             self._paint_week()
@@ -398,10 +446,10 @@ class CalendarView(QWidget):  # type: ignore[misc]
             self._paint_day()
         elif self._mode == "month":
             self._paint_month()
+        elif self._mode == "matrix":
+            self._paint_matrix()
         else:
-            # 'matrix' not yet implemented — draw the Day grid so the page is
-            # never blank during the staged rollout (Task 10 replaces this branch
-            # with the by-timer matrix paint).
+            # Unknown future mode — draw the Day grid so the page is never blank.
             self._paint_day()
 
     def _paint_day(self) -> None:
@@ -956,6 +1004,207 @@ class CalendarView(QWidget):  # type: ignore[misc]
             )
             painter.drawRect(row_rect)
         painter.setPen(pen)
+
+    # -- matrix paint ---------------------------------------------------------
+    #
+    # The by-timer matrix is the Month window seen the OTHER way round from the
+    # calendar grid: instead of one cell per day summarising all timers, it lays
+    # timers down the gutter (like Day/Week) and the visible month's days across
+    # the columns, so each row is one timer's outcome streak. Its diagnostic point
+    # (spec §5) is reading a SINGLE timer's history at a glance — a lone ✘ (a
+    # failed run) sits in a different column than a lone ⛌ (a missed slot), so
+    # "did it fail or just not run?" is answerable per timer. A high-volume timer
+    # whose busiest day exceeds CELL_DRAW_MAX collapses its whole row to one solid
+    # ▦ band (the aggregate timer), reusing the model's bucket_cell rather than
+    # glyph-storming — the same over-full rule Day and Week apply.
+
+    def _matrix_day_dates(self) -> list[date]:
+        """The visible month's days as a flat, ordered list of UTC dates.
+
+        Built by flattening _month_weeks and keeping only IN-MONTH days, so the
+        matrix columns are exactly the calendar month's days (28–31 of them),
+        never the adjacent-month padding the grid shows. Shared by the row-cell
+        builder and the paint so a column always means the same day in both.
+        Bounded: at most 31 days. Ordering is calendar order (1st → last).
+        """
+        anchor = self._month_anchor()
+        days: list[date] = []
+        for week in self._month_weeks():
+            for day in week:
+                if day.month == anchor.month:
+                    days.append(day)
+        return days
+
+    def _matrix_row_cells(self, unit: str) -> list[str]:
+        """One timer's matrix row as a list of per-day cell readouts.
+
+        The TESTABLE seam for the matrix (mirrors _day_cell_summary for Month):
+        for `unit`, returns one string per day-column of the visible month —
+        the day's worst-outcome glyph (✘ failure, ⛌ gap, ✔ success, ⏲/◇ upcoming)
+        or "" for a quiet day. This is what makes a failure row and a gap row
+        DISTINGUISHABLE without inspecting pixels: the failure lands a ✘ in its
+        column, the gap a ⛌ in its, and clean days stay empty.
+
+        Aggregate exception: if the timer's busiest day exceeds CELL_DRAW_MAX
+        events, the whole row collapses to a SINGLE "▦ <count>" band cell (red-
+        flagged with the failure count) — the aggregate timer reads as one band,
+        not a glyph storm. The over-full decision and the (count, failures) math
+        both come from the model's bucket_cell, so the view never re-decides what
+        "over-full" means (same rule as Day/Week).
+        """
+        days = self._matrix_day_dates()
+        # Bucket this timer's events by UTC date once, so each day-column is a
+        # dict lookup rather than a re-scan of the whole event list per column.
+        by_date: dict[date, list[CalendarEvent]] = {}
+        for ev in self._events:
+            if ev.unit != unit:
+                continue
+            d = datetime.fromtimestamp(ev.when / 1_000_000, UTC).date()
+            by_date.setdefault(d, []).append(ev)
+
+        # Aggregate detection: a row is a "band" when ANY single day overflows
+        # CELL_DRAW_MAX. We collapse the WHOLE row (all the unit's events) into one
+        # band cell — the matrix's aggregate-timer band is per-row, not per-cell,
+        # so a busy timer reads as one solid streak. bucket_cell gives the total
+        # and the failure count for the red flag.
+        busiest = max((len(v) for v in by_date.values()), default=0)
+        if busiest > CELL_DRAW_MAX:
+            row_events = [e for e in self._events if e.unit == unit]
+            count, failures = bucket_cell(row_events)
+            return [f"▦ {count}" + (f" ({failures}✘)" if failures else "")]
+
+        # Normal row: one worst-outcome glyph per day-column, "" for quiet days.
+        cells: list[str] = []
+        for day in days:
+            worst = self._day_cell_worst(by_date.get(day, []))
+            if worst is None:
+                cells.append("")  # quiet day — no glyph (the de-noising goal)
+                continue
+            glyph, _color = _glyph_color(worst)
+            cells.append(glyph)
+        return cells
+
+    def _paint_matrix(self) -> None:
+        """Paint the by-timer matrix: timer rows × the visible month's day-columns.
+
+        Each row is one timer; each column one in-month day; each cell the day's
+        worst-outcome glyph (via _matrix_row_cells, the same severity rule the
+        other views use). An aggregate timer's row is a single ▦ band drawn across
+        the full width instead of per-day glyphs. Geometry shares
+        _canvas_top/_TOP_PAD/_ROW_H/_GUTTER_W with row_hit_point and
+        mousePressEvent, so a click in matrix mode lands on the painted row exactly
+        like Day/Week. Exact spacing/labels are the post-build visual pass; this
+        proves the data renders and never raises.
+        """
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            top = self._canvas_top()
+            width = self.width()
+            grid_left = _GUTTER_W
+            grid_right = max(grid_left + 1, width - 8)
+            days = self._matrix_day_dates()
+            n_cols = max(1, len(days))
+            col_w = max(1, (grid_right - grid_left) // n_cols)
+
+            self._paint_matrix_header(painter, top, grid_left, col_w, days)
+
+            glyph_font = QFont(self.font())
+            painter.setFont(glyph_font)
+            for i, unit in enumerate(self._units):
+                row_y = top + _TOP_PAD + i * _ROW_H
+                self._paint_unit_label(painter, unit, row_y)
+                self._paint_matrix_row(
+                    painter, unit, row_y, grid_left, col_w, grid_right
+                )
+        finally:
+            # End the painter even if a draw raised — an un-ended QPainter on a
+            # widget can corrupt the backing store on the next paint.
+            painter.end()
+
+    def _paint_matrix_header(
+        self,
+        painter: QPainter,
+        top: int,
+        grid_left: int,
+        col_w: int,
+        days: list[date],
+    ) -> None:
+        """Draw a thin day-number tick for each matrix column.
+
+        Labels are the day-of-month numbers (1..N) across the top so a row's
+        outcome can be read against a date. Kept minimal (a number per column) —
+        denser axis styling is the visual pass; its presence anchors the columns.
+        """
+        painter.setPen(QColor(150, 150, 150))
+        for col, day in enumerate(days):
+            x = grid_left + col * col_w
+            painter.drawText(
+                QRect(x + 1, top, col_w - 2, _TOP_PAD - 2),
+                Qt.AlignmentFlag.AlignVCenter,
+                str(day.day),
+            )
+
+    def _paint_matrix_row(
+        self,
+        painter: QPainter,
+        unit: str,
+        row_y: int,
+        grid_left: int,
+        col_w: int,
+        grid_right: int,
+    ) -> None:
+        """Paint one timer's matrix row from its _matrix_row_cells readout.
+
+        An aggregate row (_matrix_row_cells returned a single "▦ …" band cell)
+        draws ONE band across the full width — a busy timer reads as a solid
+        streak, never a glyph storm. A normal row draws each non-empty per-day
+        cell at its column, in the cell's worst-outcome colour. Colour is re-
+        derived from the day's worst event (not stored in the string) so the glyph
+        keeps its outcome colour — the failure-never-hidden rule the model encodes.
+        """
+        cells = self._matrix_row_cells(unit)
+        days = self._matrix_day_dates()
+        # Aggregate band: _matrix_row_cells collapses an over-full row to exactly
+        # one "▦ …" cell. Detect that shape and draw the band instead of columns.
+        if len(cells) == 1 and cells[0].startswith("▦"):
+            row_events = [e for e in self._events if e.unit == unit]
+            _count, failures = bucket_cell(row_events)
+            band_color = _RAN_FAIL[1] if failures > 0 else QColor(110, 110, 120)
+            painter.fillRect(
+                QRect(grid_left, row_y + 6, grid_right - grid_left, _ROW_H - 12),
+                QColor(band_color.red(), band_color.green(), band_color.blue(), 60),
+            )
+            painter.setPen(band_color)
+            painter.drawText(
+                QRect(grid_left + 4, row_y, grid_right - grid_left, _ROW_H),
+                Qt.AlignmentFlag.AlignVCenter,
+                cells[0],
+            )
+            return
+
+        # Normal row: place each day's glyph at its column. We re-bucket the
+        # unit's events by date to recover the worst event's COLOUR (the cell
+        # string carries only the glyph); the glyph itself comes from `cells` so
+        # paint and the testable readout can never disagree.
+        by_date: dict[date, list[CalendarEvent]] = {}
+        for ev in self._events:
+            if ev.unit != unit:
+                continue
+            d = datetime.fromtimestamp(ev.when / 1_000_000, UTC).date()
+            by_date.setdefault(d, []).append(ev)
+        for col, (day, glyph) in enumerate(zip(days, cells, strict=True)):
+            if not glyph:
+                continue  # quiet day — nothing drawn
+            worst = self._day_cell_worst(by_date.get(day, []))
+            color = _glyph_color(worst)[1] if worst is not None else _UNKNOWN[1]
+            x = grid_left + col * col_w
+            painter.setPen(color)
+            painter.drawText(
+                QRect(x + 1, row_y, col_w - 2, _ROW_H),
+                Qt.AlignmentFlag.AlignCenter,
+                glyph,
+            )
 
     def day_hit_point(self, when_usec: int) -> QPoint:
         """Widget-local centre of the day-cell containing the µs-epoch `when`.

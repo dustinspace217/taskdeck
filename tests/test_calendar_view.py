@@ -376,3 +376,154 @@ def test_month_view_click_emits_worst_outcome_unit(qtbot):
         w, Qt.MouseButton.LeftButton, pos=w.day_hit_point(FEB10_USEC)
     )
     assert seen == ["b.timer"]  # the failing timer, not the healthy a.timer
+
+
+# -- Month by-timer matrix toggle (Task 10) ----------------------------------
+#
+# The matrix is a Month SUB-VIEW (grid <-> matrix toggle, NOT a new top-level
+# View entry): rows = timers, cols = days, each cell the timer's worst outcome
+# for that day. Its diagnostic point is that a lone failure and a lone gap must
+# read DIFFERENTLY per timer (the spec's "lone ✘ vs lone ⛌"), and a high-volume
+# (aggregate) timer collapses to a solid ▦ band instead of a glyph storm — the
+# same over-full rule Day/Week use via the model's bucket_cell. Like every other
+# view these pin BEHAVIOR — paints without raising, the per-row cells are
+# distinguishable, the band fires for an over-full row, the sub-toggle is
+# Month-only, and clicks still emit the row's unit — not the pixel layout, which
+# Dustin iterates by eye post-build. The matrix shares the Month 30-day window,
+# so events are placed on real February day boundaries (reusing the FEB*
+# constants above) to exercise the per-day bucketing.
+
+
+def test_matrix_view_renders_rows_by_timer(qtbot):
+    # A matrix paint with two timers, each with one event on a distinct day, must
+    # rasterize without raising — this exercises the rows=timers × cols=days
+    # placement for the Month window.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("matrix")
+    w.set_events(
+        [
+            CalendarEvent("a.timer", FEB10_USEC, "ran", "failure"),
+            CalendarEvent("b.timer", FEB28_USEC, "gap"),
+        ],
+        units=["a.timer", "b.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=MAR1_USEC,
+    )
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    assert w.grab().width() > 0  # painted the by-timer matrix without raising
+    assert w.mode == "matrix"
+
+
+def test_matrix_row_cells_distinguish_failure_from_gap(qtbot):
+    # THE core matrix contract: a timer with one failure and a timer with one gap
+    # must produce DIFFERENT row content. We pin it through the testable per-row
+    # summary _matrix_row_cells(unit) -> list[str]: one cell-readout per day, so
+    # the failure row carries the ✘ glyph on its day and the gap row the ⛌ glyph —
+    # the "lone ✘ vs lone ⛌" the spec wants legible per timer.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("matrix")
+    w.set_events(
+        [
+            CalendarEvent("fail.timer", FEB10_USEC, "ran", "failure"),
+            CalendarEvent("gap.timer", FEB10_USEC, "gap"),
+        ],
+        units=["fail.timer", "gap.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=MAR1_USEC,
+    )
+    fail_cells = w._matrix_row_cells("fail.timer")
+    gap_cells = w._matrix_row_cells("gap.timer")
+    # Both rows span the same number of day-columns (the month's days)...
+    assert len(fail_cells) == len(gap_cells)
+    # ...but their CONTENT differs: the failure glyph appears in one, the gap
+    # glyph in the other, and neither row is the other's content.
+    assert any("✘" in c for c in fail_cells)
+    assert any("⛌" in c for c in gap_cells)
+    assert fail_cells != gap_cells
+    # The non-event days are quiet in both (no glyph), so a row's signal is only
+    # its real outcome day(s).
+    assert "✘" not in "".join(gap_cells)
+    assert "⛌" not in "".join(fail_cells)
+
+
+def test_matrix_aggregate_timer_renders_as_band(qtbot):
+    # A high-volume ("aggregate") timer — more events than CELL_DRAW_MAX in a
+    # single day — collapses to ONE solid ▦ band row rather than per-day glyphs,
+    # the same over-full rule Day/Week apply via the model's bucket_cell. The band
+    # readout is a single cell carrying the ▦ count, distinct from the per-day
+    # cell list a normal timer produces.
+    from taskdeck.calendar_model import CELL_DRAW_MAX
+
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("matrix")
+    # CELL_DRAW_MAX + 1 runs all on the same day → over-full → aggregate band.
+    busy = [
+        CalendarEvent("busy.timer", FEB10_USEC + i * 60_000_000, "ran", "success")
+        for i in range(CELL_DRAW_MAX + 1)
+    ]
+    w.set_events(
+        busy,
+        units=["busy.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=MAR1_USEC,
+    )
+    cells = w._matrix_row_cells("busy.timer")
+    # The whole over-full row collapses to a single ▦ band cell, not a per-day
+    # list — that is how the aggregate timer reads as a band.
+    assert len(cells) == 1
+    assert "▦" in cells[0]
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    assert w.grab().width() > 0  # the band row paints without raising
+
+
+def test_matrix_subtoggle_is_month_only(qtbot):
+    # The grid<->matrix sub-toggle is a MONTH affordance, never a top-level View
+    # entry: it is visible only when the active mode is month/matrix and hidden in
+    # Day/Week. This keeps the top-level Day/Week/Month toggle (and the host's
+    # view_box) free of a fourth entry — matrix is reached only from within Month.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    w.set_mode("day")
+    assert not w._matrix_toggle.isVisible()  # hidden outside Month
+    w.set_mode("month")
+    assert w._matrix_toggle.isVisible()      # visible in the Month family
+    w.set_mode("matrix")
+    assert w._matrix_toggle.isVisible()      # still the Month family
+    w.set_mode("week")
+    assert not w._matrix_toggle.isVisible()  # hidden again
+
+
+def test_matrix_click_emits_row_unit(qtbot):
+    # The matrix is a timer-row layout (like Day/Week), so a click maps to a row
+    # → that timer's unit via the shared row hit-test — the same outward selected
+    # contract, distinct from Month's day-cell hit-test.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("matrix")
+    w.set_events(
+        [CalendarEvent("a.timer", FEB10_USEC, "ran", "success")],
+        units=["a.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=MAR1_USEC,
+    )
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    seen: list[str] = []
+    w.selected.connect(seen.append)
+    qtbot.mouseClick(w, Qt.MouseButton.LeftButton, pos=w.row_hit_point(0))
+    assert seen == ["a.timer"]
