@@ -220,3 +220,159 @@ def test_week_view_click_still_emits_selected_unit(qtbot):
     w.selected.connect(seen.append)
     qtbot.mouseClick(w, Qt.MouseButton.LeftButton, pos=w.row_hit_point(0))
     assert seen == ["a.timer"]
+
+
+# -- Month grid view (Task 9) ------------------------------------------------
+#
+# The Month paint lays the visible calendar month as a weeks-x-weekdays grid
+# (NOT timer rows): each cell is one DAY, summarising all timers' events for
+# that day into a worst-outcome glyph + count, drawn only on problem days. A
+# week-row containing any gap/failure gets a heavy border (tracked as the
+# testable set `_problem_weeks`), future cells are dimmed, and clean days stay
+# quiet. Like the other views these pin BEHAVIOR (paints without raising; the
+# problem-week state is computed; click still emits a unit) and the small
+# `_day_cell_summary` helper is pinned DIRECTLY — not the pixel layout, which
+# Dustin iterates by eye post-build. Variable month length (28 vs 31 days) is
+# exercised with a real February window AND a real 31-day-March window so the
+# grid math can't silently assume a fixed 30-day step.
+
+# Real UTC month boundaries (computed once; both months happen to start on a
+# Sunday in 2026, which exercises the leading-blank cells of a Monday-led grid).
+FEB1_USEC = 1_769_904_000_000_000      # 2026-02-01 00:00 UTC (Feb has 28 days)
+FEB10_USEC = 1_770_724_800_000_000     # 2026-02-10 12:00 UTC (mid-month, a Tue)
+FEB28_USEC = 1_772_236_800_000_000     # 2026-02-28 00:00 UTC (last day of Feb)
+MAR1_USEC = 1_772_323_200_000_000      # 2026-03-01 00:00 UTC (March has 31 days)
+MAR15_USEC = 1_773_576_000_000_000     # 2026-03-15 12:00 UTC (mid-month)
+MAR31_USEC = 1_774_915_200_000_000     # 2026-03-31 00:00 UTC (31st — only a
+#                                        31-day month has this cell)
+APR1_USEC = 1_775_001_600_000_000      # 2026-04-01 00:00 UTC (Feb/Mar window end)
+
+
+def test_month_view_renders_february_with_problem_days(qtbot):
+    # A February (28-day) month with a failure day and a gap day must rasterize
+    # without raising, and the week-rows holding those days must be flagged in
+    # _problem_weeks (the testable seam for the heavy-border draw). Feb10 and
+    # Feb28 fall in different week-rows, so two distinct weeks light up.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    w.set_events(
+        [
+            CalendarEvent("a.timer", FEB10_USEC, "ran", "failure"),
+            CalendarEvent("b.timer", FEB28_USEC, "gap"),
+            CalendarEvent("a.timer", FEB1_USEC, "ran", "success"),  # clean day
+        ],
+        units=["a.timer", "b.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=MAR1_USEC,  # whole month is in the past → nothing dimmed
+    )
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    assert w.grab().width() > 0  # painted the month grid without raising
+    assert w.mode == "month"
+    # Two problem days in two different week-rows → two flagged weeks.
+    assert len(w._problem_weeks) == 2
+
+
+def test_month_view_clean_month_has_no_problem_weeks(qtbot):
+    # A month whose only events are successes/projections must leave
+    # _problem_weeks EMPTY — the heavy border is reserved for gaps/failures, so
+    # a healthy month stays quiet (the de-noising the spec asks for).
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    w.set_events(
+        [
+            CalendarEvent("a.timer", FEB10_USEC, "ran", "success"),
+            CalendarEvent("a.timer", FEB28_USEC, "projected"),
+        ],
+        units=["a.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=FEB1_USEC,
+    )
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    assert w.grab().width() > 0
+    assert w._problem_weeks == set()
+
+
+def test_month_view_renders_thirty_one_day_month(qtbot):
+    # The 31st of March only exists in a 31-day month — placing a failure there
+    # proves the grid extends to day 31 (a fixed 30-day step would drop it). The
+    # March window must render and flag the final week as a problem week.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    w.set_events(
+        [
+            CalendarEvent("a.timer", MAR15_USEC, "ran", "success"),
+            CalendarEvent("a.timer", MAR31_USEC, "ran", "failure"),  # day 31
+        ],
+        units=["a.timer"],
+        window_start=MAR1_USEC,
+        window_end=APR1_USEC,
+        now=APR1_USEC,
+    )
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    assert w.grab().width() > 0
+    # The day-31 failure must land in some week-row → at least one problem week.
+    assert len(w._problem_weeks) >= 1
+
+
+def test_month_day_cell_summary_picks_worst_and_counts(qtbot):
+    # The per-day summary is the Month cell's core semantic and the seam the
+    # heavy-border + glyph draw both read. It returns (glyphs, worst, counts):
+    # `worst` is the worst CalendarEvent (failure > gap > success > upcoming),
+    # `counts` is (total, failures) from the model's bucket_cell. Pinned directly
+    # so the contract survives the visual pass. Mixed-timer day: a failed run
+    # must win the worst slot, and the failure count must be exact.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    ran_ok = CalendarEvent("a.timer", 1, "ran", "success")
+    ran_fail = CalendarEvent("b.timer", 2, "ran", "failure")
+    gap = CalendarEvent("c.timer", 3, "gap")
+    glyphs, worst, counts = w._day_cell_summary([ran_ok, ran_fail, gap])
+    assert worst is ran_fail            # failure dominates the day
+    assert counts == (3, 1)             # 3 events, 1 of them a failure
+    assert isinstance(glyphs, str) and glyphs  # a non-empty readout for the cell
+    # An empty day → no worst, zero counts, empty readout (a clean day stays
+    # quiet: the painter draws nothing for it).
+    glyphs0, worst0, counts0 = w._day_cell_summary([])
+    assert worst0 is None and counts0 == (0, 0) and glyphs0 == ""
+
+
+def test_month_view_click_emits_worst_outcome_unit(qtbot):
+    # Clicking a day-cell emits the unit of that day's WORST-outcome event so the
+    # host opens the detail tabs for the timer that actually failed/missed (not a
+    # healthy sibling). The Month grid is day-cells, not timer-rows, so the
+    # hit-test maps the click to a day and resolves the unit via _day_cell_summary
+    # — distinct from Day/Week's row hit-test, but the same outward `selected`
+    # contract. We click the cell of the failure day via its testable hit-point.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    w.set_events(
+        [
+            CalendarEvent("a.timer", FEB10_USEC, "ran", "success"),
+            CalendarEvent("b.timer", FEB10_USEC, "ran", "failure"),  # worst on day 10
+        ],
+        units=["a.timer", "b.timer"],
+        window_start=FEB1_USEC,
+        window_end=MAR1_USEC,
+        now=MAR1_USEC,
+    )
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    seen: list[str] = []
+    w.selected.connect(seen.append)
+    qtbot.mouseClick(
+        w, Qt.MouseButton.LeftButton, pos=w.day_hit_point(FEB10_USEC)
+    )
+    assert seen == ["b.timer"]  # the failing timer, not the healthy a.timer

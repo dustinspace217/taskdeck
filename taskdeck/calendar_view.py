@@ -22,7 +22,8 @@ without raising, click→signal, nav→window) and leaves exact spacing to that 
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import calendar
+from datetime import UTC, date, datetime
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPaintEvent
@@ -120,6 +121,15 @@ _ROW_H = 28          # height of one timer row in the canvas
 _TOP_PAD = 24        # space above row 0 for the hour axis / header
 _HEALTH_COL_W = 64   # right-edge column showing one row's worst-of-week summary
 
+# Month-grid layout. Unlike Day/Week (timer-rows down a gutter), the Month view
+# is a classic weeks-x-weekdays calendar: each CELL is one day, summarising ALL
+# timers for that day. So it has its own coordinate space — these constants and
+# _month_cell_rect are the single source of truth shared by the paint and the
+# day hit-test (so a click always lands on the cell drawn). Starting values for
+# the visual-iteration pass; behaviour is pinned by tests, not these numbers.
+_MONTH_TOP_PAD = 24     # space above the grid for the weekday header (Mon..Sun)
+_MONTH_GRID_PAD = 6     # left/right inset of the grid from the widget edges
+
 
 class CalendarView(QWidget):  # type: ignore[misc]
     """The calendar page: nav chrome on top, a custom-painted grid below.
@@ -157,6 +167,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
         self._now = 0
         self._events: list[CalendarEvent] = []
         self._units: list[str] = []
+        # Week-row indices (0-based, top of the visible month down) that contain
+        # at least one gap or failed run. Recomputed each Month paint and read by
+        # tests as the testable seam for the heavy-border draw — it lets a test
+        # assert "this month flagged N problem weeks" without inspecting pixels.
+        # Empty for any non-Month paint and for a clean month.
+        self._problem_weeks: set[int] = set()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -371,7 +387,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt naming)
         """Dispatch to the active sub-view's painter.
 
-        Day and Week are implemented; Month/matrix come in later tasks and fall
+        Day, Week and Month are implemented; matrix comes in Task 10 and falls
         back to Day so the widget always draws something rather than a blank page.
         A QPainter that escapes paintEvent un-ended can wedge Qt, so each _paint_*
         opens and ends its own painter.
@@ -380,10 +396,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
             self._paint_week()
         elif self._mode == "day":
             self._paint_day()
+        elif self._mode == "month":
+            self._paint_month()
         else:
-            # Month/matrix not yet implemented — draw the Day grid so the page is
-            # never blank during the staged rollout (Tasks 9-10 replace this
-            # branch with the real paints).
+            # 'matrix' not yet implemented — draw the Day grid so the page is
+            # never blank during the staged rollout (Task 10 replaces this branch
+            # with the by-timer matrix paint).
             self._paint_day()
 
     def _paint_day(self) -> None:
@@ -695,27 +713,326 @@ class CalendarView(QWidget):  # type: ignore[misc]
             f"{hour:02d} {glyph}",
         )
 
+    # -- month paint ----------------------------------------------------------
+    #
+    # The Month view abandons the timer-rows layout for a classic calendar grid:
+    # weeks down, weekdays across, one CELL per day summarising ALL timers for
+    # that day. The de-noising goal drives the design — a clean day is BLANK (no
+    # glyph), only a problem day (gap/failure) shows its worst glyph + count, and
+    # a week-row holding any problem gets a heavy border so the eye finds trouble
+    # at week granularity before reading individual cells. Future cells are dimmed
+    # because they can't have outcomes yet. Variable month length is handled by
+    # building the grid from the stdlib `calendar` module (monthdatescalendar),
+    # never a fixed 30-day step — Feb (28/29) and 31-day months both come out
+    # right. _day_cell_summary is the small, directly-tested seam both the paint
+    # and the click hit-test read.
+
+    def _day_cell_summary(
+        self, events: list[CalendarEvent]
+    ) -> tuple[str, CalendarEvent | None, tuple[int, int]]:
+        """Summarise one day's events into (glyphs, worst, counts).
+
+        `events` are every timer's events that fall on one calendar day (already
+        bucketed by the caller). Returns:
+        - `glyphs`: the short readout drawn in the cell — the worst event's glyph
+          plus the day's event count (e.g. "✘ 3"), or "" for an empty day so the
+          painter draws nothing (a clean day stays quiet, the spec's de-noising).
+        - `worst`: the worst-outcome CalendarEvent (failure > gap > success >
+          upcoming) via the same _day_cell_worst ranking the Week cell uses, or
+          None for an empty day. The click hit-test reads this to pick which
+          timer's detail tabs to open.
+        - `counts`: (total, failures) from the model's bucket_cell — the count is
+          shown next to the glyph, and a future visual pass can tint on failures.
+          Bucketing in the MODEL (not here) keeps the failure-never-hidden rule
+          in one place, shared with Day/Week and the plasmoid.
+        Kept small and pure-ish (no painter, no self-state mutation) precisely so
+        Task 9's most-complex view has a directly testable core.
+        """
+        worst = self._day_cell_worst(events)
+        if worst is None:
+            return ("", None, (0, 0))
+        count, failures = bucket_cell(events)
+        glyph, _color = _glyph_color(worst)
+        # "<glyph> <count>" only when there's more than one event, so a single
+        # event reads as just its glyph (less noise); the count earns its place
+        # only when it's summarising several.
+        readout = f"{glyph} {count}" if count > 1 else glyph
+        return (readout, worst, (count, failures))
+
+    def _month_anchor(self) -> date:
+        """The first day of the visible month, derived from window_start (UTC).
+
+        The host sizes the Month window to roughly a month; we take its START
+        instant, read its UTC year/month, and anchor on the 1st — so the grid
+        always shows a WHOLE calendar month regardless of the exact window edges.
+        Using the UTC date (matching the event epochs) keeps day-bucketing and
+        the grid in the same timezone, avoiding an off-by-one at month ends.
+        """
+        start = datetime.fromtimestamp(self._window_start / 1_000_000, UTC)
+        return date(start.year, start.month, 1)
+
+    def _month_weeks(self) -> list[list[date]]:
+        """The visible month as a list of week-rows of 7 UTC dates each.
+
+        Built with the stdlib calendar.Calendar.monthdatescalendar, which returns
+        full weeks padded with the trailing/leading days of the adjacent months —
+        so a 28-day Feb yields 4-6 rows and a 31-day month yields 5-6, with no
+        hand-rolled length math that could mis-handle leap years or month length.
+        firstweekday defaults to Monday (calendar's default), matching the Mon..Sun
+        header. Bounded: a month spans at most 6 week-rows.
+        """
+        anchor = self._month_anchor()
+        cal = calendar.Calendar()  # firstweekday=0 (Monday)
+        return cal.monthdatescalendar(anchor.year, anchor.month)
+
+    def _events_by_date(self) -> dict[date, list[CalendarEvent]]:
+        """Bucket all events by their UTC calendar date.
+
+        One pass over the flat event list (Power of Ten rule 2: bounded by the
+        event count, itself bounded by the projection cap). The Month grid then
+        looks each cell's date up here, so a day with no events is simply absent
+        from the dict and draws blank. UTC matches the grid dates from
+        _month_weeks, so an event never lands a day off.
+        """
+        by_date: dict[date, list[CalendarEvent]] = {}
+        for ev in self._events:
+            d = datetime.fromtimestamp(ev.when / 1_000_000, UTC).date()
+            by_date.setdefault(d, []).append(ev)
+        return by_date
+
+    def _month_cell_rect(self, week: int, weekday: int) -> QRect:
+        """Geometry of the (week-row, weekday-col) day-cell — the SINGLE source
+        of truth shared by _paint_month and day_hit_point.
+
+        `week` is the 0-based row from the top of the visible month; `weekday` is
+        0=Mon..6=Sun. The grid fills the canvas below the chrome and the weekday
+        header, inset by _MONTH_GRID_PAD. Computing rects from the live widget
+        size (not fixed cell sizes) means the grid scales with the window — and
+        because the paint and the hit-test call THIS, a click can't desync from
+        what's drawn even as the layout is tuned by eye.
+        """
+        weeks = self._month_weeks()
+        n_rows = max(1, len(weeks))  # avoid /0 before the first set_events
+        top = self._canvas_top() + _MONTH_TOP_PAD
+        grid_left = _MONTH_GRID_PAD
+        grid_right = max(grid_left + 1, self.width() - _MONTH_GRID_PAD)
+        grid_bottom = max(top + 1, self.height() - _MONTH_GRID_PAD)
+        col_w = max(1, (grid_right - grid_left) // 7)
+        row_h = max(1, (grid_bottom - top) // n_rows)
+        x = grid_left + weekday * col_w
+        y = top + week * row_h
+        return QRect(x, y, col_w, row_h)
+
+    def _paint_month(self) -> None:
+        """Paint the Month grid: a weeks-x-weekdays calendar of the visible month.
+
+        Recomputes _problem_weeks from scratch (so a clean month clears it),
+        draws the weekday header, then each day-cell. A cell only shows a glyph +
+        count when its day has a gap/failure or is otherwise non-empty (clean days
+        stay blank); future cells (day after `now`) are dimmed because they can't
+        carry an outcome yet; any week-row containing a gap/failure is flagged in
+        _problem_weeks and gets a heavy border. The model owns severity/bucketing
+        (_day_cell_summary → _day_cell_worst/bucket_cell), so the paint only
+        decides geometry and colour — never what counts as a problem.
+        """
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            weeks = self._month_weeks()
+            by_date = self._events_by_date()
+            anchor = self._month_anchor()
+            now_date = datetime.fromtimestamp(self._now / 1_000_000, UTC).date()
+
+            self._problem_weeks = set()
+            self._paint_month_header(painter)
+
+            for w_idx, week in enumerate(weeks):
+                for wd_idx, day in enumerate(week):
+                    cell = by_date.get(day, [])
+                    _glyphs, worst, _counts = self._day_cell_summary(cell)
+                    # A week is a "problem week" if any of its cells holds a gap
+                    # or a failed run — read off the worst event so one check
+                    # covers both (the worst is failure/gap when present).
+                    if worst is not None and _event_severity(worst) >= _SEVERITY[
+                        ("gap", "")
+                    ]:
+                        self._problem_weeks.add(w_idx)
+                    in_month = day.month == anchor.month
+                    is_future = day > now_date
+                    self._paint_month_cell(
+                        painter, w_idx, wd_idx, day, worst, _glyphs,
+                        in_month, is_future,
+                    )
+
+            self._paint_problem_week_borders(painter)
+        finally:
+            # End the painter even if a draw raised — an un-ended QPainter on a
+            # widget can corrupt the backing store on the next paint.
+            painter.end()
+
+    def _paint_month_header(self, painter: QPainter) -> None:
+        """Draw the Mon..Sun weekday labels across the top of the grid.
+
+        Kept minimal (abbreviations, a thin baseline) — richer styling is the
+        visual pass. Anchored to the same column geometry as the cells via
+        _month_cell_rect(0, wd) so a header column lines up with its day column.
+        """
+        painter.setPen(QColor(150, 150, 150))
+        top = self._canvas_top()
+        for wd, label in enumerate(("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")):
+            rect = self._month_cell_rect(0, wd)
+            painter.drawText(
+                QRect(rect.x() + 2, top, rect.width() - 4, _MONTH_TOP_PAD),
+                Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
+
+    def _paint_month_cell(
+        self,
+        painter: QPainter,
+        week: int,
+        weekday: int,
+        day: date,
+        worst: CalendarEvent | None,
+        glyphs: str,
+        in_month: bool,
+        is_future: bool,
+    ) -> None:
+        """Draw one day-cell: its border, day number, and (if any) worst glyph.
+
+        Days outside the visible month (grid padding) and future days are dimmed
+        so the eye stays on the current month's past — a future or adjacent-month
+        cell can't carry an outcome, so muting it is honest, not decorative. A
+        problem day's worst glyph is drawn in its outcome colour; a clean day
+        shows only its faint day number (no glyph), which is the de-noising the
+        spec asks for.
+        """
+        rect = self._month_cell_rect(week, weekday)
+        # Cell outline — faint; the heavy problem-week border is drawn separately
+        # on top so it dominates.
+        painter.setPen(QColor(70, 70, 70))
+        painter.drawRect(rect)
+
+        # Day number, top-left. Dimmed for out-of-month/future cells.
+        dim = (not in_month) or is_future
+        num_color = QColor(90, 90, 90) if dim else QColor(170, 170, 170)
+        painter.setPen(num_color)
+        painter.drawText(
+            QRect(rect.x() + 3, rect.y() + 2, rect.width() - 6, 16),
+            Qt.AlignmentFlag.AlignLeft,
+            str(day.day),
+        )
+
+        # Worst-outcome glyph + count, centred — only on a non-empty cell, and
+        # only for in-month days (an adjacent-month cell belongs to a neighbour
+        # view, so we don't summarise it here). Future in-month cells can hold
+        # `projected` events; those still draw but in the dim upcoming colour.
+        if worst is None or not in_month:
+            return
+        _glyph, color = _glyph_color(worst)
+        painter.setPen(color)
+        painter.drawText(
+            QRect(rect.x() + 3, rect.y() + 18, rect.width() - 6, rect.height() - 20),
+            Qt.AlignmentFlag.AlignCenter,
+            glyphs,
+        )
+
+    def _paint_problem_week_borders(self, painter: QPainter) -> None:
+        """Draw a heavy border around every week-row in _problem_weeks.
+
+        Spanning the full row (col 0 left edge → col 6 right edge) makes a bad
+        week jump out at a glance before the user reads any cell. Drawn LAST so it
+        sits on top of the faint per-cell outlines. Reads _problem_weeks, which
+        _paint_month populated this same paint — one computation, two uses (the
+        border here and the test's assertion).
+        """
+        pen = painter.pen()
+        painter.setPen(QColor(200, 90, 90))  # the failure red — a bad week is red
+        for w_idx in self._problem_weeks:
+            left = self._month_cell_rect(w_idx, 0)
+            right = self._month_cell_rect(w_idx, 6)
+            row_rect = QRect(
+                left.x(), left.y(), right.right() - left.x(), left.height()
+            )
+            painter.drawRect(row_rect)
+        painter.setPen(pen)
+
+    def day_hit_point(self, when_usec: int) -> QPoint:
+        """Widget-local centre of the day-cell containing the µs-epoch `when`.
+
+        Used by tests (and a future keyboard/scroll handler) to address a day
+        deterministically, and built on the SAME _month_cell_rect the paint uses,
+        so a click here lands on the drawn cell. Locates `when`'s UTC date in the
+        visible month's week-rows; if the date isn't in the grid (a window the
+        host shouldn't produce), falls back to the first cell's centre rather than
+        raising — a hit-point helper must always return a point.
+        """
+        target = datetime.fromtimestamp(when_usec / 1_000_000, UTC).date()
+        for w_idx, week in enumerate(self._month_weeks()):
+            for wd_idx, day in enumerate(week):
+                if day == target:
+                    rect = self._month_cell_rect(w_idx, wd_idx)
+                    return QPoint(rect.x() + rect.width() // 2,
+                                  rect.y() + rect.height() // 2)
+        rect = self._month_cell_rect(0, 0)
+        return QPoint(rect.x() + rect.width() // 2, rect.y() + rect.height() // 2)
+
     # -- interaction ----------------------------------------------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
-        """Hit-test a click to a timer row and emit selected(unit).
+        """Hit-test a left click and emit selected(unit) for the right target.
 
-        Maps the click's y back to a row index using the SAME geometry as
-        row_hit_point/_paint_day (one source of truth), so a click lands on the
-        row the user sees. Clicks above row 0 (the axis) or below the last row
-        select nothing. Left button only — right-click is reserved for a future
-        context menu and must not fire a selection.
+        Day/Week are timer-row layouts, so the click maps to a row → that timer.
+        Month is a day-cell grid, so the click maps to a day → the unit of that
+        day's WORST-outcome event (so the host opens the timer that actually
+        failed/missed, not a healthy sibling). Both dispatch to the SAME geometry
+        helpers the paints use, so a click always lands on what's drawn. Left
+        button only — right-click is reserved for a future context menu and must
+        not fire a selection.
         """
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
             return
-        y = int(event.position().y())
-        first_row_top = self._canvas_top() + _TOP_PAD
-        if y < first_row_top:
-            super().mousePressEvent(event)
-            return  # in the axis/header region — not a row
-        index = (y - first_row_top) // _ROW_H
-        if 0 <= index < len(self._units):
-            self.selected.emit(self._units[index])
+        pos = event.position()
+        if self._mode == "month":
+            unit = self._month_click_unit(int(pos.x()), int(pos.y()))
+        else:
+            unit = self._row_click_unit(int(pos.y()))
+        if unit is not None:
+            self.selected.emit(unit)
             return
         super().mousePressEvent(event)
+
+    def _row_click_unit(self, y: int) -> str | None:
+        """Map a click y to a timer-row unit (Day/Week), or None off any row.
+
+        Uses the SAME _TOP_PAD/_ROW_H geometry as row_hit_point/_paint_day, so a
+        click lands on the row the user sees. Clicks above row 0 (the axis) or
+        below the last row resolve to None (no selection).
+        """
+        first_row_top = self._canvas_top() + _TOP_PAD
+        if y < first_row_top:
+            return None  # in the axis/header region — not a row
+        index = (y - first_row_top) // _ROW_H
+        if 0 <= index < len(self._units):
+            return self._units[index]
+        return None
+
+    def _month_click_unit(self, x: int, y: int) -> str | None:
+        """Map a click (x, y) to a Month day-cell's worst-outcome unit, or None.
+
+        Walks the visible month's cells via the SAME _month_cell_rect the paint
+        uses, finds the cell the point lands in, and returns that day's worst
+        event's unit through _day_cell_summary (one severity rule for paint,
+        border, and click). A click on an empty/clean day or off the grid returns
+        None — nothing to select there.
+        """
+        by_date = self._events_by_date()
+        for w_idx, week in enumerate(self._month_weeks()):
+            for wd_idx, day in enumerate(week):
+                if self._month_cell_rect(w_idx, wd_idx).contains(x, y):
+                    _glyphs, worst, _counts = self._day_cell_summary(
+                        by_date.get(day, [])
+                    )
+                    return worst.unit if worst is not None else None
+        return None
