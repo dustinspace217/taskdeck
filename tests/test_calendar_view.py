@@ -820,3 +820,294 @@ def test_range_label_is_local_dates():
     w.set_events([], units=[], window_start=win_start, window_end=win_end, now=win_start)
     label = w._range_label.text()
     assert label == "Jun 01 – Jun 30", f"local inclusive range, got {label!r}"
+
+
+# -- D: Phase-2 VISUAL elements (hour axis, week separators, month names,
+#       legend, issues) ------------------------------------------------------
+#
+# Phase 1 fixed the data + local-time model; Phase 2 makes it legible. The visual
+# LOOK is Dustin's by-eye retest, so these pin PRESENCE-of-element + crash-safety,
+# not pixel-perfect layout: the Day axis grows hour labels, the Week columns gain
+# full-height separators, the Month cell lists timer NAMES, an always-on legend
+# keys the glyphs, and the health strip names WHICH unit had a problem. Geometry
+# probes (below) read the rendered image so "the separator runs full height" and
+# "the axis has multiple ticks" are checked by where dark pixels land, not by a
+# brittle exact-pixel match.
+
+from PySide6.QtGui import QImage  # noqa: E402 (test-helper imports kept by section)
+
+from taskdeck.calendar_view import (  # noqa: E402
+    _GUTTER_W,
+    _ROW_H,
+    _TOP_PAD,
+    _short_unit_name,
+)
+
+# The offscreen QPA renders on a LIGHT background (probed: rgb 239,239,239 /
+# lightness 239). "Drawn" pixels — ticks, labels, separators, glyphs — are
+# DARKER than that, so the probes look for lightness well below the background.
+_BG_LIGHTNESS = 239
+_DARK_BELOW = _BG_LIGHTNESS - 20  # a pixel this dark is ink, not background
+
+
+def _dark_run_count(img: QImage, y: int, x0: int, x1: int) -> int:
+    """How many distinct dark vertical strokes cross row `y` between x0 and x1.
+
+    Counts rising edges (background→dark) so two adjacent dark columns of one line
+    count once. Used to assert "N separators / ticks are present at this height"
+    without pinning their exact x — robust to the by-eye spacing tweaks. Bounded
+    by the pixel width (Power of Ten rule 2).
+    """
+    runs = 0
+    prev_dark = False
+    for x in range(x0, x1):
+        dark = img.pixelColor(x, y).lightness() < _DARK_BELOW
+        if dark and not prev_dark:
+            runs += 1
+        prev_dark = dark
+    return runs
+
+
+def _shown_widget(mode, events, units, win_start, win_end, now, qtbot):
+    """Build, populate, and expose a CalendarView so .grab() rasterizes."""
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode(mode)
+    w.set_events(events, units=units, window_start=win_start,
+                 window_end=win_end, now=now)
+    w.resize(1000, 400)
+    w.show()
+    qtbot.waitExposed(w)
+    return w
+
+
+def test_day_axis_draws_multiple_hour_labels(qtbot):
+    # The Day axis must grow hour ticks/labels (Phase-1 drew only a baseline). We
+    # render an EMPTY day with `now` outside the window (so neither event glyphs
+    # nor the ▲ now-marker draw in the axis band), then count distinct dark
+    # vertical strokes in the band: a bare baseline is ONE horizontal line (zero
+    # vertical strokes), whereas the hour axis lands many ticks (every hour) plus
+    # 3-hourly labels. Several distinct strokes ⇒ the axis is populated, not a lone
+    # baseline. This is the cheap "the Day axis contains hour labels" check.
+    base = _at_local(2026, 6, 20, 0, 0)  # local midnight, a clean 24h Day window
+    w = _shown_widget(
+        "day", [], [], base, base + DAY_USEC, base - 1, qtbot
+    )
+    img = w.grab().toImage()
+    top = w._canvas_top()
+    # A y INSIDE the axis band (above the baseline at top+_TOP_PAD-4) where the
+    # ticks live; count vertical strokes across the drawable axis.
+    y = top + _TOP_PAD - 6
+    strokes = _dark_run_count(img, y, _GUTTER_W, img.width() - 8)
+    # 8 labelled hours (00 03 06 09 12 15 18 21) plus hourly minor ticks → far
+    # more than the single baseline Phase 1 drew. Require several to prove the
+    # axis is populated without pinning the exact count (spacing is by-eye).
+    assert strokes >= 6, f"Day axis should show many hour ticks, saw {strokes}"
+
+
+def test_day_axis_hour_labels_are_local_six(qtbot):
+    # Non-vacuity on the LOCAL-time mapping: the axis builds each hour tick from
+    # its OWN local epoch via the same frac the events use, so the "06" label sits
+    # at the 6/24 fraction of the window — NOT 13/24 (the UTC hour for a PDT 06:00).
+    # We re-derive the expected x the production math would produce and assert dark
+    # ink (the tick/label) lands near it, distinguishing local from UTC placement.
+    base = _at_local(2026, 6, 20, 0, 0)
+    span = DAY_USEC
+    w = _shown_widget("day", [], [], base, base + span, base - 1, qtbot)
+    img = w.grab().toImage()
+    axis_left = _GUTTER_W
+    axis_right = img.width() - 8
+    # 06:00 local as an absolute epoch → its fraction across the window → x.
+    six_local = _at_local(2026, 6, 20, 6, 0)
+    frac = (six_local - base) / span
+    x_expected = int(axis_left + frac * (axis_right - axis_left))
+    top = w._canvas_top()
+    y = top + _TOP_PAD - 6
+    # Dark ink within a few px of the expected tick x (the label is centred on it).
+    near = any(
+        img.pixelColor(x, y).lightness() < _DARK_BELOW
+        for x in range(max(axis_left, x_expected - 6), x_expected + 7)
+    )
+    assert near, "the 06 hour tick must sit at the LOCAL 6/24 position, not UTC 13/24"
+
+
+def test_week_separators_run_full_height(qtbot):
+    # The day separators must extend full-height through the row area (Phase 1 only
+    # divided the header band). We render two timer rows, then count dark vertical
+    # strokes at THREE y-levels — just below the header, mid-second-row, and near
+    # the bottom of the rows. Eight strokes (the 7 columns' 8 boundaries) appearing
+    # at every level proves the lines span top-to-bottom, not just the header.
+    base = _at_local(2026, 6, 15, 0, 0)  # a local Monday-ish base; window is local-week
+    win_start, win_end = local_calendar_window("week", base)
+    w = _shown_widget(
+        "week", [], ["a.timer", "b.timer"], win_start, win_end, base - 1, qtbot
+    )
+    img = w.grab().toImage()
+    top = w._canvas_top()
+    x0, x1 = _GUTTER_W - 4, img.width() - 50  # exclude the right health column
+    ys = (
+        top + _TOP_PAD + 5,            # just below the header
+        top + _TOP_PAD + _ROW_H + 5,   # inside the 2nd row
+        top + _TOP_PAD + 2 * _ROW_H - 3,  # near the bottom of the rows
+    )
+    for y in ys:
+        runs = _dark_run_count(img, y, x0, x1)
+        # 8 column boundaries close all 7 day-lanes; require them at EVERY level so
+        # a header-only divider (which would vanish below the band) fails the test.
+        assert runs == 8, f"expected 8 full-height separators at y={y}, saw {runs}"
+
+
+def test_short_unit_name_strips_known_suffixes():
+    # The Month cell shows timer NAMES; the .timer/.service suffix is pure noise
+    # there. Strip ONLY the known suffixes (not a blind split on ".") so a dotted
+    # base name survives. Pins each branch of the helper.
+    assert _short_unit_name("backup.timer") == "backup"
+    assert _short_unit_name("logrotate.service") == "logrotate"
+    assert _short_unit_name("my.app.timer") == "my.app"   # dotted base survives
+    assert _short_unit_name("already-bare") == "already-bare"
+
+
+def test_month_cell_timer_lines_worst_first_and_named(qtbot):
+    # The Month cell body is now per-timer NAME lines, worst-first (Dustin's
+    # choice). _day_cell_timer_lines is the testable seam: one (short_name, glyph,
+    # color) per timer for the day, a failed timer sorting above a healthy one so
+    # problems lead the cell. Pin the ordering, the short-name, and the glyph.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    ok = CalendarEvent("alpha.timer", 1, "ran", "success")
+    fail = CalendarEvent("bravo.timer", 2, "ran", "failure")
+    gap = CalendarEvent("charlie.timer", 3, "gap")
+    lines = w._day_cell_timer_lines([ok, fail, gap])
+    names = [name for name, _glyph, _color in lines]
+    glyphs = [glyph for _name, glyph, _color in lines]
+    # Worst-first: the failure leads, the gap next, the success last.
+    assert names == ["bravo", "charlie", "alpha"], names
+    assert glyphs[0] == "✘" and glyphs[1] == "⛌" and glyphs[2] == "✔"
+    # Suffix-stripped names — the cell shows "bravo", never "bravo.timer".
+    assert all("." not in n or n == n for n in names)  # short names, no .timer
+    # An empty day yields no lines (a clean cell stays quiet).
+    assert w._day_cell_timer_lines([]) == []
+
+
+def test_month_cell_one_line_per_timer_worst_event(qtbot):
+    # A timer with several events on one day collapses to ONE line carrying that
+    # timer's WORST event — so a day where alpha both ran-ok and failed shows a
+    # single alpha line with the failure glyph, not two alpha lines.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    events = [
+        CalendarEvent("alpha.timer", 1, "ran", "success"),
+        CalendarEvent("alpha.timer", 2, "ran", "failure"),  # worst for alpha
+    ]
+    lines = w._day_cell_timer_lines(events)
+    assert len(lines) == 1, "one line per timer, not per event"
+    name, glyph, _color = lines[0]
+    assert name == "alpha" and glyph == "✘", "the line shows alpha's WORST event"
+
+
+def test_month_cell_renders_names_and_plus_n_more(qtbot):
+    # A day with MORE timers than _MONTH_CELL_MAX_LINES must render the first few
+    # names and a "+N more" line. We can't cheaply read the painted text, so we
+    # assert the build doesn't raise AND the seam reports the overflow the painter
+    # collapses — the cell shows _MONTH_CELL_MAX_LINES lines + the more-hint.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    cap = w._MONTH_CELL_MAX_LINES
+    # cap + 2 DISTINCT timers all on Feb 10 → overflow of 2 beyond the cap.
+    events = [
+        CalendarEvent(f"t{i}.timer", FEB10_USEC, "ran", "failure")
+        for i in range(cap + 2)
+    ]
+    units = [f"t{i}.timer" for i in range(cap + 2)]
+    w.set_events(
+        events, units=units,
+        window_start=FEB1_USEC, window_end=MAR1_USEC, now=MAR1_USEC,
+    )
+    lines = w._day_cell_timer_lines(events)
+    assert len(lines) == cap + 2, "the seam lists every timer; the paint caps it"
+    w.resize(1100, 600)
+    w.show()
+    qtbot.waitExposed(w)
+    assert w.grab().width() > 0, "an over-full Month cell paints (with +N more)"
+
+
+def test_legend_is_always_visible_and_keys_each_glyph(qtbot):
+    # The legend fixes "no idea what Gaps is" — there was no key anywhere. It must
+    # be present in EVERY mode (always-on) and spell out each glyph's meaning.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.resize(1000, 400)
+    w.show()
+    qtbot.waitExposed(w)
+    text = w._legend_label.text()
+    # Each glyph and its plain-language meaning are in the key (rich text colours
+    # the glyphs; the words are plain). Checking the glyphs AND words pins the key.
+    for token in ("✔", "ran", "✘", "failed", "⛌", "missed", "⏲", "upcoming"):
+        assert token in text, f"legend must key {token!r}"
+    # Always visible — not gated on a mode like the filter strip is.
+    for mode in ("day", "week", "month", "matrix"):
+        w.set_mode(mode)
+        assert w._legend_label.isVisible(), f"legend hidden in {mode}"
+
+
+def test_issues_line_names_which_unit_failed(qtbot):
+    # The model builds Health.issues ("unit @ date" per failure/gap) but only the
+    # COUNTS were shown — the user couldn't read WHICH unit had a gap. The issues
+    # line must surface the offending unit names so the strip is actionable.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("day")
+    base = 1_781_000_000_000_000
+    w.set_events(
+        [
+            CalendarEvent("backup.timer", base, "ran", "failure"),
+            CalendarEvent("sync.timer", base + 3_600_000_000, "gap"),
+        ],
+        units=["backup.timer", "sync.timer"],
+        window_start=base,
+        window_end=base + DAY_USEC,
+        now=base + DAY_USEC,
+    )
+    issues_text = w._issues_label.text()
+    # Both offenders named so the user knows what to look at, not just "1 failed".
+    assert "backup.timer" in issues_text, "the failed unit is named in the strip"
+    assert "sync.timer" in issues_text, "the gapped unit is named in the strip"
+
+
+def test_issues_line_empty_on_clean_window(qtbot):
+    # A clean window has no issues, so the issues line is empty (takes no space) —
+    # the de-noising goal: a healthy window stays quiet, no stray text.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("day")
+    base = 1_781_000_000_000_000
+    w.set_events(
+        [CalendarEvent("a.timer", base, "ran", "success")],
+        units=["a.timer"],
+        window_start=base,
+        window_end=base + DAY_USEC,
+        now=base + DAY_USEC,
+    )
+    assert w._issues_label.text() == "", "a clean window shows no issues line"
+
+
+def test_issues_line_caps_with_plus_n_more(qtbot):
+    # A bad window with many offenders must cap the list and append "(+N more)" so
+    # the strip stays compact instead of flooding. Pin the cap behaviour.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("day")
+    base = 1_781_000_000_000_000
+    cap = w._ISSUES_SHOWN
+    events = [
+        CalendarEvent(f"f{i}.timer", base + i * 60_000_000, "ran", "failure")
+        for i in range(cap + 3)  # 3 beyond the cap
+    ]
+    units = [f"f{i}.timer" for i in range(cap + 3)]
+    w.set_events(
+        events, units=units,
+        window_start=base, window_end=base + DAY_USEC, now=base + DAY_USEC,
+    )
+    text = w._issues_label.text()
+    assert "(+3 more)" in text, f"the issues list caps and counts the rest: {text!r}"

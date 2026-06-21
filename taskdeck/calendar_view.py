@@ -149,6 +149,23 @@ def _local_date(when_usec: int) -> date:
     return _local_dt(when_usec).date()
 
 
+def _short_unit_name(unit: str) -> str:
+    """Strip the trailing .timer/.service suffix from a unit name for display.
+
+    `unit` is a full systemd unit name (e.g. "backup.timer", "logrotate.service").
+    The Month cell shows several timer names per day, so the suffix is pure noise
+    there — every entry is a timer/service, the suffix carries no per-row signal.
+    We only strip the KNOWN trailing suffixes (not a blind rsplit on ".") so a
+    dotted base name like "my.app.timer" → "my.app" survives, and an already-bare
+    name is returned unchanged. Kept tiny and module-level so the Month paint and
+    its test share one definition.
+    """
+    for suffix in (".timer", ".service"):
+        if unit.endswith(suffix):
+            return unit[: -len(suffix)]
+    return unit
+
+
 # Layout constants for the painted canvas. These are STARTING values for the
 # visual-iteration pass, not load-bearing contract — the tests pin behavior, not
 # these numbers. Named so the iteration pass has one place to tune.
@@ -309,21 +326,75 @@ class CalendarView(QWidget):  # type: ignore[misc]
         self._build_filter_strip(outer)
 
     def _build_health_strip(self, outer: QVBoxLayout) -> None:
-        """Build the always-visible HEALTH summary strip above the canvas.
+        """Build the always-visible HEALTH strip: summary + legend, then issues.
 
-        A single QLabel inside a container widget. set_events fills its text from
-        the model's summarize() — the view never counts outcomes itself, so the
-        strip and the Phase-2 plasmoid read the same numbers. A container (not a
-        bare label added to the layout) keeps the strip's geometry a single
-        layout item _canvas_top can measure, matching the filter strip's shape.
+        Two stacked rows inside one container widget:
+        1. A row with the summary label (filled from the model's summarize() — the
+           view never counts outcomes itself, so the strip and the Phase-2 plasmoid
+           read the same numbers) on the left and an always-visible glyph LEGEND on
+           the right. The legend fixes Dustin's "no idea what Gaps is" — there was
+           no key anywhere — by spelling out each glyph's meaning in its own colour.
+        2. An issues label below it: the model already builds Health.issues ("unit @
+           date" per failure/gap), but only the counts were shown — so the user
+           couldn't read WHICH unit had a gap. We surface that compact list here.
+
+        A container (not bare labels) keeps the strip's geometry one layout item
+        _canvas_top can measure, matching the filter strip's shape. Built with a
+        QVBoxLayout so the issues line stacks under the summary/legend row.
         """
         self._health_strip = QWidget()
-        strip_layout = QHBoxLayout(self._health_strip)
+        strip_layout = QVBoxLayout(self._health_strip)
         strip_layout.setContentsMargins(8, 2, 8, 2)
+        strip_layout.setSpacing(1)
+
+        # Row 1: summary (left) + legend (right).
+        top_row = QHBoxLayout()
         self._health_label = QLabel("")
-        strip_layout.addWidget(self._health_label)
-        strip_layout.addStretch(1)
+        top_row.addWidget(self._health_label)
+        top_row.addStretch(1)
+        self._legend_label = self._build_legend_label()
+        top_row.addWidget(self._legend_label)
+        strip_layout.addLayout(top_row)
+
+        # Row 2: the compact issues list (which unit failed/gapped), under the
+        # summary. Empty (and so visually absent) on a clean window.
+        self._issues_label = QLabel("")
+        self._issues_label.setWordWrap(True)  # a long list wraps, never clips
+        strip_layout.addWidget(self._issues_label)
+
         outer.addWidget(self._health_strip)
+
+    def _build_legend_label(self) -> QLabel:
+        """Build the always-visible glyph legend ("✔ ran · ✘ failed · …").
+
+        Returns one QLabel whose rich text colours each glyph with the SAME colour
+        the cells use (_glyph_color via the _RAN_OK/_RAN_FAIL/_GAP/_PROJECTED
+        tuples), so the key and the grid speak one visual language — a user can map
+        a cell glyph straight to its meaning. Rich text (Qt's tiny HTML subset) is
+        used ONLY here, to colour individual spans within one label; a plain label
+        can't colour per-glyph. The four entries are the kinds the user actually
+        sees (ran/failed/missed/upcoming); 'approx' shares the upcoming meaning so
+        it isn't a separate key entry. Built once at construction — the legend text
+        is static, so it never changes after this.
+        """
+        def span(glyph: str, color: QColor, word: str) -> str:
+            # One coloured glyph + its plain-text meaning. .name() is the #rrggbb
+            # hex Qt rich text needs; the word stays default-coloured so only the
+            # glyph carries colour (matching the cells).
+            return f'<span style="color:{color.name()}">{glyph}</span> {word}'
+
+        legend = QLabel(
+            " · ".join(
+                (
+                    span(_RAN_OK[0], _RAN_OK[1], "ran"),
+                    span(_RAN_FAIL[0], _RAN_FAIL[1], "failed"),
+                    span(_GAP[0], _GAP[1], "missed"),
+                    span(_PROJECTED[0], _PROJECTED[1], "upcoming"),
+                )
+            )
+        )
+        legend.setTextFormat(Qt.TextFormat.RichText)
+        return legend
 
     def _build_filter_strip(self, outer: QVBoxLayout) -> None:
         """Build the Month-grid filter toggles (All / Failures / Gaps / Upcoming).
@@ -630,6 +701,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
             self._health_label.setText(
                 "⚠ partial — some data failed to load (⟳ to retry)"
             )
+            self._update_issues_label()
             return
         h = self._health
         if h.failed == 0 and h.gaps == 0:
@@ -639,10 +711,41 @@ class CalendarView(QWidget):  # type: ignore[misc]
             self._health_label.setText(
                 f"All clear · {h.ok}✔ · {h.upcoming}⏲"
             )
+            self._update_issues_label()
             return
         self._health_label.setText(
             f"{h.failed}✘ · {h.gaps}⛌ · {h.ok}✔ · {h.upcoming}⏲"
         )
+        self._update_issues_label()
+
+    # How many issue strings the strip lists before collapsing the rest into a
+    # "(+N more)" suffix. The model's Health.issues can be long on a bad window;
+    # showing a handful keeps the strip compact while still naming the offenders —
+    # the full detail lives in the per-cell drill-down.
+    _ISSUES_SHOWN = 4
+
+    def _update_issues_label(self) -> None:
+        """Render the cached Health.issues into the compact issues line.
+
+        Reads self._health.issues (built by the model's summarize() — one "unit @
+        date" per failure and per gap region). Only the COUNTS were surfaced
+        before, so the user could see "1 failed" but not WHICH unit — this line
+        closes that gap. Shows up to _ISSUES_SHOWN entries joined with " · ", with
+        a "(+N more)" tail when there are more, so a bad window names its offenders
+        without flooding the strip. A clean window (no issues) sets empty text, so
+        the line takes no visible space. A degraded build also clears it: its
+        counts are untrustworthy, so listing partial issues would mislead.
+        """
+        issues = [] if self._degraded else self._health.issues
+        if not issues:
+            self._issues_label.setText("")
+            return
+        shown = issues[: self._ISSUES_SHOWN]
+        text = " · ".join(shown)
+        extra = len(issues) - len(shown)
+        if extra > 0:
+            text += f"  (+{extra} more)"
+        self._issues_label.setText(text)
 
     # -- painting -------------------------------------------------------------
 
@@ -734,7 +837,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
             axis_right = max(axis_left + 1, width - 8)
             span = max(1, self._window_end - self._window_start)  # avoid /0
 
-            self._paint_hour_axis(painter, top, axis_left, axis_right)
+            self._paint_hour_axis(painter, top, axis_left, axis_right, span)
 
             # One row per unit, in caller order. Events are grouped by unit so an
             # over-full row collapses to a band via the model's bucket_cell — the
@@ -754,17 +857,76 @@ class CalendarView(QWidget):  # type: ignore[misc]
             painter.end()
 
     def _paint_hour_axis(
-        self, painter: QPainter, top: int, axis_left: int, axis_right: int
+        self,
+        painter: QPainter,
+        top: int,
+        axis_left: int,
+        axis_right: int,
+        span: int,
     ) -> None:
-        """Draw a thin baseline for the time axis at the top of the canvas.
+        """Draw the Day time axis: a baseline, hourly minor ticks, and LOCAL-time
+        hour labels every 3 hours (00 03 06 09 12 15 18 21).
 
-        Kept minimal (a single line, no hour ticks yet) — the spec's hourly ticks
-        are part of the visual pass. Its presence is what proves the axis region
-        is reserved correctly above row 0.
+        The Day window is local-midnight→midnight (24h, usually — a DST day is 23
+        or 25h, which is exactly why each hour's x is derived from its OWN epoch,
+        not from i/24). For each local hour we recompute that wall-clock instant as
+        an absolute µs epoch and map it with the SAME `frac = (when - start)/span`
+        the events use (_paint_row_events), so a tick and the glyphs under it share
+        one mapping — a 06:00-local run's ✔ sits exactly under the "06" label. The
+        hours are LOCAL (start.replace(hour=h)) so a PDT user reads wall-clock,
+        never the UTC hour (the trap the task calls out: 06:00 local must label 06,
+        not 13). Density: a label every 3h keeps the axis readable; minor ticks
+        every hour give finer position cues without crowding the labels.
+
+        `span` is the window width in µs (passed from _paint_day, == window_end -
+        window_start, floored to ≥1). `axis_left`/`axis_right` bound the drawable
+        axis (the gutter on the left, an 8px inset on the right) — the exact same
+        bounds the event placement uses, so labels and glyphs can't desync.
         """
-        painter.setPen(QColor(90, 90, 90))
         baseline = top + _TOP_PAD - 4
+        painter.setPen(QColor(90, 90, 90))
         painter.drawLine(axis_left, baseline, axis_right, baseline)
+
+        if self._window_end <= self._window_start:
+            return  # no window yet (pre-first-set_events) — just the baseline
+
+        axis_w = axis_right - axis_left
+        # The LOCAL midnight that starts this Day window. Reading window_start in
+        # local time and zeroing the clock gives the wall-clock 00:00 every hour
+        # tick is offset from — local (not UTC) so the labels read in the user's
+        # zone. Hours past it are built with timedelta on the AWARE instant so a
+        # DST transition inside the day shifts the ticks correctly.
+        midnight_local = _local_dt(self._window_start).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        # 25 ticks covers 00:00 through the next midnight inclusive, so a label can
+        # sit at both ends; bounded by construction (Power of Ten rule 2).
+        for h in range(25):
+            tick_local = midnight_local + timedelta(hours=h)
+            # The hour's absolute µs epoch: .astimezone() attaches the local tz so
+            # .timestamp() is the correct UTC instant for that local wall-clock,
+            # then the same frac mapping the events use places it on the axis.
+            tick_usec = int(tick_local.astimezone().timestamp()) * 1_000_000
+            frac = (tick_usec - self._window_start) / span
+            if frac < 0.0 or frac > 1.0:
+                continue  # outside the visible window (a DST-short/long day edge)
+            x = int(axis_left + frac * axis_w)
+            # Labelled hours (every 3h) get a taller tick + the "HH" text; the rest
+            # get a short minor tick so the eye can still register hour granularity.
+            labelled = tick_local.hour % 3 == 0
+            tick_h = 6 if labelled else 3
+            painter.setPen(QColor(110, 110, 110))
+            painter.drawLine(x, baseline - tick_h, x, baseline)
+            if labelled:
+                painter.setPen(QColor(150, 150, 150))
+                # Centre the 2-digit label on the tick; clamp the rect into the
+                # axis so an edge label (00 / 24) isn't clipped off-canvas.
+                lx = max(axis_left, min(x - 12, axis_right - 24))
+                painter.drawText(
+                    QRect(lx, top, 24, _TOP_PAD - 6),
+                    Qt.AlignmentFlag.AlignCenter,
+                    f"{tick_local.hour:02d}",
+                )
 
     def _paint_unit_label(self, painter: QPainter, unit: str, row_y: int) -> None:
         """Draw the timer unit name in the left gutter for one row."""
@@ -892,6 +1054,11 @@ class CalendarView(QWidget):  # type: ignore[misc]
             col_w = max(1, (grid_right - grid_left) // 7)
 
             self._paint_week_header(painter, top, grid_left, col_w)
+            # Full-height day separators, drawn BEFORE the rows so the (subtle)
+            # lines sit UNDER the glyphs — a divider must never overpaint an
+            # outcome glyph. They run the whole row area so the 7 day-columns read
+            # as distinct lanes top-to-bottom, not just in the header band.
+            self._paint_week_separators(painter, top, grid_left, col_w)
 
             for i, unit in enumerate(self._units):
                 row_y = top + _TOP_PAD + i * _ROW_H
@@ -943,6 +1110,32 @@ class CalendarView(QWidget):  # type: ignore[misc]
                 f"{col_date:%b %d}",
             )
             painter.setPen(QColor(90, 90, 90))
+
+    def _paint_week_separators(
+        self, painter: QPainter, top: int, grid_left: int, col_w: int
+    ) -> None:
+        """Draw subtle full-height vertical dividers between the 7 day-columns.
+
+        The header (_paint_week_header) only divides the label band; these extend
+        the column boundaries down through the whole row area so a glyph reads
+        clearly as belonging to one day-lane. The lines run from just below the
+        header baseline to the bottom of the last timer row (top + _TOP_PAD +
+        N×_ROW_H); an empty unit list still draws a one-row-tall stub so the
+        columns are visible before any timers load. Deliberately LIGHT (a dim grey,
+        1px) so the dividers structure the grid without competing with the outcome
+        glyphs — the task asks for subtle, not dominant. We draw the 8 boundaries
+        0..7 (left edge of col 0 through right edge of col 6) so the last column is
+        closed on its right.
+        """
+        line_top = top + _TOP_PAD - 2
+        rows = max(1, len(self._units))  # a stub height before any timers load
+        line_bottom = top + _TOP_PAD + rows * _ROW_H
+        painter.setPen(QColor(60, 60, 60))  # subtle — under the glyphs
+        # 8 boundaries close all 7 columns (0=left of col 0 … 7=right of col 6);
+        # bounded loop (Power of Ten rule 2).
+        for day in range(8):
+            x = grid_left + day * col_w
+            painter.drawLine(x, line_top, x, line_bottom)
 
     def _paint_week_row(
         self,
@@ -1089,6 +1282,52 @@ class CalendarView(QWidget):  # type: ignore[misc]
         readout = f"{glyph} {count}" if count > 1 else glyph
         return (readout, worst, (count, failures))
 
+    # How many per-timer name lines a Month cell shows before collapsing the rest
+    # into a "+N more" line. 3 fits a normal cell height (~_ROW_H×… of vertical
+    # space) without overflowing; beyond that the cell would clip. Dustin chose
+    # timer NAMES in the Month cell (over a bare glyph+count), so the cell trades
+    # density for legibility — this cap keeps it from becoming a wall of text.
+    _MONTH_CELL_MAX_LINES = 3
+
+    def _day_cell_timer_lines(
+        self, events: list[CalendarEvent]
+    ) -> list[tuple[str, str, QColor]]:
+        """One (short_name, glyph, color) line per TIMER for a Month day-cell.
+
+        `events` are every timer's events on one calendar day (already bucketed by
+        the caller). Returns one line per distinct timer — that timer's WORST event
+        for the day (failure > gap > success > upcoming via _day_cell_worst), so a
+        day's row reads "which timers, and how did each fare". Ordered WORST-FIRST
+        across timers (a failed timer sorts above a healthy one) so problems
+        surface at the top of the cell — the de-noising goal applied within the
+        cell. The short-name strips the .timer/.service suffix so the cell shows
+        "backup", not "backup.timer"; truncation-to-fit is the painter's job (it
+        knows the cell width), so this returns the full short name.
+
+        Pure-ish (no painter, no self-state mutation) so the Month cell's per-timer
+        readout has a directly testable core, mirroring _day_cell_summary.
+        """
+        # Group the day's events by timer, keep each timer's worst. dict preserves
+        # first-seen order, which the severity sort below then overrides — so the
+        # grouping order doesn't bias the final worst-first ordering.
+        by_unit: dict[str, list[CalendarEvent]] = {}
+        for ev in events:
+            by_unit.setdefault(ev.unit, []).append(ev)
+        worst_per_unit: list[CalendarEvent] = []
+        for unit_events in by_unit.values():
+            worst = self._day_cell_worst(unit_events)
+            if worst is not None:
+                worst_per_unit.append(worst)
+        # Worst-first: higher severity sorts earlier so a ✘/⛌ leads the cell. A
+        # stable sort keeps same-severity timers in first-seen order (harmless —
+        # same glyph), so the ordering is deterministic for the test.
+        worst_per_unit.sort(key=_event_severity, reverse=True)
+        lines: list[tuple[str, str, QColor]] = []
+        for ev in worst_per_unit:
+            glyph, color = _glyph_color(ev)
+            lines.append((_short_unit_name(ev.unit), glyph, color))
+        return lines
+
     def _month_anchor(self) -> date:
         """The first day of the visible month, derived from window_start (LOCAL).
 
@@ -1192,8 +1431,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
                         self._problem_weeks.add(w_idx)
                     in_month = day.month == anchor.month
                     is_future = day > now_date
+                    # Pass the cell's EVENTS (not a pre-rendered glyph string): the
+                    # cell now lists per-timer names+glyphs (Dustin's choice), which
+                    # it derives from the events via _day_cell_timer_lines. `worst`
+                    # still drives the dim/filter decision (one severity rule).
                     self._paint_month_cell(
-                        painter, w_idx, wd_idx, day, worst, _glyphs,
+                        painter, w_idx, wd_idx, day, worst, cell,
                         in_month, is_future,
                     )
 
@@ -1251,21 +1494,27 @@ class CalendarView(QWidget):  # type: ignore[misc]
         weekday: int,
         day: date,
         worst: CalendarEvent | None,
-        glyphs: str,
+        cell: list[CalendarEvent],
         in_month: bool,
         is_future: bool,
     ) -> None:
-        """Draw one day-cell: its border, day number, and (if any) worst glyph.
+        """Draw one day-cell: border, day number, and up to N per-timer name lines.
 
         Days outside the visible month (grid padding) and future days are dimmed
         so the eye stays on the current month's past — a future or adjacent-month
         cell can't carry an outcome, so muting it is honest, not decorative. When
         a Month-grid filter is active, cells whose worst event doesn't match the
-        filter are ALSO dimmed (and their glyph drawn muted) so only the kind the
+        filter are ALSO dimmed (and their lines drawn muted) so only the kind the
         user asked for stays bright — the filter never drops a cell, it just
-        recedes the rest, keeping the month's shape intact. A problem day's worst
-        glyph is drawn in its outcome colour; a clean day shows only its faint day
-        number (no glyph), which is the de-noising the spec asks for.
+        recedes the rest, keeping the month's shape intact.
+
+        The body is Dustin's explicit choice: up to _MONTH_CELL_MAX_LINES per-timer
+        rows ("<glyph> <short-name>", worst-first via _day_cell_timer_lines), each
+        in its outcome colour, then a "+N more" line when the day has more timers
+        than fit. A clean day with no events shows only its faint day number (the
+        de-noising the spec asks for). `cell` is the day's events; `worst` (already
+        computed by the caller from the same events) drives the dim/filter flag so
+        the cell's dimming matches the worst-outcome rule the rest of the grid uses.
         """
         rect = self._month_cell_rect(week, weekday)
         # Cell outline — faint; the heavy problem-week border is drawn separately
@@ -1275,7 +1524,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
 
         # A cell dims when it's out-of-month, future, OR (filter active) its worst
         # event doesn't match the chosen kind. Folding the filter into the same
-        # `dim` flag means one code path mutes both the day number and the glyph,
+        # `dim` flag means one code path mutes both the day number and the lines,
         # so a filtered-out cell recedes uniformly rather than half-bright.
         filtered_out = not self._cell_matches_filter(worst)
         dim = (not in_month) or is_future or filtered_out
@@ -1289,21 +1538,54 @@ class CalendarView(QWidget):  # type: ignore[misc]
             str(day.day),
         )
 
-        # Worst-outcome glyph + count, centred — only on a non-empty cell, and
-        # only for in-month days (an adjacent-month cell belongs to a neighbour
-        # view, so we don't summarise it here). Future in-month cells can hold
-        # `projected` events; those still draw but in the dim upcoming colour.
+        # Per-timer name lines — only on a non-empty in-month day (an adjacent-
+        # month cell belongs to a neighbour view, so we don't summarise it here).
         if worst is None or not in_month:
             return
-        _glyph, color = _glyph_color(worst)
-        # A filtered-out glyph draws in the muted grey (not its outcome colour) so
-        # the un-asked-for kinds recede; the matching kind keeps its full colour.
-        painter.setPen(QColor(95, 95, 95) if filtered_out else color)
-        painter.drawText(
-            QRect(rect.x() + 3, rect.y() + 18, rect.width() - 6, rect.height() - 20),
-            Qt.AlignmentFlag.AlignCenter,
-            glyphs,
-        )
+        self._paint_month_cell_lines(painter, rect, cell, filtered_out)
+
+    def _paint_month_cell_lines(
+        self,
+        painter: QPainter,
+        rect: QRect,
+        cell: list[CalendarEvent],
+        filtered_out: bool,
+    ) -> None:
+        """Draw the per-timer "<glyph> <short-name>" lines inside a Month cell.
+
+        Splits the heavy body of _paint_month_cell out so each function stays one
+        readable unit (Power of Ten rule 4). `rect` is the cell geometry; `cell`
+        the day's events; `filtered_out` mutes the lines to grey (the filter recede)
+        instead of their outcome colour. Shows up to _MONTH_CELL_MAX_LINES timers
+        worst-first, then a "+N more" line for the overflow so a busy day signals
+        there's more without clipping. Each line is one _ROW_LINE_H tall, starting
+        below the day number; truncation to the cell width is left to QPainter's
+        elided draw via the clipped rect (a long name just clips at the cell edge).
+        """
+        lines = self._day_cell_timer_lines(cell)
+        shown = lines[: self._MONTH_CELL_MAX_LINES]
+        line_h = 14  # one name row; small so 3 fit under the day number
+        y = rect.y() + 18  # below the day-number band
+        for short_name, glyph, color in shown:
+            # A filtered-out line draws muted grey so un-asked-for kinds recede; a
+            # matching (or unfiltered) line keeps its outcome colour.
+            painter.setPen(QColor(95, 95, 95) if filtered_out else color)
+            painter.drawText(
+                QRect(rect.x() + 4, y, rect.width() - 8, line_h),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                f"{glyph} {short_name}",
+            )
+            y += line_h
+        overflow = len(lines) - len(shown)
+        if overflow > 0:
+            # "+N more" tells the user the day has timers beyond the first few,
+            # drawn faint so it reads as a secondary hint, not another outcome.
+            painter.setPen(QColor(120, 120, 120))
+            painter.drawText(
+                QRect(rect.x() + 4, y, rect.width() - 8, line_h),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                f"+{overflow} more",
+            )
 
     def _paint_problem_week_borders(self, painter: QPainter) -> None:
         """Draw a heavy border around every week-row in _problem_weeks.
