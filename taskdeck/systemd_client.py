@@ -327,6 +327,100 @@ def parse_journal(text: str) -> list[LogEntry]:
     return entries
 
 
+def _at_epoch(usec: int) -> str:
+    """Render a MICROSECOND epoch as journalctl/systemd-analyze's `@<seconds>` form.
+
+    Receives: a µs epoch from the calendar model (the whole model is µs — see
+    TimerRow.next_usec and the win_start/win_end the host fans in here).
+    Returns: the `@`-prefixed SECONDS string those two tools actually parse.
+
+    WHY the // 1_000_000 floor is load-bearing (not cosmetic): `journalctl
+    --since/--until` and `systemd-analyze --base-time` parse an `@N` token as
+    INTEGER SECONDS. Handing them the raw µs value is not "the same instant with
+    more precision" — it is a number ~1e6× too large, which the tools REJECT
+    outright with "Failed to parse timestamp" / "Failed to parse --base-time=
+    parameter" (verified live on systemd 258 / Fedora 44, 2026-06-20: @<µs> → rc 1,
+    @<seconds> → rc 0). That rejection blanked the entire calendar past-runs +
+    gap + projection layer in production (Dustin caught it on live retest). So we
+    convert at the argv boundary and ONLY there — keeping the model µs end-to-end.
+
+    WHY floor (// not round) and integer (not seconds.fraction): floor includes
+    the window's left edge for `--since`/`--base-time` (a run AT win_start is in
+    the window). For `--until` the discarded sub-second tail is irrelevant — gap
+    detection's tolerance is 15 minutes (GAP_TOLERANCE_USEC). Integer seconds are
+    accepted by BOTH tools; journalctl also accepts `@<sec>.<frac>` but
+    systemd-analyze's fractional form is unverified, so integer keeps one uniform,
+    proven form across all three fetch sites below.
+    """
+    return f"@{usec // 1_000_000}"
+
+
+def _scope_flags(scope: str) -> list[str]:
+    """The scope flag list: ["--user"] for the user manager, [] for system.
+
+    Module-level (mirrored by SystemdClient._scope_args, which delegates here)
+    so the pure argv-builders below — and the realsystemd tests that exercise
+    them — can construct production argv without a client instance.
+    """
+    return ["--user"] if scope == SCOPE_USER else []
+
+
+# -- pure calendar argv builders --------------------------------------------
+# The three calendar fetches build their argv HERE rather than inline, so the
+# realsystemd fidelity tests can run the EXACT production argv (call the builder,
+# subprocess.run it) instead of hand-typing an approximation. That hand-typed
+# approximation is precisely what let the µs→seconds boundary bug ship: the live
+# tests used `--since "7 days ago"` and a manual `@<seconds>` base, so they never
+# exercised the real @-epoch the client emits. Building argv through one shared
+# function closes that gap — a future flag/format drift now fails a live test.
+# Each takes the resolved binary path (honoring the test-injected fakebin) and
+# returns the full argv; the µs→seconds conversion lives in _at_epoch.
+
+
+def cal_projection_argv(
+    analyze: str, expr: str, base_epoch_usec: int, iterations: int
+) -> list[str]:
+    """argv for `systemd-analyze calendar` projecting `expr` from a PAST base.
+
+    base_epoch_usec is MICROSECONDS; _at_epoch floors it to the SECONDS form
+    --base-time parses. "--" stops flag parsing before the expression.
+    """
+    return [
+        analyze, "calendar",
+        f"--base-time={_at_epoch(base_epoch_usec)}", f"--iterations={iterations}",
+        "--", expr,
+    ]
+
+
+def cal_journal_argv(
+    journalctl: str, scope: str, since_epoch_usec: int, until_epoch_usec: int
+) -> list[str]:
+    """argv for the ONE journalctl run-outcome query over [since, until].
+
+    Both bounds are MICROSECONDS; _at_epoch floors each to SECONDS. The two
+    JOB_RESULT filters keep only completed-job records (done/failed).
+    """
+    return [
+        journalctl, *_scope_flags(scope),
+        "-o", "json",
+        f"--since={_at_epoch(since_epoch_usec)}", f"--until={_at_epoch(until_epoch_usec)}",
+        "JOB_RESULT=done", "JOB_RESULT=failed", "--no-pager",
+    ]
+
+
+def cal_coverage_argv(journalctl: str, scope: str, since_epoch_usec: int) -> list[str]:
+    """argv for the UNFILTERED oldest-entry coverage-floor probe at/after since.
+
+    since_epoch_usec is MICROSECONDS; _at_epoch floors it to SECONDS.
+    --output-fields narrows each line to the one timestamp the handler reads.
+    """
+    return [
+        journalctl, *_scope_flags(scope),
+        "-o", "json", f"--since={_at_epoch(since_epoch_usec)}",
+        "--output-fields=__REALTIME_TIMESTAMP", "--no-pager",
+    ]
+
+
 # Scope constants used across modules; "user" gets --user injected, "system"
 # doesn't. Strings (not an Enum) because they appear verbatim in request ids
 # and error messages — YAGNI until a third scope exists.
@@ -524,8 +618,12 @@ class SystemdClient(QObject):  # type: ignore[misc]
     # -- typed conveniences (argv assembly in ONE place) --------------------
 
     def _scope_args(self, scope: str) -> list[str]:
-        """Return the scope flag list for scope: ["--user"] for user, [] for system."""
-        return ["--user"] if scope == SCOPE_USER else []
+        """Return the scope flag list for scope: ["--user"] for user, [] for system.
+
+        Delegates to the module-level _scope_flags so the pure argv-builders and
+        their realsystemd tests share this one mapping (no instance needed there).
+        """
+        return _scope_flags(scope)
 
     def list_timers(self, scope: str) -> bool:
         return self.request(
@@ -641,14 +739,16 @@ class SystemdClient(QObject):  # type: ignore[misc]
         expr is a NORMALIZED OnCalendar form from `systemctl show`, so it is
         well-formed; "--" stops flag parsing regardless (mirrors fetch_calendar's
         belt-and-suspenders, harmless and survives an unnormalized future caller).
+
+        `base_epoch` is MICROSECONDS (the host passes win_start straight from the
+        µs model). systemd-analyze's `--base-time=@N` parses N as SECONDS, so we
+        floor µs→s via _at_epoch — handing it the raw µs value makes it reject the
+        arg ("Failed to parse --base-time= parameter", verified live 2026-06-20)
+        and blanks the projection layer. See _at_epoch for the full rationale.
         """
         return self.request(
             f"calproj:{scope}:{unit}{tag}",
-            [
-                self._analyze, "calendar",
-                f"--base-time=@{base_epoch}", f"--iterations={iterations}",
-                "--", expr,
-            ],
+            cal_projection_argv(self._analyze, expr, base_epoch, iterations),
         )
 
     def fetch_cal_journal(
@@ -660,8 +760,13 @@ class SystemdClient(QObject):  # type: ignore[misc]
         window (parse_run_journal buckets them back to their timers in pure
         code) — querying per-unit would spawn one process per timer. The two
         JOB_RESULT filters keep only completed-job records (done=success,
-        failed=failure); the since/until are @-prefixed epochs matching the
-        calendar window the user is viewing.
+        failed=failure); the since/until bound the calendar window the user is
+        viewing. since_epoch/until_epoch arrive in MICROSECONDS (the host passes
+        win_start and min(now, win_end) from the µs model), but journalctl's
+        `--since/--until=@N` parse N as SECONDS — so we floor µs→s via _at_epoch
+        at the argv boundary. Passing the raw µs value makes journalctl reject it
+        ("Failed to parse timestamp", verified live 2026-06-20) and blanks the
+        past-runs layer. See _at_epoch for why floor + integer seconds is correct.
 
         `tag` is appended to the request id (host passes `f"@{gen}"`) so the id is
         unique per build — same reasoning as fetch_cal_projection's tag: the id
@@ -675,11 +780,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
         """
         return self.request(
             f"caljournal:{scope}{tag}",
-            [
-                self._journalctl, *self._scope_args(scope),
-                "-o", "json", f"--since=@{since_epoch}", f"--until=@{until_epoch}",
-                "JOB_RESULT=done", "JOB_RESULT=failed", "--no-pager",
-            ],
+            cal_journal_argv(self._journalctl, scope, since_epoch, until_epoch),
             timeout_ms=15_000,
         )
 
@@ -696,9 +797,13 @@ class SystemdClient(QObject):  # type: ignore[misc]
         kind in the window is, which is exactly how far back coverage reaches.
 
         How the oldest entry is obtained: journalctl prints in chronological
-        (oldest-first) order by default, and `--since=@since_epoch` makes the
-        stream START at the window's left edge. So the FIRST line of stdout is
-        the oldest entry at/after since_epoch — precisely the coverage floor. We
+        (oldest-first) order by default, and `--since` makes the stream START at
+        the window's left edge. So the FIRST line of stdout is the oldest entry
+        at/after since_epoch — precisely the coverage floor. since_epoch arrives in
+        MICROSECONDS (win_start from the µs model); journalctl's `--since=@N` wants
+        SECONDS, so _at_epoch floors µs→s at the boundary — the raw µs value is
+        rejected as "Failed to parse timestamp" (verified live 2026-06-20) and
+        would blank the coverage floor. See _at_epoch for the full rationale. We
         deliberately do NOT use `-n1`: that flag counts from the END and would
         return the NEWEST line, the opposite of what we need. The handler reads
         only the first line of the stream, so the volume after it is irrelevant.
@@ -723,11 +828,7 @@ class SystemdClient(QObject):  # type: ignore[misc]
         """
         return self.request(
             f"calcover:{scope}{tag}",
-            [
-                self._journalctl, *self._scope_args(scope),
-                "-o", "json", f"--since=@{since_epoch}",
-                "--output-fields=__REALTIME_TIMESTAMP", "--no-pager",
-            ],
+            cal_coverage_argv(self._journalctl, scope, since_epoch),
             timeout_ms=15_000,
         )
 

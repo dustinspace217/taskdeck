@@ -7,9 +7,17 @@ async code without sleeps.
 """
 from pathlib import Path
 
-from taskdeck.systemd_client import SystemdClient, parse_list_timers
+from taskdeck.systemd_client import SystemdClient, _at_epoch, parse_list_timers
 
 FAKEBIN = Path(__file__).parent / "fakebin"
+
+# A realistic MICROSECOND epoch as the host actually passes it (16-17 digits) —
+# the bug report's value. Its //1_000_000 floor is the SECONDS form the two
+# subprocess tools accept. Using a true µs magnitude here (not a seconds-sized
+# stand-in) is what makes the argv tests NON-VACUOUS: the pre-fix code
+# interpolated this raw, producing @1781914546656007 which systemd rejects.
+CAL_US = 1781914546656007
+CAL_SEC = "1781914546"  # CAL_US // 1_000_000, the form that parses (rc 0)
 
 
 def make_client(qtbot, binary: str, timeout_ms: int = 5000) -> SystemdClient:
@@ -105,19 +113,36 @@ def test_fetch_calendar_emits_expected_id_and_flag_stop_argv(qtbot):
     assert argv_lines == ["calendar", "--iterations=5", "--", "*-*-* 03:50:00"]
 
 
+def test_at_epoch_floors_microseconds_to_seconds():
+    # The µs→seconds boundary helper in isolation. systemd-analyze/journalctl
+    # parse `@N` as SECONDS, but the calendar model is microseconds throughout;
+    # _at_epoch is the one place that converts. Floor (// not round) so the
+    # window's left edge is included. A regression that dropped the //1_000_000
+    # would surface here AND in the three argv tests below.
+    assert _at_epoch(CAL_US) == "@" + CAL_SEC
+    assert _at_epoch(0) == "@0"
+    assert _at_epoch(1_999_999) == "@1"  # sub-second tail floored away, not rounded
+
+
 def test_fetch_cal_projection_id_and_argv(qtbot):
     # Calendar view's future-run source: an exact-instant projection from a past
     # base time. Pins the "calproj:{scope}:{unit}" id (NEVER "calendar:" — that
     # kind is taken by the Schedule-tab elapse preview, and _dispatch_finished
     # routes only on the kind before the first ':') AND the exact argv, including
     # the "--" flag-stop before the expression. fake_echo_argv dumps the argv.
+    #
+    # NON-VACUOUS guard for the µs→seconds bug: the host passes a MICROSECOND
+    # win_start (CAL_US, 16 digits); --base-time must carry the SECONDS floor
+    # (@CAL_SEC), NOT the raw µs value. Reverting _at_epoch's //1_000_000 makes
+    # this assert @1781914546656007 and fail — which is exactly what systemd
+    # rejects in production ("Failed to parse --base-time= parameter").
     client = SystemdClient(analyze=str(FAKEBIN / "fake_echo_argv"))
     with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
-        client.fetch_cal_projection("user", "a.timer", "*-*-* 06:00:00", 1781000000, 8)
+        client.fetch_cal_projection("user", "a.timer", "*-*-* 06:00:00", CAL_US, 8)
     rid, stdout = blocker.args
     assert rid == "calproj:user:a.timer"
     assert stdout.splitlines() == [
-        "calendar", "--base-time=@1781000000", "--iterations=8", "--", "*-*-* 06:00:00",
+        "calendar", f"--base-time=@{CAL_SEC}", "--iterations=8", "--", "*-*-* 06:00:00",
     ]
 
 
@@ -125,14 +150,44 @@ def test_fetch_cal_journal_id_and_argv(qtbot):
     # Calendar view's past-runs source: ONE journalctl query covering all units
     # in the window, filtered to completion outcomes. Pins the "caljournal:{scope}"
     # id and that both JOB_RESULT filters + the since/until window land in argv.
+    #
+    # NON-VACUOUS guard: since/until arrive in MICROSECONDS and must land as the
+    # SECONDS floor (@CAL_SEC), not @<µs> — the raw µs value is what journalctl
+    # rejected with "Failed to parse timestamp" in production. until uses a
+    # DIFFERENT µs value (CAL_US + 1 day in µs) so a swapped since/until or a
+    # dropped conversion on either bound is caught distinctly.
+    until_us = CAL_US + 86_400 * 1_000_000
+    until_sec = until_us // 1_000_000
     client = SystemdClient(journalctl=str(FAKEBIN / "fake_echo_argv"))
     with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
-        client.fetch_cal_journal("user", 1781000000, 1781086400)
+        client.fetch_cal_journal("user", CAL_US, until_us)
     rid, stdout = blocker.args
     assert rid == "caljournal:user"
     argv = stdout.splitlines()
     assert "JOB_RESULT=done" in argv and "JOB_RESULT=failed" in argv
-    assert "--since=@1781000000" in argv and "--until=@1781086400" in argv
+    assert f"--since=@{CAL_SEC}" in argv and f"--until=@{until_sec}" in argv
+    # And explicitly: the raw µs value must not appear EMBEDDED in any arg (the
+    # bug put it inside `--since=@<µs>`, so substring-check the whole line — list
+    # membership would miss it).
+    assert str(CAL_US) not in " ".join(argv)
+
+
+def test_fetch_cal_coverage_id_and_argv(qtbot):
+    # Calendar view's journal-coverage floor probe (F1): the UNFILTERED oldest-
+    # entry query that distinguishes "no runs" from "journal doesn't reach back".
+    # Pins the "calcover:{scope}" id and — the same µs→seconds boundary — that
+    # --since carries the SECONDS floor, never the raw µs value. This site had
+    # the identical bug; without this test it was the one fetch with no argv
+    # coverage at all.
+    client = SystemdClient(journalctl=str(FAKEBIN / "fake_echo_argv"))
+    with qtbot.waitSignal(client.finished, timeout=3000) as blocker:
+        client.fetch_cal_coverage("user", CAL_US)
+    rid, stdout = blocker.args
+    assert rid == "calcover:user"
+    argv = stdout.splitlines()
+    assert f"--since=@{CAL_SEC}" in argv
+    # Raw µs must not appear embedded in `--since=@<µs>` (substring, not list).
+    assert str(CAL_US) not in " ".join(argv)
 
 
 def test_list_failed_services_emits_expected_id_and_argv(qtbot):
