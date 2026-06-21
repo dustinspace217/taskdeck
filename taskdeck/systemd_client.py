@@ -438,6 +438,18 @@ RESULT_PROPS = "Result,ExecMainStatus,ExecMainExitTimestamp"
 # property set so both consumers share fixtures and parsing (DEF-V11-02).
 SCHEDULE_PROPS = "TimersCalendar,TimersMonotonic,NextElapseUSecRealtime"
 
+# Calendar-projection concurrency pool (DEF-CAL-02). A calendar build fans out one
+# `systemd-analyze` per timer×OnCalendar-expression for BOTH a past and a forward
+# projection — ~130+ concurrent on ~68 timers, with no upper bound. An uncapped run
+# OOM-crashed the machine (incident 2026-06-21). The pool caps concurrently-RUNNING
+# `calproj` subprocesses and queues the rest, starting them as slots free.
+CALPROJ_CONCURRENCY_CAP = 12
+# Hard bound on the wait queue so a runaway (or rapid nav stacking stale builds)
+# can't grow it without limit (Power of Ten rule 3). Generous — a normal build's
+# excess over the cap is ~120, so this absorbs several builds — but a true runaway
+# is refused (request() returns False) past it rather than ballooning memory.
+CALPROJ_QUEUE_MAX = 1024
+
 
 class SystemdClient(QObject):  # type: ignore[misc]
     """Runs systemctl/journalctl asynchronously and emits results as signals.
@@ -484,6 +496,16 @@ class SystemdClient(QObject):  # type: ignore[misc]
         # which runs entirely outside any emission of these objects. Bounded by
         # how many can finish between two requests (~8).
         self._finished: list[tuple[QProcess, QTimer]] = []
+        # Calendar-projection pool (DEF-CAL-02). _calproj_active = rids currently
+        # RUNNING (counted against CALPROJ_CONCURRENCY_CAP); _calproj_queue = the
+        # FIFO of (rid, argv, timeout) waiting for a slot; _calproj_queued mirrors
+        # the queue's rids so single-flight can reject a duplicate before it runs.
+        # Only kind "calproj" uses the pool — every other request kind (timers,
+        # services, results, schedules, coverage, journal, log, cat, details,
+        # action) spawns immediately so a calendar fan-out can't starve them.
+        self._calproj_active: set[str] = set()
+        self._calproj_queue: list[tuple[str, list[str], int | None]] = []
+        self._calproj_queued: set[str] = set()
 
     @property
     def systemctl_path(self) -> str:
@@ -500,17 +522,45 @@ class SystemdClient(QObject):  # type: ignore[misc]
     def request(self, request_id: str, argv: list[str], timeout_ms: int | None = None) -> bool:
         """Start argv asynchronously; results arrive via finished/failed.
 
-        Returns False (and runs nothing) if request_id is already in flight.
-        timeout_ms overrides the client default per request kind — journal
-        reads legitimately take longer than list queries (reverse-seeking a
-        multi-GB rotated journal is a known multi-second operation).
+        Returns False (runs nothing) if request_id is already in flight — or, for a
+        calproj, already running or queued in the pool. timeout_ms overrides the
+        client default per request kind — journal reads legitimately take longer
+        than list queries (reverse-seeking a multi-GB rotated journal is a known
+        multi-second operation).
+
+        Calendar projections (kind "calproj") go through a concurrency pool: at most
+        CALPROJ_CONCURRENCY_CAP run at once, the rest QUEUE and start as slots free,
+        so a build's ~130 systemd-analyze calls can't all spawn together (DEF-CAL-02
+        — the uncapped version OOM-crashed the machine). Every other kind spawns now.
         """
-        if request_id in self._inflight:
-            return False
-        # Free the previous cycle's finished processes now — safe here because
-        # we are at the top of a fresh request(), outside any of their signal
-        # emissions (the DEF-T4-01 fix). Any late death-echoes they had were
-        # already processed and dropped by the identity guards below.
+        is_calproj = request_id.split(":", 1)[0] == "calproj"
+        if (
+            request_id in self._inflight
+            or request_id in self._calproj_active
+            or request_id in self._calproj_queued
+        ):
+            return False  # single-flight across the in-flight registry AND the pool
+        if is_calproj and len(self._calproj_active) >= CALPROJ_CONCURRENCY_CAP:
+            if len(self._calproj_queue) >= CALPROJ_QUEUE_MAX:
+                return False  # bounded queue full — refuse rather than balloon (PoT r3)
+            self._calproj_queue.append((request_id, argv, timeout_ms))
+            self._calproj_queued.add(request_id)
+            return True
+        if is_calproj:
+            self._calproj_active.add(request_id)
+        self._spawn(request_id, argv, timeout_ms)
+        return True
+
+    def _spawn(self, request_id: str, argv: list[str], timeout_ms: int | None) -> None:
+        """Create and start the QProcess for an ADMITTED request (the calproj pool,
+        if any, has already let it through). Split from request() so the pool admits
+        FIRST — and so a test can override _spawn to drive the pool accounting
+        WITHOUT spawning a real process. That mock-the-spawn seam is the leak-safe
+        way to test the pool: the DEF-CAL-02 crash came from a test that fired real
+        blocking processes and leaked them, so the pool tests spawn nothing real."""
+        # Free the previous cycle's finished processes now — safe because we run
+        # outside any of their signal emissions (request() and the deferred
+        # _pump_calproj both call us off the emission stack — the DEF-T4-01 fix).
         self._sweep_finished()
         effective_timeout = timeout_ms if timeout_ms is not None else self._timeout_ms
         proc = QProcess(self)
@@ -577,7 +627,20 @@ class SystemdClient(QObject):  # type: ignore[misc]
         proc.errorOccurred.connect(on_error)
         proc.start(argv[0], argv[1:])
         watchdog.start()
-        return True
+
+    def _pump_calproj(self) -> None:
+        """Start queued calendar projections while pool slots are free. Each
+        iteration pops one, so the loop is bounded by the queue length and always
+        terminates (Power of Ten rule 2). Called deferred from _retire — off the
+        finished/timeout emission stack — so the _spawn here is DEF-T4-01-safe."""
+        while (
+            self._calproj_queue
+            and len(self._calproj_active) < CALPROJ_CONCURRENCY_CAP
+        ):
+            request_id, argv, timeout_ms = self._calproj_queue.pop(0)
+            self._calproj_queued.discard(request_id)
+            self._calproj_active.add(request_id)
+            self._spawn(request_id, argv, timeout_ms)
 
     def _retire(self, request_id: str, proc: QProcess, watchdog: QTimer) -> None:
         """Mark a request terminal: stop its watchdog, drop it from the
@@ -589,6 +652,12 @@ class SystemdClient(QObject):  # type: ignore[misc]
         watchdog.stop()
         self._inflight.pop(request_id, None)
         self._finished.append((proc, watchdog))
+        if request_id in self._calproj_active:
+            # Free this projection's pool slot and pump the queue — but on the NEXT
+            # event-loop turn: spawning a QProcess during this finished/timeout
+            # emission segfaults (DEF-T4-01); singleShot(0) hops off the stack.
+            self._calproj_active.discard(request_id)
+            QTimer.singleShot(0, self._pump_calproj)
 
     def flush_finished(self) -> None:
         """Free parked processes now, for shutdown paths where no further

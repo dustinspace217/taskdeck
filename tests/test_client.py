@@ -7,7 +7,12 @@ async code without sleeps.
 """
 from pathlib import Path
 
-from taskdeck.systemd_client import SystemdClient, _at_epoch, parse_list_timers
+from taskdeck.systemd_client import (
+    CALPROJ_CONCURRENCY_CAP,
+    SystemdClient,
+    _at_epoch,
+    parse_list_timers,
+)
 
 FAKEBIN = Path(__file__).parent / "fakebin"
 
@@ -266,3 +271,75 @@ def test_timeout_emits_exactly_one_terminal_signal(qtbot):
     qtbot.waitUntil(lambda: len(outcomes) >= 1, timeout=5000)
     qtbot.wait(400)  # let the kill's echoes arrive and be (not) handled
     assert outcomes == [("failed", "hang:once")]
+
+
+# -- calproj concurrency pool (DEF-CAL-02) ------------------------------------
+# SAFETY-CRITICAL test design: every test below MOCKS _spawn, so NO real process
+# is ever created. The DEF-CAL-02 incident (2026-06-21) was a test that fired real
+# blocking processes and leaked them, OOM-crashing the machine. Mocking the spawn
+# exercises the pool's ACCOUNTING (cap / queue / drain / single-flight) with zero
+# subprocesses — the failure mode is impossible by construction.
+
+
+def test_calproj_cap_admits_cap_and_queues_rest(qtbot):
+    client = SystemdClient()
+    spawned: list = []
+    client._spawn = lambda rid, argv, t: spawned.append(rid)  # type: ignore[method-assign]
+    cap = CALPROJ_CONCURRENCY_CAP
+    for i in range(cap + 5):
+        assert client.request(f"calproj:user:t{i}#0@1", ["x"]) is True
+    assert len(client._calproj_active) == cap        # only cap-many run
+    assert len(client._calproj_queue) == 5           # the rest wait
+    assert spawned == [f"calproj:user:t{i}#0@1" for i in range(cap)]  # only cap spawned
+
+
+def test_calproj_pump_drains_queue_as_slots_free(qtbot):
+    client = SystemdClient()
+    spawned: list = []
+    client._spawn = lambda rid, argv, t: spawned.append(rid)  # type: ignore[method-assign]
+    cap = CALPROJ_CONCURRENCY_CAP
+    for i in range(cap + 3):
+        client.request(f"calproj:user:t{i}#0@1", ["x"])
+    freed = sorted(client._calproj_active)[0]        # simulate one finishing
+    client._calproj_active.discard(freed)
+    client._pump_calproj()
+    assert len(client._calproj_active) == cap        # a queued one took the slot
+    assert len(client._calproj_queue) == 2           # one drained from the 3
+    assert len(spawned) == cap + 1                   # the pumped one spawned too
+
+
+def test_calproj_single_flight_spans_pool(qtbot):
+    client = SystemdClient()
+    client._spawn = lambda rid, argv, t: None  # type: ignore[method-assign]
+    cap = CALPROJ_CONCURRENCY_CAP
+    rid = "calproj:user:t0#0@1"
+    assert client.request(rid, ["x"]) is True        # admitted (now running)
+    assert client.request(rid, ["x"]) is False       # duplicate of a RUNNING one
+    for i in range(1, cap):                          # fill to the cap
+        client.request(f"calproj:user:t{i}#0@1", ["x"])
+    qrid = "calproj:user:tq#0@1"
+    assert client.request(qrid, ["x"]) is True        # queued (cap reached)
+    assert client.request(qrid, ["x"]) is False       # duplicate of a QUEUED one
+
+
+def test_calproj_queue_max_refuses_loudly(qtbot, monkeypatch):
+    import taskdeck.systemd_client as sc
+    monkeypatch.setattr(sc, "CALPROJ_QUEUE_MAX", 3)
+    client = sc.SystemdClient()
+    client._spawn = lambda rid, argv, t: None  # type: ignore[method-assign]
+    cap = sc.CALPROJ_CONCURRENCY_CAP
+    for i in range(cap + 3):                          # cap running + 3 queued: all OK
+        assert client.request(f"calproj:user:t{i}#0@1", ["x"]) is True
+    assert client.request("calproj:user:over#0@1", ["x"]) is False  # queue full → refused
+    assert len(client._calproj_queue) == 3            # not ballooned past the bound
+
+
+def test_non_calproj_requests_are_not_pooled(qtbot):
+    client = SystemdClient()
+    spawned: list = []
+    client._spawn = lambda rid, argv, t: spawned.append(rid)  # type: ignore[method-assign]
+    for i in range(CALPROJ_CONCURRENCY_CAP + 10):     # far more than the cap
+        assert client.request(f"caljournal:user@{i}", ["x"]) is True
+    assert client._calproj_active == set()            # nothing pooled
+    assert client._calproj_queue == []
+    assert len(spawned) == CALPROJ_CONCURRENCY_CAP + 10  # all spawned immediately
