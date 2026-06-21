@@ -355,6 +355,7 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # table selection uses, via the adapter. rebuild(start, end): a nav move
         # asks the host to refetch exactly the new window.
         self.calendar_view.selected.connect(self._on_calendar_selected)
+        self.calendar_view.event_activated.connect(self._on_calendar_event_activated)
         self.calendar_view.rebuild.connect(self._build_calendar)
         self.setCentralWidget(self._stack)
         self._update_action_enablement()
@@ -1027,6 +1028,28 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # a stale in-flight fetch for this id could fill the tab as fresh;
             # leaving the dedup unset makes the next interaction retry.
             self._last_detail_unit = None
+
+    def _on_calendar_event_activated(self, unit: str, category: str, when: int) -> None:
+        """Diagnostic click-through: steer the detail pane to the clicked OUTCOME.
+
+        `selected` (fired first by the same click) already loaded this unit's tabs;
+        here we route by WHAT was clicked. A FAILED run jumps to the Log tab (its
+        journal shows the exit + output); a GAP jumps to the Schedule tab (when it
+        was due) — a missed run has NO journal entry, so we name the specific slot
+        in the status bar rather than open an empty log. ran/upcoming keep whatever
+        tab is showing. The tab-switch is pure UI (no fetch), so it runs in tests too
+        and is NOT gated on _auto_refresh. `when` is a µs UTC epoch rendered in LOCAL
+        time (fromtimestamp without tz), matching the calendar's display-clock rule.
+        """
+        when_local = datetime.fromtimestamp(when / 1_000_000).strftime("%a %b %d %H:%M")
+        if category == "failure":
+            self.tabs.setCurrentWidget(self.tab_log)
+            self.statusBar().showMessage(f"Failed run: {unit} @ {when_local} — see Log", 0)
+        elif category == "gap":
+            self.tabs.setCurrentWidget(self.tab_schedule)
+            self.statusBar().showMessage(
+                f"Gap: {unit} was due @ {when_local} — no run found", 0
+            )
 
     def _render_rows(self) -> None:
         """Render cached data into the model; restore selection and scroll.

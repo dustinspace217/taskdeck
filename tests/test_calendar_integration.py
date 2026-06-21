@@ -966,3 +966,52 @@ def test_forward_projection_uses_now_base_distinct_from_win_start(qtbot):
     assert all(c[5] == FWD_PROJECTION_ITERATIONS for c in fwd), (
         "forward projection uses FWD_PROJECTION_ITERATIONS"
     )
+
+
+# -- diagnostic click-through (v2): failure -> Log tab, gap -> Schedule tab ----
+
+
+def test_event_category_buckets_outcomes():
+    # The routing category collapses (kind, result) into the buckets the host
+    # steers on: a failed run -> 'failure' (Log), a missed run -> 'gap' (Schedule),
+    # a healthy run -> 'ran', a projection -> 'upcoming'.
+    from taskdeck.calendar_model import CalendarEvent
+    from taskdeck.calendar_view import _event_category
+
+    assert _event_category(CalendarEvent("u.timer", 1, "ran", "failure")) == "failure"
+    assert _event_category(CalendarEvent("u.timer", 1, "ran", "success")) == "ran"
+    assert _event_category(CalendarEvent("u.timer", 1, "gap", "")) == "gap"
+    assert _event_category(CalendarEvent("u.timer", 1, "projected", "")) == "upcoming"
+    assert _event_category(CalendarEvent("u.timer", 1, "approx", "")) == "upcoming"
+
+
+def test_calendar_click_failure_jumps_to_log_tab(qtbot):
+    # Clicking a FAILED event steers the detail pane to the Log tab (the journal
+    # shows why it failed) and names the run in the status bar.
+    window, _client = make_window(qtbot)
+    window.tabs.setCurrentWidget(window.tab_details)  # start on a different tab
+    window._on_calendar_event_activated("backup.timer", "failure", _usec(2026, 6, 20, 6, 0))
+    assert window.tabs.currentWidget() is window.tab_log
+    assert "Failed run: backup.timer" in window.statusBar().currentMessage()
+
+
+def test_calendar_click_gap_jumps_to_schedule_tab(qtbot):
+    # A GAP (missed run, no journal entry) steers to the Schedule tab and names the
+    # missed slot in the status bar instead of opening an empty log.
+    window, _client = make_window(qtbot)
+    window.tabs.setCurrentWidget(window.tab_log)
+    window._on_calendar_event_activated("backup.timer", "gap", _usec(2026, 6, 20, 6, 0))
+    assert window.tabs.currentWidget() is window.tab_schedule
+    msg = window.statusBar().currentMessage()
+    assert "Gap: backup.timer" in msg and "no run found" in msg
+
+
+def test_calendar_click_healthy_keeps_current_tab(qtbot):
+    # A successful run or an upcoming projection must NOT yank the user to another
+    # tab — only problems (failure/gap) steer.
+    window, _client = make_window(qtbot)
+    window.tabs.setCurrentWidget(window.tab_details)
+    window._on_calendar_event_activated("backup.timer", "ran", _usec(2026, 6, 20, 6, 0))
+    assert window.tabs.currentWidget() is window.tab_details
+    window._on_calendar_event_activated("backup.timer", "upcoming", _usec(2026, 6, 20, 6, 0))
+    assert window.tabs.currentWidget() is window.tab_details

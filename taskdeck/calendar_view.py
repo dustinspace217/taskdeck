@@ -119,6 +119,21 @@ def _event_severity(event: CalendarEvent) -> int:
     return _SEVERITY.get((event.kind, event.result), 0)
 
 
+def _event_category(event: CalendarEvent) -> str:
+    """Coarse routing category for diagnostic click-through.
+
+    Collapses (kind, result) into the four buckets the host routes on:
+    'failure' (a run that exited non-zero → jump to its Log), 'gap' (a missed
+    scheduled run → jump to the Schedule), 'ran' (a healthy run), 'upcoming'
+    (projected/approx, or anything unrecognized — never routed as a problem).
+    """
+    if event.kind == "ran":
+        return "failure" if event.result == "failure" else "ran"
+    if event.kind == "gap":
+        return "gap"
+    return "upcoming"
+
+
 def _local_dt(when_usec: int) -> datetime:
     """A µs UTC epoch as a NAIVE LOCAL datetime — the calendar's display clock.
 
@@ -191,6 +206,9 @@ class CalendarView(QWidget):  # type: ignore[misc]
     Outward contract (consumed by main_window in Task 7):
     - `selected = Signal(str)` — the timer unit a click landed on; the host wires
       it to the same detail-tab fetches the table selection uses.
+    - `event_activated = Signal(str, str, qlonglong)` — (unit, category, when) for
+      the WORST event under the click; the host routes a failure → Log tab and a
+      gap → Schedule tab (diagnostic click-through). Additive to `selected`.
     - `rebuild = Signal(qlonglong, qlonglong)` — (window_start, window_end) after
       a nav move; the host refetches journal+projection for the new window.
       Emitting the window (not just "moved") lets the host fetch exactly what's
@@ -209,6 +227,13 @@ class CalendarView(QWidget):  # type: ignore[misc]
     # is a typo — verified: the truncated value reached the slot). qlonglong is
     # Qt's 64-bit integer and round-trips a µs epoch to Python int unchanged.
     rebuild = Signal("qlonglong", "qlonglong")
+    # Diagnostic click-through (v2): (unit, category, when_usec) for the WORST
+    # event the click landed on. category ∈ {'failure','gap','ran','upcoming'};
+    # the host routes a failure → Log tab, a gap → Schedule tab. Emitted ALONGSIDE
+    # `selected` (which loads the detail tabs) — this signal only adds the routing,
+    # so a host that ignores it keeps the old select-only behavior. qlonglong for
+    # `when`, same µs-overflow reason as `rebuild`.
+    event_activated = Signal(str, str, "qlonglong")
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1852,14 +1877,47 @@ class CalendarView(QWidget):  # type: ignore[misc]
             super().mousePressEvent(event)
             return
         pos = event.position()
+        x, y = int(pos.x()), int(pos.y())
         if self._mode == "month":
-            unit = self._month_click_unit(int(pos.x()), int(pos.y()))
+            unit = self._month_click_unit(x, y)
         else:
-            unit = self._row_click_unit(int(pos.y()))
+            unit = self._row_click_unit(y)
         if unit is not None:
             self.selected.emit(unit)
+            # Also route by the clicked OUTCOME (diagnostic click-through): resolve
+            # the worst event at the same point and emit its category so the host
+            # can steer a failure → Log tab, a gap → Schedule tab. `selected` above
+            # already loaded the tabs; this only chooses which one to show.
+            ev = self._event_at(x, y)
+            if ev is not None:
+                self.event_activated.emit(unit, _event_category(ev), ev.when)
             return
         super().mousePressEvent(event)
+
+    def _event_at(self, x: int, y: int) -> CalendarEvent | None:
+        """The WORST event at a click point, or None off any target.
+
+        Day/Week: the worst event of the clicked timer ROW. Month: the worst event
+        of the clicked day-CELL. Reuses the SAME geometry (_row_click_unit /
+        _month_cell_rect) and the SAME _event_severity the paint uses, so the click
+        resolves to exactly the event whose glyph dominates the cell — what the user
+        is aiming at.
+        """
+        if self._mode == "month":
+            by_date = self._events_by_date()
+            for w_idx, week in enumerate(self._month_weeks()):
+                for wd_idx, day in enumerate(week):
+                    if self._month_cell_rect(w_idx, wd_idx).contains(x, y):
+                        _glyphs, worst, _counts = self._day_cell_summary(
+                            by_date.get(day, [])
+                        )
+                        return worst
+            return None
+        unit = self._row_click_unit(y)
+        if unit is None:
+            return None
+        row_events = [e for e in self._events if e.unit == unit]
+        return max(row_events, key=_event_severity) if row_events else None
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
         """Reveal a Month day-cell's FULL timer list as a tooltip on hover.
