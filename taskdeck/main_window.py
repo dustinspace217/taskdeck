@@ -123,6 +123,11 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # the post-refresh selection restore re-select without re-fetching
         # (and re-flashing "loading…") every 10s cycle.
         self._last_detail_unit: str | None = None
+        # A unit to select in the Timers table once it next renders — set by the
+        # calendar's "Open in Timers" right-click, applied once by _render_rows
+        # after the table repopulates, then cleared so it can't override the user's
+        # own later selection.
+        self._pending_table_select: str | None = None
 
         # -- Calendar-page build state (page 1 of the central stack) ----------
         # The calendar fans MANY fetches in per build (a coverage probe, one
@@ -356,7 +361,9 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # asks the host to refetch exactly the new window.
         self.calendar_view.selected.connect(self._on_calendar_selected)
         self.calendar_view.event_activated.connect(self._on_calendar_event_activated)
+        self.calendar_view.menu_action.connect(self._on_calendar_menu_action)
         self.calendar_view.rebuild.connect(self._build_calendar)
+        self.calendar_view.set_run_enabled(self.scope == SCOPE_USER)
         self.setCentralWidget(self._stack)
         self._update_action_enablement()
 
@@ -384,6 +391,7 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         for view in self._kind_to_tab.values():
             view.setPlainText("(select a unit)")
         self._update_action_enablement()
+        self.calendar_view.set_run_enabled(scope == SCOPE_USER)
         if self._auto_refresh:
             self.refresh()
 
@@ -1051,6 +1059,42 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
                 f"Gap: {unit} was due @ {when_local} — no run found", 0
             )
 
+    def _on_calendar_menu_action(self, action: str, unit: str) -> None:
+        """Execute a calendar right-click action for `unit` (always a timer).
+
+        'run'   → start the timer's ACTIVATED service now (what "run now" means;
+                  starting the .timer only re-arms its schedule). Goes through the
+                  SAME action_argv guard as the toolbar — refused loudly in system
+                  scope even though the menu greys it (belt-and-suspenders).
+        'logs'  → load the unit's detail tabs and show the Log tab.
+        'table' → switch the central view to the Timers table and select the unit
+                  there once it renders (via _pending_table_select).
+        """
+        if action == "run":
+            activates = next(
+                (t.activates for t in self._timers if t.unit == unit), None
+            )
+            target = activates or unit
+            try:
+                argv = action_argv(
+                    "start", self.scope, target, systemctl=self.client.systemctl_path
+                )
+            except ActionNotAllowed as exc:
+                self.statusBar().showMessage(f"refused: {exc}", 0)
+                return
+            if self.client.run_action(argv, target):
+                self.statusBar().showMessage(f"start {target}…", 0)
+            else:
+                self.statusBar().showMessage(
+                    f"{target}: previous action still running", 5000
+                )
+        elif action == "logs":
+            self._on_calendar_selected(unit)
+            self.tabs.setCurrentWidget(self.tab_log)
+        elif action == "table":
+            self._pending_table_select = unit
+            self.view_box.setCurrentIndex(self.view_box.findText("Timers"))
+
     def _render_rows(self) -> None:
         """Render cached data into the model; restore selection and scroll.
 
@@ -1085,6 +1129,12 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             self._expected_tab_ids = set()
             for view in self._kind_to_tab.values():
                 view.setPlainText("(unit no longer listed)")
+        if self._pending_table_select is not None:
+            # An "Open in Timers" jump from the calendar: select that unit now the
+            # table has repopulated, then clear so a later refresh keeps the user's
+            # own selection. Best-effort — a vanished unit just leaves no selection.
+            self._reselect(self._pending_table_select)
+            self._pending_table_select = None
         self._freshness.setText(
             f"{self.model.rowCount()} units · {self.scope} scope · refreshed {now:%H:%M:%S}"
         )

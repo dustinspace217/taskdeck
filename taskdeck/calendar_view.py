@@ -26,10 +26,18 @@ import calendar
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPaintEvent
+from PySide6.QtGui import (
+    QColor,
+    QContextMenuEvent,
+    QFont,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+)
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QToolTip,
     QVBoxLayout,
@@ -234,6 +242,11 @@ class CalendarView(QWidget):  # type: ignore[misc]
     # so a host that ignores it keeps the old select-only behavior. qlonglong for
     # `when`, same µs-overflow reason as `rebuild`.
     event_activated = Signal(str, str, "qlonglong")
+    # Right-click context menu (v2): (action, unit), action ∈ {'run','logs','table'}.
+    # The widget builds NO argv and enforces NO policy — it emits the intent and the
+    # host runs it (the read-only guard stays in actions.py). 'Run now' is greyed
+    # when set_run_enabled(False) (system/read-only scope).
+    menu_action = Signal(str, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -243,6 +256,10 @@ class CalendarView(QWidget):  # type: ignore[misc]
         # left-click is already taken (it opens the day's worst unit). See
         # mouseMoveEvent / _month_day_tooltip_text.
         self.setMouseTracking(True)
+        # Whether the right-click "Run now" is offered. The host sets it = user
+        # scope only (system scope is read-only); default True until told. Policy
+        # lives in the host (the actions.py guard) — this flag is only the greying.
+        self._run_enabled = True
         # Nav/window state — OWNED here (spec §7) so a 10s tick or an arrow click
         # never disturbs the table. Defaults are harmless zeros until the host's
         # first set_events; _mode gates which _paint_* runs.
@@ -1861,6 +1878,44 @@ class CalendarView(QWidget):  # type: ignore[misc]
         return QPoint(rect.x() + rect.width() // 2, rect.y() + rect.height() // 2)
 
     # -- interaction ----------------------------------------------------------
+
+    def set_run_enabled(self, enabled: bool) -> None:
+        """Host toggle for the context menu's 'Run now' (user scope only)."""
+        self._run_enabled = enabled
+
+    def _build_context_menu(self, unit: str) -> QMenu:
+        """Build the right-click menu for `unit`, wiring each action to emit
+        menu_action(action, unit). Split out from contextMenuEvent so a test can
+        trigger an action without driving a modal exec(). 'Run now' is greyed per
+        _run_enabled; the host still enforces the real read-only guard."""
+        menu = QMenu(self)
+        run = menu.addAction("▶ Run now")
+        run.setEnabled(self._run_enabled)
+        if not self._run_enabled:
+            run.setToolTip("system units are read-only by design")
+        run.triggered.connect(lambda: self.menu_action.emit("run", unit))
+        logs = menu.addAction("View logs")
+        logs.triggered.connect(lambda: self.menu_action.emit("logs", unit))
+        table = menu.addAction("Open in Timers")
+        table.triggered.connect(lambda: self.menu_action.emit("table", unit))
+        return menu
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802
+        """Right-click → Run now / View logs / Open in Timers for the unit under
+        the cursor. Resolves the unit with the SAME geometry the left-click uses;
+        off any unit, no menu. The widget emits intent (menu_action); the host
+        executes and owns the read-only guard."""
+        pos = event.pos()
+        x, y = int(pos.x()), int(pos.y())
+        unit = (
+            self._month_click_unit(x, y)
+            if self._mode == "month"
+            else self._row_click_unit(y)
+        )
+        if unit is None:
+            super().contextMenuEvent(event)
+            return
+        self._build_context_menu(unit).exec(event.globalPos())
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
         """Hit-test a left click and emit selected(unit) for the right target.

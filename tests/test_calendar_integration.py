@@ -1015,3 +1015,71 @@ def test_calendar_click_healthy_keeps_current_tab(qtbot):
     assert window.tabs.currentWidget() is window.tab_details
     window._on_calendar_event_activated("backup.timer", "upcoming", _usec(2026, 6, 20, 6, 0))
     assert window.tabs.currentWidget() is window.tab_details
+
+
+# -- right-click context menu (v2): Run now / View logs / Open in Timers ------
+
+
+def test_context_run_starts_the_timers_service(qtbot):
+    # "Run now" starts the timer's ACTIVATED SERVICE (not the .timer, which would
+    # only re-arm the schedule), through the same action_argv guard as the toolbar.
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("backup.timer", "backup.service", 999, 0)]
+    window._on_calendar_menu_action("run", "backup.timer")
+    runs = [c for c in client.calls if c[0] == "run_action"]
+    assert len(runs) == 1
+    assert runs[0][2] == "backup.service"  # target = the service, not the timer
+    assert "start" in runs[0][1]           # argv carries the start verb
+
+
+def test_context_run_refused_in_system_scope(qtbot):
+    # System scope is read-only by design — the action_argv guard refuses, no
+    # run_action fires, and the refusal is surfaced (belt-and-suspenders).
+    from taskdeck.systemd_client import SCOPE_SYSTEM
+
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("backup.timer", "backup.service", 999, 0)]
+    window.scope = SCOPE_SYSTEM
+    window._on_calendar_menu_action("run", "backup.timer")
+    assert not [c for c in client.calls if c[0] == "run_action"]
+    assert "refused" in window.statusBar().currentMessage()
+
+
+def test_context_logs_opens_log_tab(qtbot):
+    window, _client = make_window(qtbot)
+    window.tabs.setCurrentWidget(window.tab_details)
+    window._on_calendar_menu_action("logs", "backup.timer")
+    assert window.tabs.currentWidget() is window.tab_log
+
+
+def test_context_open_in_timers_switches_view_and_pends_select(qtbot):
+    window, _client = make_window(qtbot)
+    window._on_calendar_menu_action("table", "backup.timer")
+    assert window.view_box.currentText() == "Timers"
+    assert window._pending_table_select == "backup.timer"
+
+
+def test_context_menu_emits_each_action(qtbot):
+    # The menu builder wires each entry to emit menu_action(action, unit); triggering
+    # them in add-order yields run / logs / table for the clicked unit.
+    window, _client = make_window(qtbot)
+    cv = window.calendar_view
+    emitted: list = []
+    cv.menu_action.connect(lambda a, u: emitted.append((a, u)))
+    for act in cv._build_context_menu("backup.timer").actions():
+        act.trigger()
+    assert emitted == [
+        ("run", "backup.timer"),
+        ("logs", "backup.timer"),
+        ("table", "backup.timer"),
+    ]
+
+
+def test_context_menu_run_greyed_in_system_scope(qtbot):
+    # 'Run now' (the first action) is greyed when the host says runs aren't allowed.
+    window, _client = make_window(qtbot)
+    cv = window.calendar_view
+    cv.set_run_enabled(False)
+    assert cv._build_context_menu("x.timer").actions()[0].isEnabled() is False
+    cv.set_run_enabled(True)
+    assert cv._build_context_menu("x.timer").actions()[0].isEnabled() is True
