@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -211,6 +212,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        # Track the cursor without a held button so a Month-cell HOVER can reveal a
+        # day's FULL timer list — the cell paints only the first few + "+N more",
+        # and Dustin asked the overflow be hover/click-expandable. Hover, because a
+        # left-click is already taken (it opens the day's worst unit). See
+        # mouseMoveEvent / _month_day_tooltip_text.
+        self.setMouseTracking(True)
         # Nav/window state — OWNED here (spec §7) so a 10s tick or an arrow click
         # never disturbs the table. Defaults are harmless zeros until the host's
         # first set_events; _mode gates which _paint_* runs.
@@ -1114,23 +1121,21 @@ class CalendarView(QWidget):  # type: ignore[misc]
     def _paint_week_separators(
         self, painter: QPainter, top: int, grid_left: int, col_w: int
     ) -> None:
-        """Draw subtle full-height vertical dividers between the 7 day-columns.
+        """Draw visible full-height vertical dividers between the 7 day-columns.
 
         The header (_paint_week_header) only divides the label band; these extend
-        the column boundaries down through the whole row area so a glyph reads
-        clearly as belonging to one day-lane. The lines run from just below the
-        header baseline to the bottom of the last timer row (top + _TOP_PAD +
-        N×_ROW_H); an empty unit list still draws a one-row-tall stub so the
-        columns are visible before any timers load. Deliberately LIGHT (a dim grey,
-        1px) so the dividers structure the grid without competing with the outcome
-        glyphs — the task asks for subtle, not dominant. We draw the 8 boundaries
-        0..7 (left edge of col 0 through right edge of col 6) so the last column is
-        closed on its right.
+        the column boundaries down the WHOLE canvas so each glyph reads clearly as
+        belonging to one day-lane top-to-bottom — including the empty space below
+        the last timer, so the 7 columns read as a real week grid. Drawn BEFORE the
+        rows so the lines sit UNDER the glyphs (a divider must never overpaint an
+        outcome). The colour is a dim-but-VISIBLE grey: the previous near-background
+        60,60,60 was countable by a pixel probe yet invisible to the eye, which read
+        as no divider at all (Dustin's Week retest). We draw the 8 boundaries 0..7
+        (left edge of col 0 through right edge of col 6) so the last column closes.
         """
         line_top = top + _TOP_PAD - 2
-        rows = max(1, len(self._units))  # a stub height before any timers load
-        line_bottom = top + _TOP_PAD + rows * _ROW_H
-        painter.setPen(QColor(60, 60, 60))  # subtle — under the glyphs
+        line_bottom = self.height()  # full canvas height, not just the populated rows
+        painter.setPen(QColor(108, 108, 116))  # dim but visible on the dark canvas
         # 8 boundaries close all 7 columns (0=left of col 0 … 7=right of col 6);
         # bounded loop (Power of Ten rule 2).
         for day in range(8):
@@ -1856,6 +1861,36 @@ class CalendarView(QWidget):  # type: ignore[misc]
             return
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt naming)
+        """Reveal a Month day-cell's FULL timer list as a tooltip on hover.
+
+        The cell paints only the first _MONTH_CELL_MAX_LINES timers + "+N more";
+        hovering shows the rest (Dustin asked the overflow be expandable, and a
+        left-click is already taken by select). Month mode only — Day/Week show
+        every event inline. Reuses the same _month_cell_rect / _events_by_date /
+        _day_cell_timer_lines the paint uses, so the tooltip can never disagree with
+        the painted cell. mouseTracking (enabled in __init__) makes this fire on a
+        bare hover, not only while a button is held.
+        """
+        if self._mode == "month":
+            pos = event.position()
+            x, y = int(pos.x()), int(pos.y())
+            by_date = self._events_by_date()
+            for w_idx, week in enumerate(self._month_weeks()):
+                for wd_idx, day in enumerate(week):
+                    if self._month_cell_rect(w_idx, wd_idx).contains(x, y):
+                        text = self._month_day_tooltip_text(day, by_date.get(day, []))
+                        if text:
+                            QToolTip.showText(
+                                event.globalPosition().toPoint(), text, self
+                            )
+                        else:
+                            QToolTip.hideText()
+                        super().mouseMoveEvent(event)
+                        return
+            QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
     def _row_click_unit(self, y: int) -> str | None:
         """Map a click y to a timer-row unit (Day/Week), or None off any row.
 
@@ -1889,3 +1924,18 @@ class CalendarView(QWidget):  # type: ignore[misc]
                     )
                     return worst.unit if worst is not None else None
         return None
+
+    def _month_day_tooltip_text(self, day: date, cell: list[CalendarEvent]) -> str:
+        """Build the hover-tooltip body for a Month day-cell: EVERY timer that day.
+
+        The cell truncates to _MONTH_CELL_MAX_LINES names + "+N more"; this returns
+        the full worst-first list (one "<glyph> <short-name>" per timer, from the
+        SAME _day_cell_timer_lines the cell paints) under a local-date header, so
+        the overflow is fully readable on hover. Empty string for a day with no
+        events → mouseMoveEvent shows no tooltip.
+        """
+        lines = self._day_cell_timer_lines(cell)
+        if not lines:
+            return ""
+        body = "\n".join(f"{glyph} {short_name}" for short_name, glyph, _color in lines)
+        return f"{day:%a %b %d}\n{body}"

@@ -1032,6 +1032,31 @@ def test_month_cell_renders_names_and_plus_n_more(qtbot):
     assert w.grab().width() > 0, "an over-full Month cell paints (with +N more)"
 
 
+def test_month_day_tooltip_lists_all_timers(qtbot):
+    # The Month cell truncates to _MONTH_CELL_MAX_LINES names + "+N more"; the hover
+    # tooltip must EXPAND to the full list (Dustin's ask). Build a day with more
+    # timers than the cap and assert the tooltip text names every one — the painted
+    # cell would only show `cap` of them, so this fails if the tooltip truncated too.
+    w = CalendarView()
+    qtbot.addWidget(w)
+    w.set_mode("month")
+    cap = w._MONTH_CELL_MAX_LINES
+    n = cap + 3
+    events = [CalendarEvent(f"t{i}.timer", FEB10_USEC, "ran", "failure") for i in range(n)]
+    units = [f"t{i}.timer" for i in range(n)]
+    w.set_events(
+        events, units=units,
+        window_start=FEB1_USEC, window_end=MAR1_USEC, now=MAR1_USEC,
+    )
+    by_date = w._events_by_date()
+    assert by_date, "the events bucket into a local day"
+    day, cell = next(iter(by_date.items()))
+    text = w._month_day_tooltip_text(day, cell)
+    for i in range(n):
+        assert f"t{i}" in text, f"tooltip lists every timer (t{i}), not the truncated cell"
+    assert text.count("\n") == n, "a date header line plus one line per timer"
+
+
 def test_legend_is_always_visible_and_keys_each_glyph(qtbot):
     # The legend fixes "no idea what Gaps is" — there was no key anywhere. It must
     # be present in EVERY mode (always-on) and spell out each glyph's meaning.
