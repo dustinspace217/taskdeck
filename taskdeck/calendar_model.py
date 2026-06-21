@@ -11,10 +11,90 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from taskdeck.models import _classify_calendar
 from taskdeck.systemd_client import ScheduleInfo
+
+# -- local-calendar window boundaries ----------------------------------------
+#
+# The model is µs-epoch (UTC-absolute) end to end, but the WINDOW the user
+# navigates is a LOCAL calendar unit: "this Day", "this Week", "this Month" mean
+# the user's wall-clock day/week/month, not a UTC one. A PDT user expects the Day
+# view to span local midnight→midnight, not 17:00→17:00 split across two UTC days.
+# So window boundaries — and ONLY window boundaries — are computed in LOCAL time,
+# then converted back to UTC µs for [win_start, win_end]. Every subprocess @-arg
+# and every model computation downstream stays UTC-absolute (the boundaries are
+# just two absolute instants); only their DERIVATION touches the local calendar.
+#
+# This lives in the pure model (not the view) so the Phase-2 plasmoid computes
+# the exact same windows — a window boundary forked into the view would silently
+# diverge between the two consumers (Global Constraints). It is still pure: no Qt,
+# no subprocess; the local timezone comes from the process clock via
+# datetime.astimezone(), exactly as the display path reads it.
+
+# Which calendar unit each mode's window spans. The matrix is a Month sub-view
+# (it shares the Month window — spec §5), so it maps to "month" here; "week" and
+# "day" map to themselves. Keyed by the mode strings set_mode accepts.
+_MODE_WINDOW_UNIT: dict[str, str] = {
+    "day": "day",
+    "week": "week",
+    "month": "month",
+    "matrix": "month",
+}
+
+
+def local_calendar_window(mode: str, anchor_usec: int) -> tuple[int, int]:
+    """The LOCAL-calendar window (UTC µs bounds) for `mode` CONTAINING `anchor`.
+
+    `anchor_usec` is any µs epoch inside the wanted unit (e.g. `now` for the
+    first-show window, or a nav step's probe instant). Returns
+    (win_start_usec, win_end_usec) — both UTC µs epochs, half-open [start, end):
+
+    - day:   local 00:00 of the anchor's day        → next local 00:00 (+1 day)
+    - week:  local Monday 00:00 of the anchor's week → +7 days (Mon-start, so it
+             matches the Month grid's Mon..Sun columns and weekday header)
+    - month: local 1st 00:00 of the anchor's month  → next month's 1st 00:00
+
+    Why derive every boundary from the LOCAL calendar rather than µs arithmetic:
+    a fixed +7×86400s "week" or +30d "month" drifts across a DST transition and
+    can't express variable month length. Re-flooring an anchor to a local-calendar
+    boundary (via .replace on the naive-local datetime, then .astimezone() to read
+    the correct UTC instant) is DST- and month-length-correct by construction —
+    confirmed by an empirical probe (2026-06-20) across a forced America/Los_Angeles
+    tz: a 06:00-local anchor floors to 00:00 local and round-trips to local 00:00.
+
+    Unknown modes fall back to the Day unit so a future caller never gets an empty
+    or raising window — mirrors the view's tolerant set_mode/unknown-mode guard.
+    """
+    unit = _MODE_WINDOW_UNIT.get(mode, "day")
+    # fromtimestamp WITHOUT a tz argument yields a NAIVE datetime in LOCAL time —
+    # this is the same conversion the display path uses, so the window the user
+    # navigates and the times drawn inside it share one timezone.
+    local = datetime.fromtimestamp(anchor_usec / 1_000_000)
+    day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if unit == "day":
+        start_local = day_start
+        end_local = day_start + timedelta(days=1)
+    elif unit == "week":
+        # weekday(): Monday=0 … Sunday=6. Subtracting it lands on this week's
+        # Monday 00:00 — the Mon-start the Month grid header (Mon..Sun) expects.
+        start_local = day_start - timedelta(days=day_start.weekday())
+        end_local = start_local + timedelta(days=7)
+    else:  # month
+        start_local = day_start.replace(day=1)
+        # Next month's 1st: bump the year at December rather than month=13.
+        if start_local.month == 12:
+            end_local = start_local.replace(year=start_local.year + 1, month=1)
+        else:
+            end_local = start_local.replace(month=start_local.month + 1)
+    # .astimezone() attaches the LOCAL tzinfo to the naive boundary, so
+    # .timestamp() returns the correct UTC epoch for that local wall-clock instant
+    # (a DST-aware conversion — the only place tz enters). Floor to whole seconds
+    # then ×1e6 to keep the µs-epoch convention used everywhere else.
+    start_usec = int(start_local.astimezone().timestamp()) * 1_000_000
+    end_usec = int(end_local.astimezone().timestamp()) * 1_000_000
+    return (start_usec, end_usec)
 
 
 @dataclass(frozen=True)
@@ -315,6 +395,21 @@ CELL_DRAW_MAX_PER_WINDOW = 500
 # slots we ASK systemd for; this bounds how many we DRAW in one cell. Owned here
 # so the plasmoid uses the same threshold (spec line 122).
 CELL_DRAW_MAX = 12
+
+# Forward-projection iteration budget per eligible timer×expression, based at
+# NOW (not win_start). WHY a SEPARATE, small budget exists: the win_start-based
+# projection (sized by projection_iterations, capped at CELL_DRAW_MAX_PER_WINDOW)
+# fans out the PAST slots gap detection needs — but a fast cadence burns that cap
+# entirely on slots BEFORE now, so a minutely timer (always) or an hourly timer
+# (at Month scale) produces ZERO future slots and its "upcoming" ⏲ never shows
+# (Dustin's live-retest symptom: "upcoming doesn't show for some timers"). A
+# second projection based at NOW with this tiny fixed budget guarantees EVERY
+# cadence yields a handful of upcoming slots regardless of how the win_start cap
+# was spent. 16 is enough for several upcoming glyphs at any cadence while staying
+# trivially bounded (Power of Ten rule 3) — the view aggregates above CELL_DRAW_MAX
+# anyway, so more would only be drawn as a band. Owned here so the plasmoid shares
+# it (Global Constraints).
+FWD_PROJECTION_ITERATIONS = 16
 
 
 def cadence_interval_usec(info: ScheduleInfo | None) -> int | None:

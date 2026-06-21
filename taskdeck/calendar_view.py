@@ -23,7 +23,7 @@ without raising, click→signal, nav→window) and leaves exact spacing to that 
 from __future__ import annotations
 
 import calendar
-from datetime import UTC, date, datetime
+from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QPoint, QRect, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPaintEvent
@@ -40,23 +40,22 @@ from taskdeck.calendar_model import (
     CalendarEvent,
     Health,
     bucket_cell,
+    local_calendar_window,
     summarize,
 )
 
-# The span (µs) the nav arrows shift by, per mode. Day/Week are exact; Month is
-# a NOMINAL 30 days — the exact month boundary is the host's job when it sizes
-# projections (cadence_interval_usec already treats "monthly" as ~30d), so the
-# widget's job is only to move the window by a sensible step and ask the host to
-# refetch. Keys match the mode strings accepted by set_mode.
+# µs in a day — used only for relative time→x fractions and the Day-view axis
+# span, never for window navigation (that is local-calendar-aligned now via
+# local_calendar_window in the model). Kept here because the Day/Week paints
+# still position events as a fraction of the window span.
 _DAY_USEC = 86_400_000_000
-_MODE_SPAN_USEC: dict[str, int] = {
-    "day": _DAY_USEC,
-    "week": 7 * _DAY_USEC,
-    "month": 30 * _DAY_USEC,
-    # "matrix" shares the Month window — it's a Month sub-toggle (spec §5), so it
-    # navigates by the same 30-day step.
-    "matrix": 30 * _DAY_USEC,
-}
+
+# The modes set_mode accepts. Replaces the old fixed-µs-span table: nav no longer
+# shifts by a constant span — it moves by ONE LOCAL calendar unit via the model's
+# local_calendar_window (±1 day/week/month, DST- and month-length-correct). The
+# set is what set_mode/local_calendar_window validate against; "matrix" is a
+# Month sub-view (spec §5) and shares the Month window.
+_MODES: frozenset[str] = frozenset({"day", "week", "month", "matrix"})
 
 # Glyph + color per (kind, result), straight from spec §6's visual grammar.
 # Both glyph AND color carry the meaning so the readout is colorblind-safe, and
@@ -117,6 +116,37 @@ def _event_severity(event: CalendarEvent) -> int:
     unrecognized event outrank or mask a real failure.
     """
     return _SEVERITY.get((event.kind, event.result), 0)
+
+
+def _local_dt(when_usec: int) -> datetime:
+    """A µs UTC epoch as a NAIVE LOCAL datetime — the calendar's display clock.
+
+    `when_usec` is an absolute UTC µs epoch (a slot/run time, or a window edge).
+    EVERY time the user SEES — a Day x-position's hour, a Week cell's hour glyph,
+    a Month/matrix day-cell, the now-marker, day-bucketing into cells — must read
+    in the user's LOCAL timezone, or a PDT run at 22:00 local (05:00 UTC next day)
+    would land in the wrong day-cell and a 06:00-local run would label as 13:00.
+    fromtimestamp WITHOUT a tz argument is exactly that local conversion (verified
+    2026-06-20 against a forced America/Los_Angeles tz). This is the SINGLE seam
+    for it, so a future "show in UTC" toggle has one place to change — and so the
+    model's UTC-µs absolutes never leak a UTC wall-clock into the display.
+
+    NOTE the deliberate split: model + subprocess @-args stay UTC-absolute
+    (journalctl/systemd-analyze @<seconds> are absolute, timezone-free); ONLY this
+    display path and the window-boundary derivation (local_calendar_window) touch
+    the local calendar.
+    """
+    return datetime.fromtimestamp(when_usec / 1_000_000)
+
+
+def _local_date(when_usec: int) -> date:
+    """The LOCAL calendar date of a µs UTC epoch (see _local_dt for the why).
+
+    Used wherever an event is bucketed into a day-cell (Month grid, matrix
+    columns, day_hit_point) so the cell a run lands in matches the user's
+    wall-clock day, not a UTC one.
+    """
+    return _local_dt(when_usec).date()
 
 
 # Layout constants for the painted canvas. These are STARTING values for the
@@ -362,7 +392,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
         Updates the toggle button so a programmatic set_mode keeps the chrome in
         sync with a click-driven one.
         """
-        if mode not in _MODE_SPAN_USEC:
+        if mode not in _MODES:
             return  # unrecognized — keep the current mode, never raise
         self._mode = mode
         # The top-level toggle only has Day/Week/Month buttons; "matrix" is a
@@ -500,63 +530,81 @@ class CalendarView(QWidget):  # type: ignore[misc]
 
     # -- navigation -----------------------------------------------------------
     #
-    # Each nav move shifts the window by the current mode's span and emits
-    # `rebuild(start, end)` so the host refetches exactly the new window. The
-    # widget owns this state; it never calls the host directly (spec §7).
+    # Each nav move steps the window by ONE LOCAL calendar unit (±1 day / week /
+    # month) and emits `rebuild(start, end)` so the host refetches exactly the new
+    # window. The widget owns this state; it never calls the host directly (spec
+    # §7). The local-calendar math lives in the model (local_calendar_window) so
+    # the Phase-2 plasmoid navigates identically — a boundary computed here would
+    # fork between the two consumers.
 
     def nav_next(self) -> None:
-        """Advance the window by one mode-span and ask the host to refetch."""
-        span = _MODE_SPAN_USEC[self._mode]
-        self._shift_window(span)
+        """Step to the NEXT local calendar unit and ask the host to refetch.
+
+        The current window is half-open [start, end), so `end` is EXACTLY the next
+        unit's local 00:00 (next day, next Monday, or next month's 1st). Feeding it
+        back through local_calendar_window re-floors to that unit's boundaries —
+        DST- and month-length-correct, because the boundary is re-derived from the
+        local calendar, not by adding a fixed span (a +30-day month would drift).
+        """
+        self._set_window(local_calendar_window(self._mode, self._window_end))
 
     def nav_prev(self) -> None:
-        """Move the window one mode-span earlier (host bounds how far back data
-        exists — the widget just shifts; journal coverage is the host's limit)."""
-        span = _MODE_SPAN_USEC[self._mode]
-        self._shift_window(-span)
+        """Step to the PREVIOUS local calendar unit and ask the host to refetch.
+
+        `win_start - 1µs` lands one microsecond before this unit's local 00:00 —
+        i.e. the last instant of the PREVIOUS unit — which local_calendar_window
+        then floors to that previous unit's boundaries. Re-deriving from the local
+        calendar (not subtracting a fixed span) keeps it correct across DST and
+        variable month length. How far back data exists is the host's limit; the
+        widget just steps and asks.
+        """
+        self._set_window(local_calendar_window(self._mode, self._window_start - 1))
 
     def nav_today(self) -> None:
-        """Recenter the window on `now`, keeping the current span.
+        """Return to the local calendar unit CONTAINING `now`.
 
-        Anchors the window's START at now (so 'Today' shows from now forward for
-        Day) rather than centring — the simplest recenter that the visual pass can
-        refine; the host still gets the new window via rebuild.
+        'Today' = the now-containing window for the current mode (Day = today's
+        local midnight-to-midnight, Week = this local week, Month = this month) —
+        the same window first-show uses. `_now` is the absolute µs instant the host
+        last set via set_events; local_calendar_window floors it to the local unit.
         """
-        span = self._window_end - self._window_start
-        if span <= 0:
-            span = _MODE_SPAN_USEC[self._mode]
-        self._window_start = self._now
-        self._window_end = self._now + span
-        self._update_range_label()
-        self.update()
-        self.rebuild.emit(self._window_start, self._window_end)
+        self._set_window(local_calendar_window(self._mode, self._now))
 
-    def _shift_window(self, delta: int) -> None:
-        """Shift both window edges by `delta` µs, repaint, and emit rebuild.
+    def _set_window(self, window: tuple[int, int]) -> None:
+        """Adopt a new (start, end) window, repaint, and emit rebuild.
 
-        Centralized so nav_next/nav_prev share the exact same emit contract — the
-        repaint shows the (now-empty) shifted window immediately for feedback,
-        and rebuild tells the host to fill it.
+        Centralized so nav_next/nav_prev/nav_today share one emit contract — the
+        repaint shows the (now-empty) new window immediately for feedback, and
+        rebuild tells the host to fill it. `window` comes from the model's
+        local_calendar_window, so both edges are local-calendar-aligned UTC µs.
         """
-        self._window_start += delta
-        self._window_end += delta
+        self._window_start, self._window_end = window
         self._update_range_label()
         self.update()
         self.rebuild.emit(self._window_start, self._window_end)
 
     def _update_range_label(self) -> None:
-        """Refresh the chrome's range text from the current window.
+        """Refresh the chrome's range text from the current window, in LOCAL dates.
 
-        Minimal on purpose (epoch-derived, not richly formatted) — the date
-        formatting is part of the post-build visual pass; this keeps the label
-        non-empty and correct so the iteration has something to refine.
+        The window is half-open [start, end) in UTC µs; the label must read in the
+        user's LOCAL calendar (the window IS a local unit now), so we convert with
+        fromtimestamp WITHOUT a tz (= local wall-clock). `end` is the EXCLUSIVE
+        next-unit boundary (local 00:00), so we label the INCLUSIVE last day
+        (end - 1µs) — otherwise a one-day Day window would read "Jun 20 – Jun 21"
+        and a month would read "Jun 01 – Jul 01". A single-day window collapses to
+        just that date. Minimal formatting on purpose — richer styling is the
+        post-build visual pass.
         """
         if self._window_end <= self._window_start:
             self._range_label.setText("")
             return
-        start = datetime.fromtimestamp(self._window_start / 1_000_000, UTC)
-        end = datetime.fromtimestamp(self._window_end / 1_000_000, UTC)
-        self._range_label.setText(f"{start:%b %d} – {end:%b %d}")
+        start = datetime.fromtimestamp(self._window_start / 1_000_000)
+        # Inclusive last day: one µs before the exclusive end boundary.
+        last = datetime.fromtimestamp((self._window_end - 1) / 1_000_000)
+        if start.date() == last.date():
+            self._range_label.setText(f"{start:%b %d}")
+        else:
+            self._range_label.setText(f"{start:%b %d} – {last:%b %d}")
 
     def _update_health_strip(self) -> None:
         """Render the cached Health into the strip's label text.
@@ -820,7 +868,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
         """Paint the Week view: timer rows × 7 day-columns + a per-row health col.
 
         Each cell shows the day's worst event as "HH glyph" (the worst event's
-        UTC hour-of-day, then its glyph) so a single readout captures both WHEN in
+        LOCAL hour-of-day, then its glyph) so a single readout captures both WHEN in
         the day it happened and the WORST thing that happened. A cell whose event
         count exceeds CELL_DRAW_MAX collapses to an aggregate band via the model's
         bucket_cell (same rule as Day) instead of a misleading single glyph. The
@@ -857,29 +905,42 @@ class CalendarView(QWidget):  # type: ignore[misc]
             # widget can corrupt the backing store on the next paint.
             painter.end()
 
+    def _week_start_date(self) -> date:
+        """The LOCAL date of the Week window's first column (its Monday).
+
+        The window is local-Monday-00:00 aligned (local_calendar_window), so its
+        local date IS the Monday the 7 columns count from. Derived once and shared
+        by the header labels and the row bucketing so a column's label and the
+        events placed under it always mean the same local day.
+        """
+        return _local_date(self._window_start)
+
     def _paint_week_header(
         self, painter: QPainter, top: int, grid_left: int, col_w: int
     ) -> None:
-        """Draw the 7 day-column dividers and date labels across the top.
+        """Draw the 7 day-column dividers and LOCAL date labels across the top.
 
-        Labels come from window_start + N days (UTC, matching the event epochs);
-        kept minimal (a thin tick + "MMM DD") — richer formatting is the visual
-        pass. Drawing the dividers is what makes the 7-column structure legible.
+        Labels are the window's local Monday + N local days (LOCAL, matching the
+        local-aligned window and the local day-bucketing in _paint_week_row) — a
+        UTC label here would disagree with where a near-midnight run is bucketed.
+        Adding `timedelta(days=N)` to the local START DATE (not N×86400s to the µs
+        epoch) keeps the labels correct across a DST transition inside the week.
+        Kept minimal (a thin tick + "MMM DD") — richer formatting is the visual pass.
         """
         painter.setPen(QColor(90, 90, 90))
         baseline = top + _TOP_PAD - 4
+        start_date = self._week_start_date()
         for day in range(7):
             x = grid_left + day * col_w
             painter.drawLine(x, top + 2, x, baseline)
-            # Label each column with its date so the week is anchored in time.
-            day_start = datetime.fromtimestamp(
-                (self._window_start + day * _DAY_USEC) / 1_000_000, UTC
-            )
+            # Label each column with its LOCAL date so the week is anchored in
+            # time exactly where its events are bucketed.
+            col_date = start_date + timedelta(days=day)
             painter.setPen(QColor(150, 150, 150))
             painter.drawText(
                 QRect(x + 2, top, col_w - 4, _TOP_PAD - 4),
                 Qt.AlignmentFlag.AlignVCenter,
-                f"{day_start:%b %d}",
+                f"{col_date:%b %d}",
             )
             painter.setPen(QColor(90, 90, 90))
 
@@ -894,19 +955,24 @@ class CalendarView(QWidget):  # type: ignore[misc]
     ) -> None:
         """Paint one timer's 7 day-cells plus its trailing health summary.
 
-        Events are bucketed into day-columns by their offset from window_start
-        (integer-divided by one day). Each non-empty cell draws either an "HH
-        glyph" worst-outcome readout or — above CELL_DRAW_MAX events — an
-        aggregate band, the same over-full rule the Day view uses (the count and
-        failure flag both come from the model's bucket_cell). The health column
-        at the right shows the worst event across the whole week for this row.
+        Events are bucketed into day-columns by their LOCAL date's offset from the
+        window's local Monday. Each non-empty cell draws either an "HH glyph"
+        worst-outcome readout or — above CELL_DRAW_MAX events — an aggregate band,
+        the same over-full rule the Day view uses (the count and failure flag both
+        come from the model's bucket_cell). The health column at the right shows
+        the worst event across the whole week for this row.
         """
-        # Bucket the row's events into 7 day-columns. A day index outside [0, 6]
-        # (an event just outside the window from a prefetch) is dropped here — it
-        # has no column to land in; the health summary still considers all events.
+        # Bucket the row's events into 7 day-columns by LOCAL-DATE difference (NOT
+        # a µs offset // _DAY_USEC): the window is local-Monday aligned and may not
+        # be exactly 7×86400s wide across a DST transition, so a µs division could
+        # misbucket a run near a local-midnight DST boundary. Subtracting local
+        # dates is the user's-calendar-correct column index. A day index outside
+        # [0, 6] (an event just outside the window from a prefetch) is dropped — it
+        # has no column; the health summary still considers all events.
+        start_date = self._week_start_date()
         columns: list[list[CalendarEvent]] = [[] for _ in range(7)]
         for ev in row_events:
-            day = (ev.when - self._window_start) // _DAY_USEC
+            day = (_local_date(ev.when) - start_date).days
             if 0 <= day < 7:
                 columns[day].append(ev)
 
@@ -944,8 +1010,10 @@ class CalendarView(QWidget):  # type: ignore[misc]
         Above CELL_DRAW_MAX events the cell collapses to an aggregate band (count
         + red tint if any failed) via the model's bucket_cell — the view never
         re-decides what "over-full" means. Otherwise it shows the day's worst
-        event as its UTC hour-of-day then its glyph, so one readout carries both
-        time-of-day and the worst outcome (spec §6's Week cell).
+        event as its LOCAL hour-of-day then its glyph, so one readout carries both
+        time-of-day and the worst outcome (spec §6's Week cell). The hour is LOCAL
+        (was UTC — a glaring bug for a PDT user: a 06:00-local run read "13"); see
+        _local_dt for the UTC-µs→local-display rule.
         """
         if len(cell) > CELL_DRAW_MAX:
             count, failures = bucket_cell(cell)
@@ -967,7 +1035,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
         if worst is None:
             return
         glyph, color = _glyph_color(worst)
-        hour = datetime.fromtimestamp(worst.when / 1_000_000, UTC).hour
+        hour = _local_dt(worst.when).hour  # LOCAL hour-of-day (see _local_dt)
         painter.setPen(color)
         painter.drawText(
             QRect(cell_x + 3, row_y, col_w - 5, _ROW_H),
@@ -1022,19 +1090,21 @@ class CalendarView(QWidget):  # type: ignore[misc]
         return (readout, worst, (count, failures))
 
     def _month_anchor(self) -> date:
-        """The first day of the visible month, derived from window_start (UTC).
+        """The first day of the visible month, derived from window_start (LOCAL).
 
-        The host sizes the Month window to roughly a month; we take its START
-        instant, read its UTC year/month, and anchor on the 1st — so the grid
-        always shows a WHOLE calendar month regardless of the exact window edges.
-        Using the UTC date (matching the event epochs) keeps day-bucketing and
-        the grid in the same timezone, avoiding an off-by-one at month ends.
+        The host sizes the Month window to the local calendar month; we take its
+        START instant, read its LOCAL year/month, and anchor on the 1st — so the
+        grid shows a WHOLE calendar month. LOCAL (not UTC) is load-bearing for a
+        tz EAST of UTC: local 1st 00:00 is the PREVIOUS day in UTC, so a UTC read
+        would pick the wrong month. Reading it local keeps the grid month and the
+        local event-bucketing (_events_by_date) in the same timezone, avoiding an
+        off-by-one at month ends.
         """
-        start = datetime.fromtimestamp(self._window_start / 1_000_000, UTC)
+        start = _local_dt(self._window_start)
         return date(start.year, start.month, 1)
 
     def _month_weeks(self) -> list[list[date]]:
-        """The visible month as a list of week-rows of 7 UTC dates each.
+        """The visible month as a list of week-rows of 7 LOCAL dates each.
 
         Built with the stdlib calendar.Calendar.monthdatescalendar, which returns
         full weeks padded with the trailing/leading days of the adjacent months —
@@ -1048,17 +1118,18 @@ class CalendarView(QWidget):  # type: ignore[misc]
         return cal.monthdatescalendar(anchor.year, anchor.month)
 
     def _events_by_date(self) -> dict[date, list[CalendarEvent]]:
-        """Bucket all events by their UTC calendar date.
+        """Bucket all events by their LOCAL calendar date.
 
         One pass over the flat event list (Power of Ten rule 2: bounded by the
         event count, itself bounded by the projection cap). The Month grid then
         looks each cell's date up here, so a day with no events is simply absent
-        from the dict and draws blank. UTC matches the grid dates from
-        _month_weeks, so an event never lands a day off.
+        from the dict and draws blank. LOCAL (not UTC) matches the local grid dates
+        from _month_weeks, so a run at e.g. 22:00 local (05:00 UTC next day) lands
+        in the cell the user expects, not the next day's.
         """
         by_date: dict[date, list[CalendarEvent]] = {}
         for ev in self._events:
-            d = datetime.fromtimestamp(ev.when / 1_000_000, UTC).date()
+            d = _local_date(ev.when)
             by_date.setdefault(d, []).append(ev)
         return by_date
 
@@ -1103,7 +1174,7 @@ class CalendarView(QWidget):  # type: ignore[misc]
             weeks = self._month_weeks()
             by_date = self._events_by_date()
             anchor = self._month_anchor()
-            now_date = datetime.fromtimestamp(self._now / 1_000_000, UTC).date()
+            now_date = _local_date(self._now)  # LOCAL "today" (see _local_dt)
 
             self._problem_weeks = set()
             self._paint_month_header(painter)
@@ -1268,12 +1339,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
     # glyph-storming — the same over-full rule Day and Week apply.
 
     def _matrix_day_dates(self) -> list[date]:
-        """The visible month's days as a flat, ordered list of UTC dates.
+        """The visible month's days as a flat, ordered list of LOCAL dates.
 
-        Built by flattening _month_weeks and keeping only IN-MONTH days, so the
-        matrix columns are exactly the calendar month's days (28–31 of them),
-        never the adjacent-month padding the grid shows. Shared by the row-cell
-        builder and the paint so a column always means the same day in both.
+        Built by flattening _month_weeks (LOCAL dates) and keeping only IN-MONTH
+        days, so the matrix columns are exactly the calendar month's days (28–31 of
+        them), never the adjacent-month padding the grid shows. Shared by the
+        row-cell builder and the paint so a column always means the same day in both.
         Bounded: at most 31 days. Ordering is calendar order (1st → last).
         """
         anchor = self._month_anchor()
@@ -1302,13 +1373,14 @@ class CalendarView(QWidget):  # type: ignore[misc]
         "over-full" means (same rule as Day/Week).
         """
         days = self._matrix_day_dates()
-        # Bucket this timer's events by UTC date once, so each day-column is a
+        # Bucket this timer's events by LOCAL date once, so each day-column is a
         # dict lookup rather than a re-scan of the whole event list per column.
+        # LOCAL matches the local matrix columns (see _local_dt).
         by_date: dict[date, list[CalendarEvent]] = {}
         for ev in self._events:
             if ev.unit != unit:
                 continue
-            d = datetime.fromtimestamp(ev.when / 1_000_000, UTC).date()
+            d = _local_date(ev.when)
             by_date.setdefault(d, []).append(ev)
 
         # Aggregate detection: a row is a "band" when ANY single day overflows
@@ -1433,14 +1505,15 @@ class CalendarView(QWidget):  # type: ignore[misc]
             return
 
         # Normal row: place each day's glyph at its column. We re-bucket the
-        # unit's events by date to recover the worst event's COLOUR (the cell
+        # unit's events by LOCAL date to recover the worst event's COLOUR (the cell
         # string carries only the glyph); the glyph itself comes from `cells` so
-        # paint and the testable readout can never disagree.
+        # paint and the testable readout can never disagree. LOCAL matches the
+        # local matrix columns (see _local_dt).
         by_date: dict[date, list[CalendarEvent]] = {}
         for ev in self._events:
             if ev.unit != unit:
                 continue
-            d = datetime.fromtimestamp(ev.when / 1_000_000, UTC).date()
+            d = _local_date(ev.when)
             by_date.setdefault(d, []).append(ev)
         for col, (day, glyph) in enumerate(zip(days, cells, strict=True)):
             if not glyph:
@@ -1460,12 +1533,12 @@ class CalendarView(QWidget):  # type: ignore[misc]
 
         Used by tests (and a future keyboard/scroll handler) to address a day
         deterministically, and built on the SAME _month_cell_rect the paint uses,
-        so a click here lands on the drawn cell. Locates `when`'s UTC date in the
-        visible month's week-rows; if the date isn't in the grid (a window the
-        host shouldn't produce), falls back to the first cell's centre rather than
-        raising — a hit-point helper must always return a point.
+        so a click here lands on the drawn cell. Locates `when`'s LOCAL date in the
+        visible month's (local) week-rows; if the date isn't in the grid (a window
+        the host shouldn't produce), falls back to the first cell's centre rather
+        than raising — a hit-point helper must always return a point.
         """
-        target = datetime.fromtimestamp(when_usec / 1_000_000, UTC).date()
+        target = _local_date(when_usec)
         for w_idx, week in enumerate(self._month_weeks()):
             for wd_idx, day in enumerate(week):
                 if day == target:

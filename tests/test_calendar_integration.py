@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 
 from PySide6.QtCore import QObject, Signal
 
-from taskdeck.calendar_model import summarize
+from taskdeck.calendar_model import FWD_PROJECTION_ITERATIONS, summarize
 from taskdeck.main_window import MainWindow
 from taskdeck.systemd_client import ScheduleInfo, TimerRow
 
@@ -145,10 +145,63 @@ def pending_id(window, prefix):
     the ACTUAL fired id from the build's pending set instead. This returns the
     one id starting with `prefix` (coverage/journal are unique per build);
     asserts exactly one so a test never silently matches the wrong one.
+
+    NOTE: this asserts uniqueness, so it MUST NOT be used for `calproj:` — every
+    eligible timer×expression now has TWO projection ids (the win_start one and
+    the now-based forward one, B). Use past_proj_id / fwd_proj_ids for those.
     """
     matches = [i for i in window._cal_pending if i.startswith(prefix)]
     assert len(matches) == 1, f"expected exactly one pending {prefix!r}, got {matches}"
     return matches[0]
+
+
+# Projection ids carry a tag after the unit name: the WIN_START projection is
+# "...#<idx>@<gen>" and the NOW-based FORWARD projection (B) is "...#f<idx>@<gen>"
+# — the leading 'f' is the discriminator. These split the two so a test can
+# deliver PAST slots (gaps) on the win_start id and FUTURE slots (or empty) on the
+# forward id, without one masking the other.
+
+
+def _is_fwd(proj_id):
+    """True if `proj_id` is a NOW-based forward projection (tag '#f…')."""
+    # The tag begins at the LAST '#'; the unit name may itself contain no '#'
+    # (systemd unit names don't), so the last '#' starts the tag. A forward tag's
+    # first char after '#' is 'f'; a win_start tag's is a digit.
+    return proj_id.rsplit("#", 1)[1].startswith("f")
+
+
+def past_proj_id(window):
+    """The single outstanding WIN_START projection id (the one feeding gaps).
+
+    Asserts exactly one so a single-timer/single-expr test never silently matches
+    the wrong projection. For a multi-expr test, use the per-id forms directly.
+    """
+    matches = [
+        i for i in window._cal_pending if i.startswith("calproj:") and not _is_fwd(i)
+    ]
+    assert len(matches) == 1, f"expected one win_start calproj, got {matches}"
+    return matches[0]
+
+
+def fwd_proj_ids(window):
+    """Every outstanding NOW-based forward projection id (B).
+
+    A test drains these (delivering empty or future slots) so the fan-in barrier
+    releases — every forward projection is in _cal_pending and must be answered
+    for _finalize_calendar to fire.
+    """
+    return [i for i in window._cal_pending if i.startswith("calproj:") and _is_fwd(i)]
+
+
+def drain_fwd_projections(window, payload=""):
+    """Answer all outstanding forward projections with `payload` (default empty).
+
+    Lets a test that only cares about PAST gaps release the forward half of the
+    barrier without inventing future slots. With the default empty payload the
+    forward projections contribute no slots, so they don't perturb the assertions.
+    """
+    for fid in fwd_proj_ids(window):
+        window._on_finished(fid, payload)
 
 
 # -- stacked-widget swap ------------------------------------------------------
@@ -265,7 +318,10 @@ def test_calendar_fan_in_assembles_runs_and_gaps_into_set_events(qtbot):
         f'"__REALTIME_TIMESTAMP":"{slot1}"}}\n'
     )
     # Deliver by the ACTUAL stamped ids (generation-tagged), not hardcoded ones.
-    window._on_finished(pending_id(window, "calproj:"), proj)
+    # The win_start projection carries the two past slots; the forward projection
+    # (B) is drained empty so the barrier releases without adding future slots.
+    window._on_finished(past_proj_id(window), proj)
+    drain_fwd_projections(window)
     window._on_finished(pending_id(window, "caljournal:"), journal)
 
     assert len(handed) == 1, "set_events fires exactly once, after BOTH land"
@@ -334,7 +390,8 @@ def test_coverage_probe_clamps_gaps_to_journal_floor(qtbot):
         f"       (in UTC): {_utc(pre_slot)} UTC\n"
         f"       (in UTC): {_utc(post_slot)} UTC\n"
     )
-    window._on_finished(pending_id(window, "calproj:"), proj)
+    window._on_finished(past_proj_id(window), proj)
+    drain_fwd_projections(window)  # forward projection adds no slots here
     window._on_finished(pending_id(window, "caljournal:"), "")  # no runs
 
     assert len(handed) == 1
@@ -368,7 +425,8 @@ def test_zero_coverage_records_suppresses_all_gaps(qtbot):
         f"       (in UTC): {_utc(_usec(2026, 6, 12, 6))} UTC\n"
         f"       (in UTC): {_utc(_usec(2026, 6, 16, 6))} UTC\n"
     )
-    window._on_finished(pending_id(window, "calproj:"), proj)
+    window._on_finished(past_proj_id(window), proj)
+    drain_fwd_projections(window)
     window._on_finished(pending_id(window, "caljournal:"), "")
 
     assert len(handed) == 1
@@ -401,11 +459,14 @@ def test_malformed_projection_releases_barrier_and_renders_partial(qtbot):
     # Coverage lands → the projection fans out (now in pending with a stamped id).
     window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
 
-    # The journal lands fine; the projection FAILS (a poison subprocess). Both are
-    # delivered by their ACTUAL stamped ids; the failed projection id must be the
-    # real one for the barrier-release branch to match it in _cal_pending.
-    proj_id = pending_id(window, "calproj:")
+    # The journal lands fine; the win_start projection FAILS (a poison
+    # subprocess). The forward projection (B) is drained so the only thing keeping
+    # the barrier open is the failure-release of the win_start id. The failed id
+    # must be the real one for the barrier-release branch to match it in
+    # _cal_pending.
+    proj_id = past_proj_id(window)
     window._on_finished(pending_id(window, "caljournal:"), "")
+    drain_fwd_projections(window)
     window._on_failed(proj_id, "systemd-analyze: bad calendar")
 
     assert len(handed) == 1, "barrier released on the projection failure → partial render"
@@ -432,7 +493,7 @@ def test_stale_generation_response_is_dropped(qtbot):
     window._build_calendar(win_a, _usec(2026, 6, 17, 0))
     gen_a = window._cal_gen  # A's generation
     window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_a))
-    proj_id_a = pending_id(window, "calproj:")  # A's actual fired projection id
+    proj_id_a = past_proj_id(window)  # A's actual fired win_start projection id
 
     # Build B supersedes A (a nav move) BEFORE A's projection arrives. The bump
     # makes B's ids carry a different generation, so A's id is no longer pending.
@@ -486,22 +547,38 @@ def test_multi_trigger_projects_each_expression(qtbot):
     # Coverage lands by its actual stamped id → the planned projections fan out.
     window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
 
-    # Two distinct projection fetches fired — one per expression (unique ids).
-    proj_calls = [c for c in client.calls if c[0] == "fetch_cal_projection"]
-    assert len(proj_calls) == 2, "one projection per OnCalendar expr"
-    exprs = {c[3] for c in proj_calls}
+    # Two WIN_START projection fetches fired — one per expression. The build also
+    # fires a NOW-based forward projection per expression (B, base_epoch=now), so
+    # filter to the win_start ones (base_epoch=win_start) to assert F4's one-per-
+    # expr contract on the slots that feed gaps. (c[4] is base_epoch.)
+    win_proj_calls = [
+        c for c in client.calls
+        if c[0] == "fetch_cal_projection" and c[4] == win_start
+    ]
+    assert len(win_proj_calls) == 2, "one win_start projection per OnCalendar expr"
+    exprs = {c[3] for c in win_proj_calls}
     assert exprs == {"*-*-* 06:00:00", "*-*-* 18:00:00"}
+    # The forward projections fired too — one per expression, based at now.
+    fwd_proj_calls = [
+        c for c in client.calls
+        if c[0] == "fetch_cal_projection" and c[4] == now
+    ]
+    assert len(fwd_proj_calls) == 2, "one forward projection per OnCalendar expr"
 
-    # The build fired ids with a per-expr index + generation suffix
+    # The build fired win_start ids with a per-expr index + generation suffix
     # (calproj:user:multi.timer#0@gen, #1@gen); recover BOTH from pending. Both
     # ids belong to multi.timer, and F4 unions every expression's slots into the
     # unit's one list — so it doesn't matter WHICH id carries which slot; what
     # matters is that both 06:00 and 18:00 reach the unit's slot list (only then
-    # is the 18:00 miss even a candidate gap). Deliver one slot per id.
-    proj_ids = sorted(i for i in window._cal_pending if i.startswith("calproj:"))
-    assert len(proj_ids) == 2, "two outstanding projection ids, one per expr"
+    # is the 18:00 miss even a candidate gap). Deliver one slot per win_start id;
+    # drain the forward projections empty (they'd only add future slots, not gaps).
+    proj_ids = sorted(
+        i for i in window._cal_pending if i.startswith("calproj:") and not _is_fwd(i)
+    )
+    assert len(proj_ids) == 2, "two outstanding win_start projection ids, one per expr"
     window._on_finished(proj_ids[0], f"       (in UTC): {_utc(slot_a)} UTC\n")
     window._on_finished(proj_ids[1], f"       (in UTC): {_utc(slot_b)} UTC\n")
+    drain_fwd_projections(window)
     # Journal: only the 06:00 run happened; 18:00 was missed.
     journal = (
         '{"USER_UNIT":"multi.service","JOB_RESULT":"done",'
@@ -539,9 +616,12 @@ def test_now_instant_slot_is_drawn_somewhere(qtbot):
     window._build_calendar(win_start, win_end)
     window._cal_now = now
     window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
-    # One projection slot, exactly at now; no runs at all.
+    # One win_start projection slot, exactly at now; no runs at all. The forward
+    # projection is drained empty — the now-instant slot must be owned by the
+    # win_start/gap path, not the forward one (which only emits s > now).
     proj = f"       (in UTC): {_utc(now_slot)} UTC\n"
-    window._on_finished(pending_id(window, "calproj:"), proj)
+    window._on_finished(past_proj_id(window), proj)
+    drain_fwd_projections(window)
     window._on_finished(pending_id(window, "caljournal:"), "")
 
     assert len(handed) == 1
@@ -580,12 +660,18 @@ def test_multi_trigger_coincident_slot(qtbot):
     window._cal_now = now
     window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
 
-    # Both expressions fire a projection; deliver the SAME future slot to each id.
-    proj_ids = sorted(i for i in window._cal_pending if i.startswith("calproj:"))
-    assert len(proj_ids) == 2, "one projection id per expression"
+    # Both expressions fire a WIN_START projection; deliver the SAME future slot to
+    # each. The forward projections (one per expr) are drained empty so the
+    # assertion pins cross-EXPRESSION dedup of the win_start slots, not forward
+    # ones (finalize dedups every source the same way via sorted(set(...))).
+    proj_ids = sorted(
+        i for i in window._cal_pending if i.startswith("calproj:") and not _is_fwd(i)
+    )
+    assert len(proj_ids) == 2, "one win_start projection id per expression"
     same_proj = f"       (in UTC): {_utc(future_slot)} UTC\n"
     window._on_finished(proj_ids[0], same_proj)
     window._on_finished(proj_ids[1], same_proj)
+    drain_fwd_projections(window)
     window._on_finished(pending_id(window, "caljournal:"), "")
 
     assert len(handed) == 1
@@ -667,7 +753,8 @@ def test_complete_build_is_not_degraded(qtbot):
     window._cal_now = now
     window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
     proj = f"       (in UTC): {_utc(_usec(2026, 6, 15, 6))} UTC\n"
-    window._on_finished(pending_id(window, "calproj:"), proj)
+    window._on_finished(past_proj_id(window), proj)
+    drain_fwd_projections(window)
     window._on_finished(pending_id(window, "caljournal:"), "")
 
     assert len(handed) == 1
@@ -739,15 +826,17 @@ def test_out_of_order_journal_before_coverage(qtbot):
     window._on_finished(pending_id(window, "caljournal:"), "")
     assert handed == [], "journal-before-coverage must not finalize early"
 
-    # Coverage lands → floor known → projection fires.
+    # Coverage lands → floor known → projections fire (win_start + forward).
     window._on_finished(pending_id(window, "calcover:"), _coverage_line(oldest))
     assert "new.timer" in _proj_ids(client), "projection fans out after coverage"
-    # Projection lands → last barrier slot → finalize.
+    # Win_start projection carries the two past slots; the forward projection is
+    # drained empty. Finalize fires only when the barrier empties (both delivered).
     proj = (
         f"       (in UTC): {_utc(pre_slot)} UTC\n"
         f"       (in UTC): {_utc(post_slot)} UTC\n"
     )
-    window._on_finished(pending_id(window, "calproj:"), proj)
+    window._on_finished(past_proj_id(window), proj)
+    drain_fwd_projections(window)
 
     assert len(handed) == 1, "finalizes exactly once, after all three land"
     gap_whens = {e.when for e in handed[0][0] if e.kind == "gap"}
@@ -783,3 +872,97 @@ def test_empty_scope_build_finalizes_empty(qtbot):
     args, kwargs = handed[0]
     assert args[0] == [], "an empty scope renders an empty (not stale) calendar"
     assert kwargs.get("degraded") is False, "a clean empty build is not degraded"
+
+
+# -- B: forward projection from NOW — every cadence yields an upcoming slot ----
+
+
+def test_minutely_timer_yields_an_upcoming_projected_event(qtbot):
+    # B (the reported symptom: "upcoming doesn't show for some timers"). A MINUTELY
+    # timer's WIN_START projection is capped (CELL_DRAW_MAX_PER_WINDOW) and, on a
+    # window ending near now, spends the whole cap on PAST slots → ZERO future
+    # slots → no upcoming ⏲. The NOW-based forward projection (small budget) must
+    # produce an upcoming slot that finalize emits as a `projected` event. We drive
+    # this through the REAL host build path (per the task: "assert via the host
+    # build path"), feeding the win_start projection only past slots and the
+    # forward projection a future slot — exactly the production split.
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("minutely.timer", "minutely.service", 999, 0)]
+    # The NORMALIZED minutely form `systemctl show` emits (every minute). It
+    # classifies as "minutely" → interval 60s → projection_iterations caps at
+    # CELL_DRAW_MAX_PER_WINDOW over the window, the cap-exhaustion this fix targets.
+    window._last_schedules = {
+        "minutely.timer": ScheduleInfo(("*-*-* *:*:00",), ())
+    }
+
+    win_start = _usec(2026, 6, 16, 0)
+    now = win_end = _usec(2026, 6, 17, 0)
+    past_slot = _usec(2026, 6, 16, 23, 58)   # ≤ now → a win_start slot (a gap here)
+    future_slot = _usec(2026, 6, 17, 0, 1)   # > now → the upcoming slot
+
+    handed: list = []
+    window.calendar_view.set_events = lambda *a, **k: handed.append(a)  # type: ignore[method-assign]
+
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+
+    # A forward projection (base_epoch == now) MUST have been planned for the
+    # minutely timer — that is the whole fix. (The win_start one bases at win_start.)
+    window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
+    fwd_calls = [
+        c for c in client.calls
+        if c[0] == "fetch_cal_projection" and c[2] == "minutely.timer" and c[4] == now
+    ]
+    assert fwd_calls, "a minutely timer gets a NOW-based forward projection"
+
+    # WIN_START projection: only a PAST slot (mimicking the cap-exhausted-on-past
+    # reality — systemd would return 500 past slots; one is enough to prove the
+    # point). FORWARD projection: the upcoming slot. Journal: empty.
+    window._on_finished(
+        past_proj_id(window), f"       (in UTC): {_utc(past_slot)} UTC\n"
+    )
+    for fid in fwd_proj_ids(window):
+        window._on_finished(fid, f"       (in UTC): {_utc(future_slot)} UTC\n")
+    window._on_finished(pending_id(window, "caljournal:"), "")
+
+    assert len(handed) == 1
+    events = handed[0][0]
+    upcoming = [
+        e for e in events
+        if e.kind == "projected" and e.unit == "minutely.timer" and e.when == future_slot
+    ]
+    assert upcoming, (
+        "the minutely timer must show an upcoming 'projected' event — the forward "
+        "projection produced it where the capped win_start projection could not"
+    )
+
+
+def test_forward_projection_uses_now_base_distinct_from_win_start(qtbot):
+    # Non-vacuity guard for B: the forward projection's base_epoch is NOW and the
+    # win_start projection's is WIN_START — they are genuinely two different
+    # fetches, not one mislabeled. A regression that based both at win_start (so
+    # the forward one also produced only past slots) would still 'fire a second
+    # projection' but show no upcoming; this pins the base_epoch difference that
+    # makes the forward slots future.
+    window, client = make_window(qtbot)
+    window._timers = [TimerRow("daily.timer", "daily.service", 999, 0)]
+    window._last_schedules = {"daily.timer": ScheduleInfo(("*-*-* 06:00:00",), ())}
+
+    win_start = _usec(2026, 6, 14, 0)
+    now = win_end = _usec(2026, 6, 17, 0)
+
+    window.calendar_view.set_events = lambda *a, **k: None  # type: ignore[method-assign]
+    window._build_calendar(win_start, win_end)
+    window._cal_now = now
+    window._on_finished(pending_id(window, "calcover:"), _coverage_line(win_start))
+
+    proj_calls = [c for c in client.calls if c[0] == "fetch_cal_projection"]
+    bases = {c[4] for c in proj_calls}
+    assert win_start in bases, "a win_start-based projection fired"
+    assert now in bases, "a now-based forward projection fired"
+    assert win_start != now and len(bases) == 2, "the two projections use distinct bases"
+    # The forward projection uses the small fixed budget, not the window-sized one.
+    fwd = [c for c in proj_calls if c[4] == now]
+    assert all(c[5] == FWD_PROJECTION_ITERATIONS for c in fwd), (
+        "forward projection uses FWD_PROJECTION_ITERATIONS"
+    )

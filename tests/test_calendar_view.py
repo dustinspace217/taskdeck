@@ -9,7 +9,7 @@ QPA from conftest renders headlessly so grab() rasterizes without a display.
 """
 from PySide6.QtCore import Qt
 
-from taskdeck.calendar_model import CalendarEvent
+from taskdeck.calendar_model import CalendarEvent, local_calendar_window
 from taskdeck.calendar_view import CalendarView
 
 DAY_USEC = 86_400_000_000  # µs in a day; the Day view's window span
@@ -81,39 +81,68 @@ def test_mode_and_window_are_readable(qtbot):
     assert w.window_end == base + DAY_USEC
 
 
-def test_next_nav_shifts_window_and_emits_rebuild(qtbot):
-    # The ▸ button advances the window by one Day span and asks the host to
-    # refetch for the new range via rebuild(start, end). Owning nav state in the
+def _local_midnight(when_usec: int) -> int:
+    """The µs epoch of the LOCAL midnight starting `when_usec`'s local day.
+
+    Independent re-derivation of the boundary (NOT a call to the production
+    local_calendar_window), so a nav test that compares against it would catch a
+    regression in the production math rather than tautologically agreeing with it.
+    """
+    from datetime import datetime
+    local = datetime.fromtimestamp(when_usec / 1_000_000)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(midnight.astimezone().timestamp()) * 1_000_000
+
+
+def test_next_nav_steps_one_local_day_and_emits_rebuild(qtbot):
+    # ▸ advances the window by ONE LOCAL calendar day (not a fixed µs span) and
+    # asks the host to refetch the new range via rebuild(start, end). The window
+    # is local-midnight aligned, so the next window starts at the NEXT local
+    # midnight and the emitted edges match the new window. Owning nav state in the
     # widget keeps it off the table's selection-restore path (spec §7).
     w = CalendarView()
     qtbot.addWidget(w)
-    base = 1_781_000_000_000_000
     w.set_mode("day")
-    w.set_events([], units=[], window_start=base, window_end=base + DAY_USEC,
-                 now=base + DAY_USEC)
+    # Build the now-containing Day window so we start local-aligned, exactly like
+    # first-show does, rather than from an arbitrary unaligned base.
+    anchor = 1_781_960_400_000_000  # 2026-06-20 06:00 PDT (a Saturday)
+    start, end = local_calendar_window("day", anchor)
+    w.set_events([], units=[], window_start=start, window_end=end, now=anchor)
     rebuilds: list[tuple[int, int]] = []
     w.rebuild.connect(lambda s, e: rebuilds.append((s, e)))
     w.nav_next()
-    assert w.window_start == base + DAY_USEC
-    assert w.window_end == base + 2 * DAY_USEC
-    assert rebuilds == [(base + DAY_USEC, base + 2 * DAY_USEC)]
+    # The new window is the NEXT local day: its start is the old end (the next
+    # local midnight), independently re-derived to avoid agreeing with a bug.
+    assert w.window_start == end
+    assert w.window_start == _local_midnight(end)
+    assert w.window_end == _local_midnight(end + DAY_USEC + 3600 * 1_000_000)
+    # Local-midnight alignment: start round-trips to local 00:00 (would be 7/8 on
+    # a UTC bug for a PDT user).
+    from datetime import datetime
+    assert datetime.fromtimestamp(w.window_start / 1_000_000).hour == 0
+    assert rebuilds == [(w.window_start, w.window_end)]
 
 
-def test_prev_nav_shifts_window_back(qtbot):
-    # ◂ moves the window one span earlier (bounded by journal coverage at the
-    # host level — the widget just shifts; the host decides how far back is data).
+def test_prev_nav_steps_one_local_day_back(qtbot):
+    # ◂ moves the window to the PREVIOUS local calendar day. Re-deriving from the
+    # local calendar (not subtracting a fixed span) keeps it correct; the host
+    # bounds how far back data exists.
     w = CalendarView()
     qtbot.addWidget(w)
-    base = 1_781_000_000_000_000
     w.set_mode("day")
-    w.set_events([], units=[], window_start=base, window_end=base + DAY_USEC,
-                 now=base + DAY_USEC)
+    anchor = 1_781_960_400_000_000  # 2026-06-20 06:00 PDT
+    start, end = local_calendar_window("day", anchor)
+    w.set_events([], units=[], window_start=start, window_end=end, now=anchor)
     rebuilds: list[tuple[int, int]] = []
     w.rebuild.connect(lambda s, e: rebuilds.append((s, e)))
     w.nav_prev()
-    assert w.window_start == base - DAY_USEC
-    assert w.window_end == base
-    assert rebuilds == [(base - DAY_USEC, base)]
+    # The new window ends where the old one started (this local midnight) and
+    # starts one local day earlier.
+    assert w.window_end == start
+    assert w.window_start == _local_midnight(start - 1)
+    from datetime import datetime
+    assert datetime.fromtimestamp(w.window_start / 1_000_000).hour == 0
+    assert rebuilds == [(w.window_start, w.window_end)]
 
 
 # -- Week view (Task 8) ------------------------------------------------------
@@ -239,16 +268,21 @@ def test_week_view_click_still_emits_selected_unit(qtbot):
 # exercised with a real February window AND a real 31-day-March window so the
 # grid math can't silently assume a fixed 30-day step.
 
-# Real UTC month boundaries (computed once; both months happen to start on a
-# Sunday in 2026, which exercises the leading-blank cells of a Monday-led grid).
-FEB1_USEC = 1_769_904_000_000_000      # 2026-02-01 00:00 UTC (Feb has 28 days)
-FEB10_USEC = 1_770_724_800_000_000     # 2026-02-10 12:00 UTC (mid-month, a Tue)
-FEB28_USEC = 1_772_236_800_000_000     # 2026-02-28 00:00 UTC (last day of Feb)
-MAR1_USEC = 1_772_323_200_000_000      # 2026-03-01 00:00 UTC (March has 31 days)
-MAR15_USEC = 1_773_576_000_000_000     # 2026-03-15 12:00 UTC (mid-month)
-MAR31_USEC = 1_774_915_200_000_000     # 2026-03-31 00:00 UTC (31st — only a
+# Real LOCAL (America/Los_Angeles, pinned in conftest) month boundaries. The
+# window is local-calendar-aligned now, and _month_anchor reads window_start in
+# LOCAL time — so these MUST be local-midnight epochs, not UTC ones (a UTC-midnight
+# start in PST = the previous day local → the wrong month grid). Mid-month events
+# are local noon, unambiguously inside their day regardless of the offset. Both
+# months still start on a Sunday in 2026 (exercising a Monday-led grid's leading
+# blanks — verified: Feb 1 and Mar 1 2026 are Sundays).
+FEB1_USEC = 1_769_932_800_000_000      # 2026-02-01 00:00 LOCAL (Feb has 28 days)
+FEB10_USEC = 1_770_753_600_000_000     # 2026-02-10 12:00 LOCAL (mid-month)
+FEB28_USEC = 1_772_265_600_000_000     # 2026-02-28 00:00 LOCAL (last day of Feb)
+MAR1_USEC = 1_772_352_000_000_000      # 2026-03-01 00:00 LOCAL (March has 31 days)
+MAR15_USEC = 1_773_601_200_000_000     # 2026-03-15 12:00 LOCAL (mid-month)
+MAR31_USEC = 1_774_940_400_000_000     # 2026-03-31 00:00 LOCAL (31st — only a
 #                                        31-day month has this cell)
-APR1_USEC = 1_775_001_600_000_000      # 2026-04-01 00:00 UTC (Feb/Mar window end)
+APR1_USEC = 1_775_026_800_000_000      # 2026-04-01 00:00 LOCAL (Feb/Mar window end)
 
 
 def test_month_view_renders_february_with_problem_days(qtbot):
@@ -713,3 +747,76 @@ def test_cell_matches_filter_predicate(qtbot):
     w.set_filter("upcoming")  # projected OR approx
     assert w._cell_matches_filter(proj) and w._cell_matches_filter(approx)
     assert not any(w._cell_matches_filter(e) for e in (fail, ok, gap, None))
+
+
+# -- C: LOCAL-time display correctness (conftest pins TZ=America/Los_Angeles) --
+#
+# These pin that the calendar renders times in the user's LOCAL zone, converting
+# from the UTC-µs model. They use a fixed PDT offset so each assertion would FAIL
+# if the render reverted to UTC — the trap the task calls out.
+
+from datetime import UTC, datetime  # noqa: E402 (test helpers, kept by the section)
+
+from taskdeck.calendar_view import _local_date, _local_dt  # noqa: E402
+
+
+def _at_local(y, mo, d, h, mi=0):
+    """A local wall-clock time as the absolute µs epoch the model would carry."""
+    return int(datetime(y, mo, d, h, mi).astimezone().timestamp()) * 1_000_000
+
+
+def test_week_cell_hour_is_local_not_utc():
+    # The Week cell draws the worst event's hour via _local_dt(worst.when).hour —
+    # the EXACT computation the paint uses. A run at 06:00 LOCAL (PDT) is 13:00
+    # UTC; the cell must show 06, not 13. Pinning the helper pins what the cell
+    # draws and would FAIL the instant the render used a UTC hour again.
+    six_am_local = _at_local(2026, 6, 20, 6, 0)
+    assert _local_dt(six_am_local).hour == 6, "Week cell shows the LOCAL hour"
+    # Non-vacuity: the SAME instant is 13:00 in UTC, so a code path that used the
+    # UTC hour would draw 13 and fail the assert above — the test genuinely
+    # distinguishes local from UTC on the pinned America/Los_Angeles tz.
+    assert datetime.fromtimestamp(six_am_local / 1_000_000, UTC).hour == 13
+
+
+def test_month_buckets_near_midnight_run_into_local_day():
+    # A run at 22:00 LOCAL on Jun 20 is 05:00 UTC on Jun 21. The Month grid must
+    # bucket it into Jun 20 (the user's day), NOT Jun 21 — the local-vs-UTC trap
+    # for any run in the local evening. _events_by_date is the bucketing seam.
+    w = CalendarView()
+    late = _at_local(2026, 6, 20, 22, 0)
+    win_start, win_end = local_calendar_window("month", late)
+    w.set_mode("month")
+    w.set_events(
+        [CalendarEvent("t.timer", late, "ran", "failure")],
+        units=["t.timer"],
+        window_start=win_start,
+        window_end=win_end,
+        now=win_end,
+    )
+    by_date = w._events_by_date()
+    assert _local_date(late) == datetime(2026, 6, 20).date(), "the run's LOCAL date is Jun 20"
+    assert datetime(2026, 6, 20).date() in by_date, "bucketed into the LOCAL day (Jun 20)"
+    assert datetime(2026, 6, 21).date() not in by_date, "NOT the UTC day (Jun 21)"
+
+
+def test_month_anchor_reads_window_start_in_local_time():
+    # _month_anchor must read window_start LOCALLY: a local June window's grid is
+    # June, even though local 2026-06-01 00:00 PDT is 2026-06-01 07:00 UTC (same
+    # date here, but the LOCAL read is the contract). Pin the anchor month/year.
+    win_start, _win_end = local_calendar_window("month", _at_local(2026, 6, 20, 6))
+    w = CalendarView()
+    w.set_mode("month")
+    w.set_events([], units=[], window_start=win_start, window_end=_win_end, now=win_start)
+    anchor = w._month_anchor()
+    assert (anchor.year, anchor.month) == (2026, 6), "the grid month is the LOCAL month"
+
+
+def test_range_label_is_local_dates():
+    # The chrome range label must read local dates. A local June window labels as
+    # "Jun 01 – Jun 30" (inclusive last day), not a UTC-shifted range.
+    win_start, win_end = local_calendar_window("month", _at_local(2026, 6, 20, 6))
+    w = CalendarView()
+    w.set_mode("month")
+    w.set_events([], units=[], window_start=win_start, window_end=win_end, now=win_start)
+    label = w._range_label.text()
+    assert label == "Jun 01 – Jun 30", f"local inclusive range, got {label!r}"

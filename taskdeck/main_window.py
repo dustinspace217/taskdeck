@@ -26,10 +26,12 @@ from PySide6.QtWidgets import (
 
 from taskdeck.actions import ActionNotAllowed, action_argv
 from taskdeck.calendar_model import (
+    FWD_PROJECTION_ITERATIONS,
     GAP_TOLERANCE_USEC,
     CalendarEvent,
     cadence_interval_usec,
     compute_gaps,
+    local_calendar_window,
     parse_projection,
     parse_run_journal,
     projection_iterations,
@@ -174,6 +176,16 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         # NOT fired until the coverage probe lands (F1 gating) — held here in the
         # meantime. Bounded by eligible-timers × expressions-per-timer.
         self._cal_proj_plan: list[tuple[str, int, str, int]] = []
+        # The FORWARD-projection plan for THIS build: one (unit, expr_idx, expr)
+        # entry per eligible timer×expression, projected from NOW with the small
+        # FWD_PROJECTION_ITERATIONS budget so EVERY cadence yields upcoming slots.
+        # The win_start plan above is sized to cover the window and is capped, so a
+        # fast cadence (minutely, or hourly at Month scale) burns the cap on PAST
+        # slots and produces no future one — the "upcoming doesn't show" symptom.
+        # This separate now-based projection guarantees a handful of `projected`
+        # slots regardless. No iteration count is stored (it's always the constant);
+        # fired alongside the win_start plan once coverage lands. Bounded the same.
+        self._cal_fwd_plan: list[tuple[str, int, str]] = []
         # Per-timer slots accumulated from projection responses in THIS build,
         # held until the journal lands so gaps can be computed (a gap needs both
         # the scheduled slots AND the actual runs). Keyed by timer unit name;
@@ -388,13 +400,19 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         if self.view_box.currentText() == "Calendar":
             self._stack.setCurrentWidget(self.calendar_view)
             # Build the visible window now so the page isn't blank on first show.
-            # The CalendarView starts in Day mode; build a one-day window ending
-            # at now (past-facing — "what happened today" plus today's upcoming
-            # slots). auto_refresh=False (tests) fires zero subprocesses here.
+            # The CalendarView starts in Day mode; build the LOCAL calendar day
+            # CONTAINING now (local 00:00 → next local 00:00), not [now-24h, now].
+            # The old [now-24h, now] ended AT now, so nothing was ever projected
+            # on first show (every future slot is > now = the window's right edge);
+            # a now-containing day has room to the right of the now-marker for
+            # today's upcoming runs. The window edges come from the model's pure
+            # local_calendar_window so first-show and the view's nav_today agree on
+            # exactly which day "today" is. auto_refresh=False (tests) fires zero
+            # subprocesses here.
             if self._auto_refresh:
                 now_usec = int(datetime.now(UTC).timestamp() * 1_000_000)
-                day = 86_400_000_000
-                self._build_calendar(now_usec - day, now_usec)
+                win_start, win_end = local_calendar_window("day", now_usec)
+                self._build_calendar(win_start, win_end)
             return
         # Timers or Services → back to the table page, and refresh it (the
         # column set differs between the two, so a re-query is correct).
@@ -643,6 +661,7 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
         self._cal_slots = {}
         self._cal_proj_unit_by_id = {}
         self._cal_proj_plan = []
+        self._cal_fwd_plan = []
         # None = floor not yet established (R2-3). A SUCCESSFUL coverage probe
         # fills it in _on_cal_coverage; if the probe fails, it stays None and
         # _finalize_calendar suppresses gaps rather than judging against epoch.
@@ -689,6 +708,17 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # the past slots compute_gaps needs are produced.
             for expr_idx, expr in enumerate(info.calendar):
                 self._cal_proj_plan.append((timer.unit, expr_idx, expr, iterations))
+                # ALSO plan a NOW-based forward projection for the same expression
+                # (B). The win_start projection above is capped and can spend its
+                # whole budget on past slots (a minutely timer always; an hourly
+                # one at Month scale), leaving NO future slot → the timer's
+                # upcoming ⏲ never shows. The forward projection, based at now with
+                # the small FWD_PROJECTION_ITERATIONS budget, guarantees a few
+                # upcoming slots whatever the cap did. Same eligibility (it shares
+                # this loop), so a disabled / serviceless / monotonic timer gets
+                # neither projection. The fixed iteration count is the constant, so
+                # only (unit, expr_idx, expr) is stored.
+                self._cal_fwd_plan.append((timer.unit, expr_idx, expr))
 
         # Fire the coverage probe + the journal query NOW (both stamped with the
         # generation). Recorded in the fan-in set BEFORE firing so a synchronous
@@ -752,6 +782,26 @@ class MainWindow(QMainWindow):  # type: ignore[misc]
             # coverage_start clamp (set above) does the pre-coverage suppression.
             _ = self.client.fetch_cal_projection(
                 scope, unit, expr, win_start, iterations, proj_tag
+            )
+        # Fire the NOW-based forward projections (B). They share the calproj kind
+        # and fan-in path: _on_cal_projection unions their slots into _cal_slots,
+        # and since every forward slot is strictly > now, _finalize_calendar emits
+        # them as `projected` (the s > now branch) — they never reach the gap walk
+        # (which judges only [coverage_start, now]). The base_epoch is `now` and
+        # the iteration count is the small fixed FWD_PROJECTION_ITERATIONS, so a
+        # fast cadence still yields a few upcoming slots. The tag is "#f{idx}@gen"
+        # — the leading 'f' keeps it DISTINCT from the win_start tag "#{idx}@gen"
+        # so the same unit×expr's two projections never collide in _cal_pending or
+        # _cal_proj_unit_by_id. base_epoch (now) goes through cal_projection_argv →
+        # _at_epoch (µs→seconds floor), so no raw µs reaches the --base-time arg.
+        now = self._cal_now
+        for unit, expr_idx, expr in self._cal_fwd_plan:
+            fwd_tag = f"#f{expr_idx}@{gen}"
+            fwd_id = f"calproj:{scope}:{unit}{fwd_tag}"
+            self._cal_pending.add(fwd_id)
+            self._cal_proj_unit_by_id[fwd_id] = unit
+            _ = self.client.fetch_cal_projection(
+                scope, unit, expr, now, FWD_PROJECTION_ITERATIONS, fwd_tag
             )
         # If the coverage probe was the last outstanding fetch AND there are no
         # projections to fire (e.g. a window with no eligible timers, the journal

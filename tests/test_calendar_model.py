@@ -8,16 +8,19 @@ already-fetched text — no Qt, no subprocess — so these tests run offscreen; 
 only fixture is a captured `journalctl -o json` dump.
 """
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from taskdeck.calendar_model import (
     CELL_DRAW_MAX_PER_WINDOW,
+    FWD_PROJECTION_ITERATIONS,
     GAP_TOLERANCE_USEC,
     CalendarEvent,
     Health,
     bucket_cell,
     cadence_interval_usec,
     compute_gaps,
+    local_calendar_window,
     parse_projection,
     parse_run_journal,
     projection_iterations,
@@ -471,6 +474,106 @@ def test_summarize_empty_is_all_zero_no_issues():
 # reach for a QWidget or subprocess and the promise would rot silently. This
 # scans the module's SOURCE for forbidden imports so the purity contract fails
 # loudly at test time, not at plasmoid-reuse time.
+
+
+# -- local_calendar_window: local-aligned windows that CONTAIN the anchor -----
+#
+# The conftest pins TZ=America/Los_Angeles, so "local" here is PDT/PST — a fixed
+# non-UTC offset that makes these assertions FAIL if the math reverted to UTC.
+# A 2026-06-20 06:00 LOCAL anchor (a Saturday) is the running example.
+
+# 2026-06-20 06:00 PDT, as the absolute µs epoch the host would pass as `now`.
+ANCHOR_USEC = int(datetime(2026, 6, 20, 6, 0).astimezone().timestamp()) * 1_000_000
+
+
+def _local(usec):
+    """A µs epoch as a NAIVE LOCAL datetime (the display/window clock)."""
+    return datetime.fromtimestamp(usec / 1_000_000)
+
+
+def test_local_window_day_is_local_midnight_to_midnight_containing_now():
+    # Day = the local calendar day CONTAINING the anchor: local 00:00 → next local
+    # 00:00, and the anchor must sit inside it. Both edges round-trip to local
+    # midnight (hour 0) — on a UTC bug for a PDT user they'd land at 07:00/08:00.
+    start, end = local_calendar_window("day", ANCHOR_USEC)
+    assert start <= ANCHOR_USEC < end, "the day window contains now"
+    assert _local(start).hour == 0 and _local(start).minute == 0
+    assert _local(end).hour == 0 and _local(end).minute == 0
+    assert _local(start).date() == datetime(2026, 6, 20).date()
+    assert _local(end).date() == datetime(2026, 6, 21).date()
+
+
+def test_local_window_week_is_monday_start_containing_now():
+    # Week = the local week CONTAINING the anchor, MONDAY-start (matching the Month
+    # grid's Mon..Sun columns). 2026-06-20 is a Saturday, so its week starts Mon
+    # 2026-06-15 and ends Mon 2026-06-22.
+    start, end = local_calendar_window("week", ANCHOR_USEC)
+    assert start <= ANCHOR_USEC < end, "the week window contains now"
+    assert _local(start).weekday() == 0, "week starts on a Monday (weekday 0)"
+    assert _local(start).date() == datetime(2026, 6, 15).date()
+    assert _local(end).date() == datetime(2026, 6, 22).date()
+    assert _local(start).hour == 0 and _local(end).hour == 0
+    # Exactly 7 local days (this week has no DST transition).
+    assert (_local(end) - _local(start)) == timedelta(days=7)
+
+
+def test_local_window_month_is_first_to_first_containing_now():
+    # Month = the local calendar month CONTAINING the anchor: local 1st 00:00 →
+    # next month's 1st 00:00. June → 2026-06-01 .. 2026-07-01.
+    start, end = local_calendar_window("month", ANCHOR_USEC)
+    assert start <= ANCHOR_USEC < end, "the month window contains now"
+    assert _local(start).date() == datetime(2026, 6, 1).date()
+    assert _local(end).date() == datetime(2026, 7, 1).date()
+    assert _local(start).day == 1 and _local(end).day == 1
+    assert _local(start).hour == 0 and _local(end).hour == 0
+
+
+def test_local_window_matrix_shares_the_month_window():
+    # The matrix is a Month sub-view (spec §5) — its window MUST equal the Month
+    # window for the same anchor, so toggling grid⇄matrix never refetches.
+    assert local_calendar_window("matrix", ANCHOR_USEC) == local_calendar_window(
+        "month", ANCHOR_USEC
+    )
+
+
+def test_local_window_month_december_rolls_to_next_year():
+    # A December anchor's month end is NEXT YEAR's January 1st — the year-bump
+    # branch (month=13 would raise). Pin it so the rollover never regresses.
+    dec_anchor = int(datetime(2026, 12, 15, 6, 0).astimezone().timestamp()) * 1_000_000
+    start, end = local_calendar_window("month", dec_anchor)
+    assert _local(start).date() == datetime(2026, 12, 1).date()
+    assert _local(end).date() == datetime(2027, 1, 1).date()
+
+
+def test_local_window_nav_step_re_derives_adjacent_unit():
+    # The view navigates by feeding win_end (next) / win_start-1 (prev) back into
+    # local_calendar_window. Pin that this yields the ADJACENT local unit, the
+    # contract the view's nav_next/nav_prev rely on.
+    start, end = local_calendar_window("day", ANCHOR_USEC)
+    # next: anchor = win_end → the next local day.
+    nstart, nend = local_calendar_window("day", end)
+    assert nstart == end
+    assert _local(nstart).date() == datetime(2026, 6, 21).date()
+    # prev: anchor = win_start - 1µs → the previous local day.
+    pstart, pend = local_calendar_window("day", start - 1)
+    assert pend == start
+    assert _local(pstart).date() == datetime(2026, 6, 19).date()
+
+
+def test_local_window_unknown_mode_falls_back_to_day():
+    # An unknown mode must not raise — it degrades to the Day unit (mirrors the
+    # view's tolerant unknown-mode guard), so a future caller never gets an empty
+    # or raising window.
+    assert local_calendar_window("bogus", ANCHOR_USEC) == local_calendar_window(
+        "day", ANCHOR_USEC
+    )
+
+
+def test_fwd_projection_iterations_is_a_small_positive_budget():
+    # The forward-projection budget (B) must be small (so a fast cadence yields a
+    # few upcoming slots without flooding) and well under the win_start window cap
+    # — they serve different purposes (upcoming glyphs vs past-slot coverage).
+    assert 0 < FWD_PROJECTION_ITERATIONS < CELL_DRAW_MAX_PER_WINDOW
 
 
 def test_calendar_model_imports_no_qt_or_subprocess():

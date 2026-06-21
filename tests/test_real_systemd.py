@@ -9,7 +9,11 @@ import time
 
 import pytest
 
-from taskdeck.calendar_model import parse_projection, parse_run_journal
+from taskdeck.calendar_model import (
+    FWD_PROJECTION_ITERATIONS,
+    parse_projection,
+    parse_run_journal,
+)
 from taskdeck.systemd_client import (
     SCHEDULE_PROPS,
     cal_coverage_argv,
@@ -105,6 +109,28 @@ def test_live_cal_projection_base_time_parses():
     slots = parse_projection(run(argv))
     assert len(slots) == 3, "three daily slots projected from a past anchor"
     assert slots == sorted(slots) and slots[0] > WEEK_AGO_USEC
+
+
+def test_live_cal_forward_projection_from_now_yields_future_slots():
+    # B (forward projection): the EXACT argv the host fires for the now-based
+    # forward projection — cal_projection_argv with base_epoch == NOW (µs) and the
+    # small FWD_PROJECTION_ITERATIONS budget. This is what makes "upcoming" show
+    # for a fast cadence whose win_start projection burned its cap on past slots.
+    # Proves (a) the now-base @<seconds> is accepted (raw µs would make systemd
+    # reject --base-time → run()'s rc!=0 fires here, the exact production blank-out)
+    # and (b) every projected slot is strictly in the FUTURE — which is why
+    # _finalize_calendar emits them as `projected` (the s > now branch). Uses a
+    # minutely expression so the cap-vs-now distinction is the real one.
+    now_usec = int(time.time()) * 1_000_000
+    argv = cal_projection_argv(
+        "systemd-analyze", "*:0/1", now_usec, FWD_PROJECTION_ITERATIONS
+    )
+    slots = parse_projection(run(argv))
+    assert len(slots) == FWD_PROJECTION_ITERATIONS, (
+        "the forward budget projects that many upcoming minutely slots"
+    )
+    assert all(s > now_usec for s in slots), "every forward slot is in the future"
+    assert slots == sorted(slots)
 
 
 def test_live_cal_journal_outcomes_parse():
