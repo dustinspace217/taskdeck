@@ -3,7 +3,14 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt
 
-from taskdeck.models import COLUMNS, ROLE_ACTIVATES, ROLE_UNIT, TaskTableModel, classify_cadence
+from taskdeck.models import (
+    COLUMNS,
+    ROLE_ACTIVATES,
+    ROLE_UNIT,
+    TaskTableModel,
+    classify_cadence,
+    unescape_unit,
+)
 from taskdeck.systemd_client import LastResult, ScheduleInfo, ServiceRow, TimerRow
 
 NOW = datetime(2026, 6, 10, 19, 0, 0)
@@ -103,6 +110,60 @@ def test_failed_service_status(qtbot):
     model = TaskTableModel()
     model.set_service_rows(services, {}, now=NOW)
     assert cell(model, 0, 1) == "✘ failed"
+
+
+def test_escaped_unit_name_decoded_for_display_only(qtbot):
+    # systemd template-built units (the "app-…@autostart.service" autostart
+    # pattern) arrive escaped — the '-' in "nvidia-settings" is "\x2d". The Task
+    # column must show the human form, but ROLE_UNIT/ROLE_ACTIVATES must keep the
+    # RAW name: that is what journalctl/systemctl accept, so decoding into the
+    # command path would target a unit that does not exist. "\\x2d" in this
+    # source string is one backslash + "x2d" — exactly what json.loads yields.
+    raw = "app-nvidia\\x2dsettings\\x2duser@autostart.service"
+    services = [ServiceRow(raw, "loaded", "failed", "failed", "nvidia-settings")]
+    model = TaskTableModel()
+    model.set_service_rows(services, {}, now=NOW)
+    assert cell(model, 0, 0) == "app-nvidia-settings-user@autostart.service"
+    idx = model.index(0, 0)
+    assert idx.data(ROLE_UNIT) == raw          # raw survives for the action argv
+    assert idx.data(ROLE_ACTIVATES) == raw
+
+
+def test_unescape_unit_helper():
+    # Plain names (user timers, ordinary services) have no escapes -> unchanged.
+    assert unescape_unit("backup.timer") == "backup.timer"
+    # The canonical autostart case decodes every \xNN.
+    assert unescape_unit("app-foo\\x2dbar@autostart.service") == "app-foo-bar@autostart.service"
+    # \x followed by non-hex is NOT an escape -> left verbatim (no over-decode).
+    assert unescape_unit("weird\\xZZ.service") == "weird\\xZZ.service"
+
+
+def test_escaped_timer_name_decoded_for_display_only(qtbot):
+    # The decode runs at TWO call sites: set_timer_rows has its own, separate
+    # from the service path covered above. An autostart-pattern unit can surface
+    # in the timer view too (list-timers --all), so drive the TIMER path with an
+    # escaped name and pin every sink — the Task column AND its sort key DECODE,
+    # while ROLE_UNIT/ROLE_ACTIVATES and the cadence lookup key stay RAW. QA
+    # mutation-checked this gap: reverting just the timer-side decode, or leaking
+    # the decoded name into the raw slot, passes every other test but fails here.
+    from taskdeck.models import ROLE_SORT
+
+    raw = "app-nvidia\\x2dsettings\\x2duser@autostart.timer"
+    activates = "app-nvidia\\x2dsettings\\x2duser@autostart.service"
+    decoded = "app-nvidia-settings-user@autostart.timer"
+    timers = [TimerRow(raw, activates, usec(datetime(2026, 6, 10, 23, 10)), None)]
+    services = [ServiceRow(activates, "loaded", "active", "running", "nvidia-settings")]
+    # Schedule keyed by the RAW timer name: proves the cadence lookup key was NOT
+    # decoded — a leaked decode would miss this key and render Cadence as "—".
+    schedules = {raw: ScheduleInfo(calendar=("*-*-* 03:50:00",), monotonic=())}
+    model = TaskTableModel()
+    model.set_timer_rows(timers, services, {}, schedules, now=NOW)
+    idx = model.index(0, 0)
+    assert cell(model, 0, 0) == decoded            # Task column decoded for humans
+    assert idx.data(ROLE_SORT) == decoded          # sort key agrees with the display
+    assert cell(model, 0, 2) == "daily"            # cadence resolved via the RAW key
+    assert idx.data(ROLE_UNIT) == raw              # raw survives for journalctl/systemctl
+    assert idx.data(ROLE_ACTIVATES) == activates   # raw activates for run actions
 
 
 def test_result_column_foreground_tinting(qtbot):

@@ -108,6 +108,17 @@ PlasmoidItem {
         return "in " + Math.round(deltaSec / 86400) + "d"
     }
 
+    // Decode systemd's \xNN hex escapes for display (e.g. "\x2d" -> "-"). systemd
+    // escapes non-[A-Za-z0-9:_.] chars when it builds a unit name from a template,
+    // so a failed "app-nvidia\x2dsettings\x2duser@autostart.service" arrives with
+    // raw escapes. Display-only — this is a read-only glance that never runs
+    // commands on these names. Mirrors models.py `unescape_unit` in the app.
+    function _unescapeUnit(name) {
+        return name.replace(/\\x([0-9A-Fa-f]{2})/g, function (m, hex) {
+            return String.fromCharCode(parseInt(hex, 16))
+        })
+    }
+
     Timer {
         interval: root.refreshSec * 1000
         running: true
@@ -172,7 +183,7 @@ PlasmoidItem {
                 required property string modelData
                 Layout.fillWidth: true
                 elide: Text.ElideRight
-                text: "✘ " + modelData
+                text: "✘ " + root._unescapeUnit(modelData)
             }
         }
 
@@ -186,7 +197,7 @@ PlasmoidItem {
                 required property var modelData
                 Layout.fillWidth: true
                 elide: Text.ElideRight
-                text: "⏲ " + modelData.unit + "  —  " + root._relTime(modelData.next)
+                text: "⏲ " + root._unescapeUnit(modelData.unit) + "  —  " + root._relTime(modelData.next)
             }
         }
         PlasmaComponents.Label {

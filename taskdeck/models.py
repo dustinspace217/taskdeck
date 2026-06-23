@@ -45,6 +45,34 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+# systemd escapes any character outside [A-Za-z0-9:_.] as \xNN when it builds a
+# unit name from a template — the '-' in "nvidia-settings" becomes "\x2d" inside
+# the "app-…@autostart.service" autostart pattern, so the failed unit arrives as
+# "app-nvidia\x2dsettings\x2duser@autostart.service". Only template-constructed
+# names (autostart scopes/services, slice paths) escape; user timers never do.
+_UNIT_ESCAPE_RE = re.compile(r"\\x([0-9A-Fa-f]{2})")
+
+
+def unescape_unit(unit: str) -> str:
+    """Decode systemd's \\xNN hex escapes in a unit name for human display.
+
+    `unit` is the raw, canonical name as emitted by `systemctl … -o json`.
+    Returns it with each \\xNN replaced by its byte — mirroring
+    `systemd-escape --unescape` for the single-byte ASCII case, which is all
+    real unit names produce. A non-ASCII name (systemd emits UTF-8 as per-byte
+    \\xNN) would decode each byte independently into mojibake rather than the
+    composed character — acceptable because this is display-only (the raw name
+    feeding commands is untouched) and unit names are ASCII in practice. A
+    regex sub, not a per-row shell-out: a refresh renders tens of rows at once.
+
+    DISPLAY ONLY. The escaped form is what systemctl/journalctl accept, so the
+    raw name must survive for every command path (ROLE_UNIT, ROLE_ACTIVATES,
+    the journal/action argv). Same render-not-parse discipline as strip_ansi
+    above — decode at the render site, never in the client or the row data.
+    """
+    return _UNIT_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), unit)
+
+
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 # Monotonic trigger kinds → human phrasing. systemd's `show` output spells
@@ -323,8 +351,11 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
                 status = "○ inactive"
             result = results.get(t.activates)
             cadence = classify_cadence(schedules.get(t.unit))
+            # Decode \xNN escapes for the Task column only; t.unit stays raw in
+            # the row tuple below so ROLE_UNIT/ROLE_ACTIVATES feed real commands.
+            name = unescape_unit(t.unit)
             display = (
-                t.unit,
+                name,
                 status,
                 cadence,
                 format_when(t.next_usec, now),
@@ -332,7 +363,7 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
                 _result_text(result),
             )
             sort = (
-                t.unit,
+                name,
                 status,
                 cadence,
                 _ts_sort_key(t.next_usec, _SORT_NO_NEXT),
@@ -360,8 +391,10 @@ class TaskTableModel(QAbstractTableModel):  # type: ignore[misc]
                 status = "✘ failed"
             result = results.get(s.unit)
             # Services have no schedule of their own — cadence is "—".
-            display = (s.unit, status, "—", "—", "—", _result_text(result))
-            sort = (s.unit, status, "—", _SORT_NO_NEXT, _SORT_NO_LAST, display[5])
+            # Decode escapes for display; s.unit stays raw for ROLE_UNIT/actions.
+            name = unescape_unit(s.unit)
+            display = (name, status, "—", "—", "—", _result_text(result))
+            sort = (name, status, "—", _SORT_NO_NEXT, _SORT_NO_LAST, display[5])
             ok = None if result is None else result.result == "success"
             # Services activate themselves; ROLE_ACTIVATES = own unit name.
             rows.append((display, sort, s.unit, s.unit, ok))
